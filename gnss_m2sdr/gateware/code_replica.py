@@ -56,15 +56,28 @@ class CodeReplica(LiteXModule):
         self.code_frac  = Signal(frac_bits)
         self.epoch      = Signal()
 
+        # Runtime code-load port (host writes the acquired PRN's code here).
+        self.load_we  = Signal()
+        self.load_adr = Signal(max=code_length)
+        self.load_dat = Signal()
+
         # # #
 
-        # Code ROM (0/1), 1 bit x code_length, three async read ports (E/P/L).
+        # Code RAM (0/1), 1 bit x code_length: three async read ports (E/P/L)
+        # plus a write port for host runtime loading. Initialised with `prn`
+        # so simulation and power-on work without an explicit load.
         init = ca_code_reference(prn)
         self.specials.mem = mem = Memory(1, code_length, init=init)
         p_e = mem.get_port(async_read=True)
         p_p = mem.get_port(async_read=True)
         p_l = mem.get_port(async_read=True)
-        self.specials += p_e, p_p, p_l
+        wp  = mem.get_port(write_capable=True)
+        self.specials += p_e, p_p, p_l, wp
+        self.comb += [
+            wp.adr.eq(self.load_adr),
+            wp.dat_w.eq(self.load_dat),
+            wp.we.eq(self.load_we),
+        ]
 
         idx      = self.chip_index
         idx_next = Signal(max=code_length)  # idx + 1 (wrapped)
