@@ -114,8 +114,14 @@ class CodeReplica(LiteXModule):
         # Code NCO: fractional accumulator + chip index with mod-code_length wrap.
         acc_next = Signal(frac_bits + 1)
         self.comb += acc_next.eq(self.code_frac + self.code_step)
+        # epoch is COMBINATIONAL and aligned with the wrapping strobe (the sample
+        # that completes chip 1022 -> 0). It must coincide with `stb` because
+        # consumers sample it on `stb` cycles, and `stb` is sparse on hardware
+        # (one pulse every fs/sys_clk cycles) -- a registered epoch would land
+        # on a non-stb cycle and be missed.
+        self.comb += self.epoch.eq(
+            self.stb & ~self.restart & acc_next[frac_bits] & (idx == (code_length - 1)))
         self.sync += [
-            self.epoch.eq(0),
             If(self.restart,
                 self.code_frac.eq(0),
                 self.chip_index.eq(0),
@@ -124,7 +130,6 @@ class CodeReplica(LiteXModule):
                 If(acc_next[frac_bits],  # chip boundary crossed
                     If(idx == (code_length - 1),
                         self.chip_index.eq(0),
-                        self.epoch.eq(1),
                     ).Else(
                         self.chip_index.eq(idx + 1),
                     ),

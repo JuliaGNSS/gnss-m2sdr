@@ -44,7 +44,9 @@ def synth_signal(prn, code_offset_chips=0.0, carrier_phase0=0.0, n=None):
     return I, Q
 
 
-def run_channel(prn, I, Q, spacing_chips=0.5):
+def run_channel(prn, I, Q, spacing_chips=0.5, stb_gap=0):
+    # stb_gap>0 inserts that many idle (sample_stb=0) cycles between samples,
+    # reproducing the sparse strobe seen on hardware (fs << sys_clk).
     dut = TrackingChannel(prn=prn, code_frac_bits=FRAC, carrier_phase_bits=PHASE_BITS)
     carrier_fw = round(F_IF / FS * (1 << PHASE_BITS)) & ((1 << PHASE_BITS) - 1)
     code_step  = round(CHIP_RATE / FS * (1 << FRAC))
@@ -66,6 +68,15 @@ def run_channel(prn, I, Q, spacing_chips=0.5):
             yield dut.sample_q.eq(Q[k])
             yield dut.sample_stb.eq(1)
             yield
+            for _ in range(stb_gap):           # idle cycles between samples
+                yield dut.sample_stb.eq(0)
+                yield
+                if (yield dut.dump_stb):
+                    dump.update(
+                        ie=(yield dut.ie), qe=(yield dut.qe),
+                        ip=(yield dut.ip), qp=(yield dut.qp),
+                        il=(yield dut.il), ql=(yield dut.ql),
+                        n=(yield dut.integrated_samples))
             if (yield dut.dump_stb):
                 dump.update(
                     ie=(yield dut.ie), qe=(yield dut.qe),
@@ -102,6 +113,16 @@ class TestChannelLock(unittest.TestCase):
         self.assertLess(abs(e - l) / p, 0.05)
         # 0.5-chip taps -> ~half the prompt correlation (triangular autocorr).
         self.assertAlmostEqual(e / p, 0.5, delta=0.1)
+
+    def test_locks_with_sparse_strobe(self):
+        # Hardware feeds one sample every ~31 sys cycles; the epoch/dump must
+        # still fire. Regression test for the registered-epoch bug.
+        prn = 5
+        I, Q = synth_signal(prn, code_offset_chips=0.0)
+        d = self.assertDump(run_channel(prn, I, Q, stb_gap=7))
+        p = mag(d["ip"], d["qp"])
+        aligned = CARRIER_AMP * AMP * d["n"]
+        self.assertGreater(p, 0.9 * aligned)
 
     def test_discriminator_sign(self):
         prn = 5

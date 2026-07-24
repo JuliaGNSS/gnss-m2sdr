@@ -144,6 +144,12 @@ class GNSSTracking(LiteXModule):
             CSRField("enable", size=1, description="Enable sample processing in all channels."),
         ])
         self._overflow = CSRStatus(n_channels, description="Sticky per-channel record overflow.")
+        # Diagnostics: free-running count of observed sample strobes (ungated by
+        # enable/restart) to confirm the RX observer actually sees the stream.
+        self._dbg_stb_count = CSRStatus(32, description="Raw sample_stb count (diagnostic).")
+        _dbg = Signal(32)
+        self.sync += If(self.sample_stb, _dbg.eq(_dbg + 1))
+        self.comb += self._dbg_stb_count.status.eq(_dbg)
 
         # # #
 
