@@ -31,12 +31,17 @@ correlator dumps — DMA0's I/Q path is untouched.
 
 - [x] GPS L1 C/A code generator — validated vs IS-GPS-200, autocorrelation/balance,
       and GNSSSignals.jl `gen_code` (all 32 PRNs, exact).
-- [ ] Carrier NCO + complex mixer (carrier wipe-off)
-- [ ] Code NCO + E/P/L tap generation
-- [ ] E/P/L correlators + integrate-and-dump
+- [x] Carrier NCO + sin/cos LUT (SinCosLUT.jl amplitude convention) — matches ideal
+      within quantization; frequency and phase-set verified.
+- [x] Code NCO + E/P/L replica with **runtime-configurable spacing** — prompt
+      reproduces the code, epoch period exact, E leads / L trails by the spacing.
+- [x] E/P/L correlators + integrate-and-dump (`TrackingChannel`).
+- [x] Full single-channel Migen simulation: locks on a synthetic L1 C/A signal
+      (prompt peaks, E/L balanced, DLL discriminator sign correct, wrong-PRN rejects).
 - [ ] Correlator-dump record builder + FIFO + DMA1
-- [ ] Full single-channel Migen simulation (lock on synthetic L1 C/A)
-- [ ] SoC integration + hardware validation on orin2
+- [ ] Multi-channel bank + CSR control (carrier/code freq words, spacing, PRN load)
+- [ ] SoC integration via litex_m2sdr#152 hook + host driver + Tracking.jl glue
+- [ ] Hardware validation on orin2
 
 ## Layout
 
