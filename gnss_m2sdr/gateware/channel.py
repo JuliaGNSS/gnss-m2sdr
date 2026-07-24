@@ -72,13 +72,27 @@ class TrackingChannel(LiteXModule):
             code.restart.eq(self.restart),
         ]
 
-        # Carrier wipe-off (multiply by conjugate of the replica).
+        # Two-stage pipeline (RFIC samples are many sys cycles apart, so extra
+        # latency is free and it keeps the multiply and the accumulate off the
+        # same critical path):
+        #   Stage 1 (on sample_stb): carrier wipe-off (multiply by conjugate)
+        #     + register the code chips / epoch / code phase.
+        #   Stage 2 (next cycle):    code sign multiply + integrate-and-dump.
         prod_bits = sample_bits + carrier_amp_bits + 1
-        i_bb = Signal((prod_bits, True))
-        q_bb = Signal((prod_bits, True))
-        self.comb += [
-            i_bb.eq(self.sample_i * carrier.cos + self.sample_q * carrier.sin),
-            q_bb.eq(self.sample_q * carrier.cos - self.sample_i * carrier.sin),
+
+        s1_valid  = Signal()
+        i_bb = Signal((prod_bits, True)); q_bb = Signal((prod_bits, True))
+        early_r  = Signal((2, True)); prompt_r = Signal((2, True)); late_r = Signal((2, True))
+        epoch_r  = Signal()
+        cphase_r = Signal(code_frac_bits)
+        self.sync += [
+            s1_valid.eq(self.sample_stb),
+            If(self.sample_stb,
+                i_bb.eq(self.sample_i * carrier.cos + self.sample_q * carrier.sin),
+                q_bb.eq(self.sample_q * carrier.cos - self.sample_i * carrier.sin),
+                early_r.eq(code.early), prompt_r.eq(code.prompt), late_r.eq(code.late),
+                epoch_r.eq(code.epoch), cphase_r.eq(code.code_frac),
+            ),
         ]
 
         # Running accumulators + sample/index bookkeeping.
@@ -93,28 +107,28 @@ class TrackingChannel(LiteXModule):
             If(self.restart,
                 ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
                 nsamp.eq(0), sidx.eq(0),
-            ).Elif(self.sample_stb,
-                # code.early/prompt/late are +/-1; multiply-accumulate.
-                ie.eq(ie + code.early  * i_bb),
-                qe.eq(qe + code.early  * q_bb),
-                ip.eq(ip + code.prompt * i_bb),
-                qp.eq(qp + code.prompt * q_bb),
-                il.eq(il + code.late   * i_bb),
-                ql.eq(ql + code.late   * q_bb),
+            ).Elif(s1_valid,
+                # code.*_r are +/-1; multiply-accumulate the registered baseband.
+                ie.eq(ie + early_r  * i_bb),
+                qe.eq(qe + early_r  * q_bb),
+                ip.eq(ip + prompt_r * i_bb),
+                qp.eq(qp + prompt_r * q_bb),
+                il.eq(il + late_r   * i_bb),
+                ql.eq(ql + late_r   * q_bb),
                 nsamp.eq(nsamp + 1),
                 sidx.eq(sidx + 1),
                 # Dump on the sample that completes a code period.
-                If(code.epoch,
+                If(epoch_r,
                     self.dump_stb.eq(1),
-                    self.ie.eq(ie + code.early  * i_bb),
-                    self.qe.eq(qe + code.early  * q_bb),
-                    self.ip.eq(ip + code.prompt * i_bb),
-                    self.qp.eq(qp + code.prompt * q_bb),
-                    self.il.eq(il + code.late   * i_bb),
-                    self.ql.eq(ql + code.late   * q_bb),
+                    self.ie.eq(ie + early_r  * i_bb),
+                    self.qe.eq(qe + early_r  * q_bb),
+                    self.ip.eq(ip + prompt_r * i_bb),
+                    self.qp.eq(qp + prompt_r * q_bb),
+                    self.il.eq(il + late_r   * i_bb),
+                    self.ql.eq(ql + late_r   * q_bb),
                     self.integrated_samples.eq(nsamp + 1),
                     self.sample_index.eq(sidx),
-                    self.dump_code_phase.eq(code.code_frac),
+                    self.dump_code_phase.eq(cphase_r),
                     # Reset accumulators for the next integration.
                     ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
                     nsamp.eq(0),
