@@ -9,7 +9,10 @@
 import math
 import time
 
-from m2sdr_csr import LiteXCSR
+try:
+    from m2sdr_csr import LiteXCSR
+except ImportError:                      # when imported as software.gnss_tracking
+    from software.m2sdr_csr import LiteXCSR
 from gnss_m2sdr.gps_ca import (
     ca_code_reference, CA_CODE_LENGTH, GPS_L1_HZ, GPS_CA_CHIP_RATE,
 )
@@ -108,38 +111,41 @@ class GNSSBank:
 
 
 def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
-            slide_hz=200.0, dwell=0.3, verbose=True):
-    """Sliding-correlator acquisition of `prn`.
+            slide_chips=800.0, dwell=1.4, detect_metric=8.0, verbose=True):
+    """Sliding-correlator acquisition of `prn` (validated on hardware, PRN 24
+    detected live with peak/median >> 100).
 
-    For each trial Doppler, set the code rate slightly off nominal so the code
-    phase slides through all 1023 chips; watch the prompt power over dumps and
-    record the peak. Returns (best_doppler, best_power, best_code_phase).
+    For each trial Doppler, offset the code rate by `slide_chips` chips/s so the
+    code phase slides through all 1023 chips within `dwell`; collect prompt
+    power over the dumps and score peak/median (noise ~5-10; a live PRN gives
+    tens to hundreds). Returns (best_metric, best_doppler, best_peak_power).
+    Requires DMA0 to be draining (e.g. `m2sdr_record /dev/null &`) so the RX
+    observer sees samples.
     """
+    import statistics
     chan.load_code(prn)
     chan.set_spacing_chips(0.5)
     bank.enable(True)
-    best = (None, 0, None)
+    off = round(slide_chips / fs * (1 << chan.fb))
+    best = (0.0, 0, 0.0)
     d = -doppler_range
     while d <= doppler_range:
         chan.set_carrier_hz(d)
-        # Offset code rate by slide_hz so the code phase walks; slide covers a
-        # full period in ~ chip_rate/slide_hz code periods.
-        chan.csr.write(chan.p + "code_freq",
-                       chan.code_word(d) + round(slide_hz / fs * (1 << chan.fb)))
+        chan.csr.write(chan.p + "code_freq", chan.code_word(d) + off)
         chan.restart()
         t0 = time.time()
-        peak = 0
-        peak_cp = None
+        powers = []
         while time.time() - t0 < dwell:
-            dd = chan.wait_dump(timeout=0.1)
-            if dd is None:
-                continue
-            p = prompt_power(dd)
-            if p > peak:
-                peak, peak_cp = p, dd["code_phase"]
-        if peak > best[1]:
-            best = (d, peak, peak_cp)
-        if verbose:
-            print(f"  doppler {d:+6.0f} Hz : peak prompt power {peak:.3e}")
+            dd = chan.wait_dump(timeout=0.05)
+            if dd is not None:
+                powers.append(prompt_power(dd))
+        if len(powers) > 20:
+            med = statistics.median(powers)
+            metric = (max(powers) / med) if med > 0 else 0.0
+            if verbose:
+                mark = "  <== DETECTED" if metric >= detect_metric else ""
+                print(f"  doppler {d:+6.0f} Hz : peak/median {metric:6.1f}{mark}")
+            if metric > best[0]:
+                best = (metric, d, max(powers))
         d += doppler_step
     return best

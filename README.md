@@ -38,10 +38,25 @@ correlator dumps — DMA0's I/Q path is untouched.
 - [x] E/P/L correlators + integrate-and-dump (`TrackingChannel`).
 - [x] Full single-channel Migen simulation: locks on a synthetic L1 C/A signal
       (prompt peaks, E/L balanced, DLL discriminator sign correct, wrong-PRN rejects).
-- [ ] Correlator-dump record builder + FIFO + DMA1
-- [ ] Multi-channel bank + CSR control (carrier/code freq words, spacing, PRN load)
-- [ ] SoC integration via litex_m2sdr#152 hook + host driver + Tracking.jl glue
-- [ ] Hardware validation on orin2
+- [x] Correlator-dump record builder + FIFO + DMA1 (record.py, record_format.py)
+- [x] Multi-channel bank + CSR control (bank.py: carrier/code freq words, spacing,
+      runtime PRN code load, per-channel dump readback)
+- [x] SoC integration via litex_m2sdr#152 hook (soc.py, pcie_dmas=2, RX observer)
+- [x] Host software: pure-Python CSR access (ioctl) + sliding-correlator acquisition
+- [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS
+      satellite (PRN 24, peak/median >> 100) from the antenna.**
+
+### Hardware notes (learned bringing this up on a Jetson Orin)
+
+- Requires a litex_m2sdr gateware whose SI5351 uses litei2c **before** commit
+  `ce0bb5d` (the stuck-low bus-error check spuriously fails on this board over
+  PCIe). This repo pins litei2c to `19417d6`. Symptom otherwise: `m2sdr_rf`
+  fails at `SI5351 SYS_INIT ... status 0x00`.
+- The RX observer only sees samples while DMA0 is draining — run a continuous
+  `m2sdr_record /dev/null &` during tracking.
+- On the Orin the PCIe device is `0004:01:00.0`; after `flash_reload`, re-enumerate
+  manually (rescan.py mis-formats the domain): `rmmod m2sdr; echo 1 >
+  /sys/bus/pci/devices/0004:01:00.0/remove; echo 1 > /sys/bus/pci/rescan; modprobe m2sdr`.
 
 ## Layout
 
