@@ -52,6 +52,17 @@ class ChannelWithCSR(LiteXModule):
             CSRField("reset_addr", size=1, description="Reset the load address to 0."),
         ])
 
+        # Correlator-dump readback (latched on each dump). Driver-free way to
+        # run/validate the tracking loop over RemoteClient. For a coherent read,
+        # sample dump_count, read the fields, then re-read dump_count.
+        self._dump_count = CSRStatus(32, description="Increments on each correlator dump.")
+        self._ip = CSRStatus(32); self._qp = CSRStatus(32)
+        self._ie = CSRStatus(32); self._qe = CSRStatus(32)
+        self._il = CSRStatus(32); self._ql = CSRStatus(32)
+        self._integrated_samples = CSRStatus(32)
+        self._sample_index       = CSRStatus(64)
+        self._dump_code_phase    = CSRStatus(code_frac_bits)
+
         # # #
 
         # Edge-detect restart / carrier_set (0->1 -> one-cycle pulse).
@@ -92,6 +103,17 @@ class ChannelWithCSR(LiteXModule):
             ch.code.load_dat.eq(self._code_load.storage[0]),
             ch.code.load_we.eq(self._code_load.re & self._code_load.storage[1]),
         ]
+
+        # Latch dump fields into readback status registers.
+        self.sync += If(ch.dump_stb,
+            self._dump_count.status.eq(self._dump_count.status + 1),
+            self._ip.status.eq(ch.ip), self._qp.status.eq(ch.qp),
+            self._ie.status.eq(ch.ie), self._qe.status.eq(ch.qe),
+            self._il.status.eq(ch.il), self._ql.status.eq(ch.ql),
+            self._integrated_samples.status.eq(ch.integrated_samples),
+            self._sample_index.status.eq(ch.sample_index),
+            self._dump_code_phase.status.eq(ch.dump_code_phase),
+        )
 
     def connect_dump(self, port):
         ch = self.channel

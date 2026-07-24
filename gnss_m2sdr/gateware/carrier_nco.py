@@ -63,11 +63,13 @@ class CarrierNCO(LiteXModule):
         # # #
 
         sin_t, cos_t = _sincos_tables(lut_addr_bits, amp_bits)
-        self.specials.sin_mem = sin_mem = Memory(amp_bits, 1 << lut_addr_bits, init=sin_t)
-        self.specials.cos_mem = cos_mem = Memory(amp_bits, 1 << lut_addr_bits, init=cos_t)
+        # Add memories via `specials +=` (not as named attributes) so AutoCSR
+        # does not map them onto the CSR bus (keeps them as plain ROMs).
+        sin_mem = Memory(amp_bits, 1 << lut_addr_bits, init=sin_t)
+        cos_mem = Memory(amp_bits, 1 << lut_addr_bits, init=cos_t)
         sin_rd = sin_mem.get_port(async_read=True)
         cos_rd = cos_mem.get_port(async_read=True)
-        self.specials += sin_rd, cos_rd
+        self.specials += sin_mem, cos_mem, sin_rd, cos_rd
 
         addr = Signal(lut_addr_bits)
         self.comb += [

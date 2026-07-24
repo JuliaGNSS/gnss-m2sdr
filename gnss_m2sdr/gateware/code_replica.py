@@ -63,21 +63,28 @@ class CodeReplica(LiteXModule):
 
         # # #
 
-        # Code RAM (0/1), 1 bit x code_length: three async read ports (E/P/L)
-        # plus a write port for host runtime loading. Initialised with `prn`
-        # so simulation and power-on work without an explicit load.
+        # Code RAM (0/1), 1 bit x code_length. Replicated 3x (Early/Prompt/Late)
+        # so each RAM is a simple 1-write + 1-async-read distributed RAM (clean
+        # LUTRAM template); all three share the host load port. Added via
+        # `specials +=` (not named attributes) so AutoCSR does not CSR-map them.
+        # Initialised with `prn` so sim/power-on work without an explicit load.
         init = ca_code_reference(prn)
-        self.specials.mem = mem = Memory(1, code_length, init=init)
-        p_e = mem.get_port(async_read=True)
-        p_p = mem.get_port(async_read=True)
-        p_l = mem.get_port(async_read=True)
-        wp  = mem.get_port(write_capable=True)
-        self.specials += p_e, p_p, p_l, wp
-        self.comb += [
-            wp.adr.eq(self.load_adr),
-            wp.dat_w.eq(self.load_dat),
-            wp.we.eq(self.load_we),
-        ]
+
+        def make_replica():
+            m  = Memory(1, code_length, init=init)
+            rp = m.get_port(async_read=True)
+            wp = m.get_port(write_capable=True)
+            self.specials += m, rp, wp
+            self.comb += [
+                wp.adr.eq(self.load_adr),
+                wp.dat_w.eq(self.load_dat),
+                wp.we.eq(self.load_we),
+            ]
+            return rp
+
+        p_e = make_replica()
+        p_p = make_replica()
+        p_l = make_replica()
 
         idx      = self.chip_index
         idx_next = Signal(max=code_length)  # idx + 1 (wrapped)
