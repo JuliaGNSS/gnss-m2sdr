@@ -55,19 +55,27 @@ class GNSSSoC(BaseSoC):
 
     def add_rx_datapath_processing(self, rx_stream):
         from gnss_m2sdr.gateware.bank import GNSSTracking
+        from gnss_m2sdr.gateware.rx_observer import RXSampleObserver
         self.gnss = GNSSTracking(
             n_channels     = self._gnss_channels,
             prns           = self._gnss_prns,
             code_frac_bits = self._gnss_frac_bits,
             accum_bits     = self._gnss_accum_bits,
         )
-        # Non-intrusive observer: every accepted RX word is one I/Q sample
-        # (RX1 I in [0:16], RX1 Q in [16:32]). The main path is unchanged;
-        # requires the RX header inserter disabled (default) and DMA0 draining.
+        # Non-intrusive observer: de-interleave each accepted RX word into I/Q
+        # samples. How many samples a word carries depends on the AD9361 PHY
+        # channel mode -- one (RX1) in 2R2T, two consecutive ones in 1R1T -- so
+        # the observer follows the PHY's mode CSR (see rx_observer.py). The main
+        # path is unchanged; requires the RX header inserter disabled (default)
+        # and DMA0 draining.
+        self.gnss_rx = RXSampleObserver(data_width=len(rx_stream.data))
         self.comb += [
-            self.gnss.sample_i.eq(rx_stream.data[0:16]),
-            self.gnss.sample_q.eq(rx_stream.data[16:32]),
-            self.gnss.sample_stb.eq(rx_stream.valid & rx_stream.ready),
+            self.gnss_rx.rx_data.eq(rx_stream.data),
+            self.gnss_rx.rx_stb.eq(rx_stream.valid & rx_stream.ready),
+            self.gnss_rx.mode_1r1t.eq(self.ad9361.phy.control.fields.mode),
+            self.gnss.sample_i.eq(self.gnss_rx.sample_i),
+            self.gnss.sample_q.eq(self.gnss_rx.sample_q),
+            self.gnss.sample_stb.eq(self.gnss_rx.sample_stb),
         ]
         if hasattr(self, "pcie_dma1"):
             self.comb += [

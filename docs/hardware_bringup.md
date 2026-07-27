@@ -52,6 +52,12 @@ cd ~/litex_m2sdr/litex_m2sdr/software
 (Confirm the exact `m2sdr_rf` flag names with `./user/m2sdr_rf -h`; adjust
 `-samplerate`. Note the sample rate `fs` — the host uses it for the NCO words.)
 
+Either channel mode works. The RX observer follows the AD9361 PHY `mode` CSR:
+in 2T2R (the default) one 64-bit RX word is one RX1 sample, in 1T1R
+(`-chan_mode 1t1r`, which halves the DMA0 bandwidth for a single GNSS antenna)
+the word's two slots are two consecutive samples and both are fed to the bank.
+`fs` is the per-antenna sample rate either way.
+
 ## 4. Keep the RX sample stream flowing
 
 The tracking bank is a non-intrusive observer on the RX stream, so it only sees
