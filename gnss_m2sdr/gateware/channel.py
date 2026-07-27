@@ -13,12 +13,21 @@ Per enabled input sample (I, Q):
   3. Accumulate code * baseband into six I&D accumulators (I/Q x E/P/L).
 
 On each code epoch (one 1023-chip period) the accumulators are latched to the
-dump registers, the integrated-sample count and a free-running sample_index are
+dump registers, the integrated-sample count and the sample-counter value are
 captured, and the accumulators reset. The dump maps onto Tracking.jl's
 CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing),
 integrated_samples, sample_index; code_phase) -- note that Tracking.jl orders its
 accumulators latest-first, so E and L go in reversed relative to the names used
 here; see record_format.py for why getting that backwards inverts the DLL.
+
+The timestamp is NOT generated here: `sample_count` is an input, driven by the
+one free-running counter shared by every channel (and by the raw stream) in
+GNSSTracking, so dumps from channels restarted at different times stay on a
+single time axis. `restart` therefore rebases only the code phase and the
+integration accumulators, never the timestamp. `sample_index` is the 0-based
+global index of the last sample included in the integration; the host maps it
+to Tracking.jl's 1-based per-chunk convention with
+`sample_index_julia = sample_index - chunk_origin + 1` (see record_format.py).
 """
 
 from migen import *
@@ -34,10 +43,13 @@ class TrackingChannel(LiteXModule):
     def __init__(self, prn=1, sample_bits=16, carrier_phase_bits=32,
                  carrier_lut_addr_bits=8, carrier_amp_bits=8,
                  code_frac_bits=24, accum_bits=32, code_length=CA_CODE_LENGTH):
-        # Sample input.
-        self.sample_i   = Signal((sample_bits, True))
-        self.sample_q   = Signal((sample_bits, True))
-        self.sample_stb = Signal()
+        # Sample input. sample_count is the global free-running input-sample
+        # counter (0-based index of the sample presented this strobe), owned by
+        # GNSSTracking and shared by all channels.
+        self.sample_i     = Signal((sample_bits, True))
+        self.sample_q     = Signal((sample_bits, True))
+        self.sample_stb   = Signal()
+        self.sample_count = Signal(64)
 
         # Control (host / acquisition feedback).
         self.carrier_fw    = Signal(carrier_phase_bits)  # carrier phase increment / sample
@@ -88,6 +100,7 @@ class TrackingChannel(LiteXModule):
         early_r  = Signal((2, True)); prompt_r = Signal((2, True)); late_r = Signal((2, True))
         epoch_r  = Signal()
         cphase_r = Signal(code_frac_bits)
+        sidx_r   = Signal(64)
         self.sync += [
             s1_valid.eq(self.sample_stb),
             If(self.sample_stb,
@@ -95,21 +108,24 @@ class TrackingChannel(LiteXModule):
                 q_bb.eq(self.sample_q * carrier.cos - self.sample_i * carrier.sin),
                 early_r.eq(code.early), prompt_r.eq(code.prompt), late_r.eq(code.late),
                 epoch_r.eq(code.epoch), cphase_r.eq(code.code_frac),
+                # Global index of *this* sample, carried alongside it into
+                # stage 2 so the dump timestamps the sample it integrated.
+                sidx_r.eq(self.sample_count),
             ),
         ]
 
-        # Running accumulators + sample/index bookkeeping.
+        # Running accumulators + integrated-sample bookkeeping. No sample-index
+        # state here: restart must not rebase the (global) timestamp.
         ie = Signal((accum_bits, True)); qe = Signal((accum_bits, True))
         ip = Signal((accum_bits, True)); qp = Signal((accum_bits, True))
         il = Signal((accum_bits, True)); ql = Signal((accum_bits, True))
         nsamp = Signal(32)
-        sidx  = Signal(64)
 
         self.sync += [
             self.dump_stb.eq(0),
             If(self.restart,
                 ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
-                nsamp.eq(0), sidx.eq(0),
+                nsamp.eq(0),
             ).Elif(s1_valid,
                 # code.*_r are +/-1; multiply-accumulate the registered baseband.
                 ie.eq(ie + early_r  * i_bb),
@@ -119,7 +135,6 @@ class TrackingChannel(LiteXModule):
                 il.eq(il + late_r   * i_bb),
                 ql.eq(ql + late_r   * q_bb),
                 nsamp.eq(nsamp + 1),
-                sidx.eq(sidx + 1),
                 # Dump on the sample that completes a code period.
                 If(epoch_r,
                     self.dump_stb.eq(1),
@@ -130,7 +145,7 @@ class TrackingChannel(LiteXModule):
                     self.il.eq(il + late_r   * i_bb),
                     self.ql.eq(ql + late_r   * q_bb),
                     self.integrated_samples.eq(nsamp + 1),
-                    self.sample_index.eq(sidx),
+                    self.sample_index.eq(sidx_r),
                     self.dump_code_phase.eq(cphase_r),
                     # Reset accumulators for the next integration.
                     ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),

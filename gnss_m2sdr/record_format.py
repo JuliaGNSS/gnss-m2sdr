@@ -33,6 +33,18 @@ i.e. word 4, then word 2, then word 3 -- the reverse of the wire order. Passing
 `SVector(early, prompt, late)` swaps E and L, which inverts the sign of the DLL
 discriminator `(2-d)/2 * (E-L)/(E+L)` and drives the code phase away from lock;
 the symptom is "tracking never converges" rather than an obvious error.
+
+`sample_index` is the **0-based** index of the last sample included in the
+integration, on the bank's single free-running counter (gnss_sample_count CSR):
+shared by every channel, never reset by a channel restart, so records from
+channels handed over at different times are directly comparable. Tracking.jl
+wants the 1-based index relative to the current chunk origin, so the host maps
+
+    sample_index_julia = sample_index - chunk_origin + 1
+
+where chunk_origin is the counter value at the first sample of the chunk. The
+`+1` is deliberate, not an off-by-one. The companion invariant holds on both
+sides: first_sample = sample_index - integrated_samples + 1.
 """
 
 RECORD_WORDS = 6

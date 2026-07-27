@@ -109,6 +109,26 @@ class GNSSBank:
     def overflow(self):
         return self.csr.read("gnss_overflow")
 
+    def sample_count(self, tries=3):
+        """Global free-running input-sample counter (the record timestamp axis).
+
+        Read this next to a raw DMA0 capture to place the capture on the same
+        axis as the correlator records. The 64-bit CSR is two 32-bit reads and
+        the counter is live, so re-read the high word and retry if the low word
+        wrapped in between (every ~2**32 samples, i.e. ~17 min at 4.092 MHz).
+        """
+        addr, _ = self.csr.regs["gnss_sample_count"]   # MSW at the lowest addr
+        for _ in range(tries):
+            hi = self.csr._readl(addr)
+            lo = self.csr._readl(addr + 4)
+            if self.csr._readl(addr) == hi:
+                break
+        return (hi << 32) | lo
+
+    def sample_index_julia(self, record_sample_index, chunk_origin):
+        """Record timestamp -> Tracking.jl's 1-based per-chunk sample_index."""
+        return record_sample_index - chunk_origin + 1
+
 
 def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
             slide_chips=800.0, dwell=1.4, detect_metric=8.0, verbose=True):

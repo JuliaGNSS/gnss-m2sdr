@@ -8,8 +8,12 @@
 
 Each channel is CSR-controlled (carrier/code frequency words, carrier phase,
 E/L spacing, PRN tag, runtime code loading, integration restart). All channels
-observe the same RX sample strobe. Correlator dumps are serialized by a
-CorrelatorRecorder into a 64-bit record stream for DMA1.
+observe the same RX sample strobe and the same free-running sample counter --
+one 64-bit counter per bank, ungated and never reset, which timestamps every
+dump so channels handed over at different times stay comparable (and which the
+host can read over CSR to place the raw DMA0 stream on the same axis).
+Correlator dumps are serialized by a CorrelatorRecorder into a 64-bit record
+stream for DMA1.
 """
 
 from migen import *
@@ -26,9 +30,10 @@ class ChannelWithCSR(LiteXModule):
     """One TrackingChannel + its control/status CSRs and runtime code loader."""
     def __init__(self, prn=1, code_frac_bits=24, accum_bits=32,
                  carrier_phase_bits=32, code_length=CA_CODE_LENGTH):
-        self.sample_i   = Signal((16, True))
-        self.sample_q   = Signal((16, True))
-        self.sample_stb = Signal()
+        self.sample_i     = Signal((16, True))
+        self.sample_q     = Signal((16, True))
+        self.sample_stb   = Signal()
+        self.sample_count = Signal(64)   # global counter, from GNSSTracking
 
         self.channel = ch = TrackingChannel(
             prn=prn, code_frac_bits=code_frac_bits, accum_bits=accum_bits,
@@ -78,6 +83,7 @@ class ChannelWithCSR(LiteXModule):
             ch.sample_i.eq(self.sample_i),
             ch.sample_q.eq(self.sample_q),
             ch.sample_stb.eq(self.sample_stb),
+            ch.sample_count.eq(self.sample_count),
             ch.carrier_fw.eq(self._carrier_freq.storage),
             ch.carrier_phase_in.eq(self._carrier_phase.storage),
             ch.code_step.eq(self._code_freq.storage),
@@ -144,12 +150,20 @@ class GNSSTracking(LiteXModule):
             CSRField("enable", size=1, description="Enable sample processing in all channels."),
         ])
         self._overflow = CSRStatus(n_channels, description="Sticky per-channel record overflow.")
-        # Diagnostics: free-running count of observed sample strobes (ungated by
-        # enable/restart) to confirm the RX observer actually sees the stream.
-        self._dbg_stb_count = CSRStatus(32, description="Raw sample_stb count (diagnostic).")
-        _dbg = Signal(32)
-        self.sync += If(self.sample_stb, _dbg.eq(_dbg + 1))
-        self.comb += self._dbg_stb_count.status.eq(_dbg)
+        # The one time axis: a free-running count of observed sample strobes,
+        # ungated by `enable` and never reset (not by a channel restart either),
+        # so every channel's dumps -- and the raw DMA0 stream, which the host
+        # relates to it through this CSR -- share one origin. Reads as the
+        # 0-based index of the next sample; during a strobe cycle it reads the
+        # 0-based index of the sample being presented, which is what channels
+        # latch. Doubles as the RX-observer liveness diagnostic.
+        # A 64-bit CSR read is not atomic: read the high word, the low word,
+        # then the high word again and retry if it changed.
+        self.sample_count = Signal(64)
+        self._sample_count = CSRStatus(64,
+            description="Global free-running input-sample counter (also RX-observer liveness).")
+        self.sync += If(self.sample_stb, self.sample_count.eq(self.sample_count + 1))
+        self.comb += self._sample_count.status.eq(self.sample_count)
 
         # # #
 
@@ -168,6 +182,7 @@ class GNSSTracking(LiteXModule):
                 chan.sample_i.eq(self.sample_i),
                 chan.sample_q.eq(self.sample_q),
                 chan.sample_stb.eq(gated_stb),
+                chan.sample_count.eq(self.sample_count),
             ]
             self.comb += chan.connect_dump(recorder.ports[i])
 
