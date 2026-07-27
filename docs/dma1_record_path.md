@@ -72,6 +72,23 @@ Consequences for the design, in preference order:
    `DMA_BUFFER_PER_IRQ = 1` gives 8 records → 2 ms at 4 channels. This is the
    real fix and it belongs in the (already required) "expose the 2nd DMA
    channel" driver work, not in gateware.
+
+   enjoy-digital/litex_m2sdr#151 ("liblitepcie: read DMA ring geometry from the
+   kernel at runtime", open) is an enabler for this, not a solution to it. It
+   stops liblitepcie baking in the compile-time `DMA_BUFFER_SIZE`/`_COUNT` and
+   reads them from `LITEPCIE_IOCTL_MMAP_DMA_INFO` instead (the macros stay only
+   as a fallback when the kernel reports 0), so a buffer-size change becomes a
+   kernel-module rebuild rather than a matched userspace/SoapySDR rebuild — and
+   it independently confirms that the descriptor length is programmed at
+   runtime. What it does *not* give us is per-channel geometry: the ioctl
+   carries one `dma_rx_buf_size`/`dma_rx_buf_count` pair per *direction*
+   (`kernel/litepcie.h:55-57`), and DMA0 (I/Q) and DMA1 (records) are both
+   writer/RX channels, so shrinking to 512 B for record latency would shrink
+   the I/Q buffers too — the opposite of #151's own motivation, which is
+   *larger* buffers to absorb GC pauses on zero-copy RX. `DMA_BUFFER_PER_IRQ`
+   and the MSI-only `writer_hw_count` update are untouched by it as well, so
+   even with small buffers the host still waits `DMA_BUFFER_PER_IRQ` of them per
+   interrupt. Per-DMA-channel sizing remains the missing piece.
 2. **Bounded-schedule filler records.** Emitting an idle/epoch record when no
    channel dumps makes buffer completion depend on wall-clock rather than on
    how many channels are locked. That is the mechanism issue #7 needs anyway,
