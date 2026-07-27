@@ -44,8 +44,39 @@ class GNSSChannel:
     def set_code_doppler(self, doppler_hz):
         self.csr.write(self.p + "code_freq", self.code_word(doppler_hz))
 
-    def set_spacing_chips(self, d):
-        self.csr.write(self.p + "spacing", int(round(d * (1 << self.fb))))
+    def sample_shift(self, spacing_chips, code_doppler_hz=0.0):
+        """Tracking.jl's E/L shift in whole input samples.
+
+        `calc_preferred_code_shift_to_sample_shift` rounds the preferred chip
+        shift to an integer number of samples (at least 1), and `dll_disc`
+        derives its (2 - d)/2 normalisation from *that* quantised spacing. The
+        step word (not the float chip rate) is the divisor so the shift is
+        expressed on the same grid as the NCO actually programmed.
+        """
+        step = self.code_word(code_doppler_hz)
+        return max(1, int(round(spacing_chips * (1 << self.fb) / step)))
+
+    def spacing_word(self, spacing_chips, code_doppler_hz=0.0):
+        """E/L half-spacing CSR word: `sample_shift` whole NCO samples.
+
+        `sample_shift * code_step` puts the Early tap exactly that many samples
+        ahead of the prompt (and Late that many behind) with no rounding drift
+        between the two fixed-point words -- programming the raw preferred shift
+        instead leaves the accumulators at a spacing `dll_disc` does not assume
+        (~2.3 % DLL loop-gain error at fs = 4 MHz, 0.5 chips). The E/L taps only
+        reach chip index +/- 1, so the result must stay below one chip.
+        """
+        step = self.code_word(code_doppler_hz)
+        word = self.sample_shift(spacing_chips, code_doppler_hz) * step
+        if word >= (1 << self.fb):
+            raise ValueError(
+                f"E/L spacing {word / (1 << self.fb):.3f} chips >= 1 chip: the "
+                f"E/L taps only reach chip index +/-1 (preferred {spacing_chips} "
+                f"chips at fs={self.fs:.0f} Hz)")
+        return word
+
+    def set_spacing_chips(self, d, code_doppler_hz=0.0):
+        self.csr.write(self.p + "spacing", self.spacing_word(d, code_doppler_hz))
 
     def set_prn(self, prn):
         self.csr.write(self.p + "prn", prn)
@@ -66,7 +97,7 @@ class GNSSChannel:
 
     def configure(self, prn, carrier_hz, code_doppler_hz=0.0, spacing=0.5):
         self.load_code(prn)
-        self.set_spacing_chips(spacing)
+        self.set_spacing_chips(spacing, code_doppler_hz)
         self.set_carrier_hz(carrier_hz)
         self.set_code_doppler(code_doppler_hz)
         self.restart()

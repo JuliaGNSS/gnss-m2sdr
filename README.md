@@ -32,6 +32,14 @@ handover and downstream vector tracking.
 > `gnss_m2sdr/record_format.py`). Swapping E and L inverts the sign of the DLL
 > discriminator and the loop never converges.
 
+> **E/L spacing.** Tracking.jl quantises the preferred Early/Late chip shift to a
+> whole number of input samples (`get_correlator_sample_shifts`) and `dll_disc`
+> normalises with that quantised spacing. The host therefore programs the spacing
+> CSR as `sample_shift * code_step`, not as the raw preferred chip shift
+> (`GNSSChannel.spacing_word`) — at fs = 4 MHz and 0.5 chips the raw value is a
+> ~2.3 % DLL loop-gain error. The Julia glue must quantise the same way and hand
+> the correlator the same integer sample shift it programmed.
+
 ## Integration with litex_m2sdr (no fork)
 
 The base SoC (PCIe, clocking, SI5351, time) is reused via the upstream
