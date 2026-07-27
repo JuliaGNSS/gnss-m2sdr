@@ -19,6 +19,14 @@ The dumps map 1:1 onto `Tracking.jl`'s `CorrelatorOutput(correlator,
 integrated_samples, sample_index; code_phase)` external-producer contract
 (JuliaGNSS/Tracking.jl #205, #207).
 
+> **Accumulator order.** `EarlyPromptLateCorrelator.accumulators` is ordered
+> *latest first* — `[late, prompt, early]`, since `get_prompt_index` is 2, late
+> is index 1 and early is index 3. The host glue must therefore build
+> `EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing)`, i.e. the
+> reverse of the record's `prompt, early, late` word order (see
+> `gnss_m2sdr/record_format.py`). Swapping E and L inverts the sign of the DLL
+> discriminator and the loop never converges.
+
 ## Integration with litex_m2sdr (no fork)
 
 The base SoC (PCIe, clocking, SI5351, time) is reused via the upstream

@@ -17,9 +17,22 @@ One record = 6 x 64-bit words = 48 bytes, little-endian on the wire:
 
 `seq` is a per-channel record counter (wraps at 256) for host-side loss
 detection; `flags` bit 0 = overflow (a dump was dropped before this one).
-These map onto Tracking.jl's
-CorrelatorOutput(correlator=[early, prompt, late], integrated_samples,
-sample_index; code_phase).
+
+These map onto Tracking.jl's CorrelatorOutput. Mind the accumulator order:
+Tracking.jl's `EarlyPromptLateCorrelator.accumulators` runs *latest first*, not
+early first -- `get_prompt_index` is `div(3-1,2)+1` = 2, the late accumulator is
+`prompt_index - 1` = 1 and the early one is `prompt_index + 1` = 3 (matching
+`get_correlator_sample_shifts`, whose shifts are "ordered from latest to
+earliest replica"). So the host glue must build
+
+    CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early),
+                                               spacing),
+                     integrated_samples, sample_index; code_phase)
+
+i.e. word 4, then word 2, then word 3 -- the reverse of the wire order. Passing
+`SVector(early, prompt, late)` swaps E and L, which inverts the sign of the DLL
+discriminator `(2-d)/2 * (E-L)/(E+L)` and drives the code phase away from lock;
+the symptom is "tracking never converges" rather than an obvious error.
 """
 
 RECORD_WORDS = 6
