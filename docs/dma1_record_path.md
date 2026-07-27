@@ -37,9 +37,10 @@ of misparsing.
 
 The extra 16 B/record costs 64 kB/s per channel at 1 kHz dumps — free at these
 rates. Words 6 and 7 are reserved (zero) and are where a format extension
-(epoch-strobe/idle records, a second antenna's accumulators) can go without
-moving any existing field; bump `RECORD_MAGIC` if a layout ever changes
-incompatibly.
+(a second antenna's accumulators) can go without moving any existing field;
+bump `RECORD_MAGIC` if a layout ever changes incompatibly. The epoch strobe
+(#7) needed no extra words: it is a normal record with `channel = 0xFF`,
+`flags` bit 1 set and a zero payload.
 
 ## Latency (not fixed here — a driver/transport limit)
 
@@ -89,12 +90,15 @@ Consequences for the design, in preference order:
    and the MSI-only `writer_hw_count` update are untouched by it as well, so
    even with small buffers the host still waits `DMA_BUFFER_PER_IRQ` of them per
    interrupt. Per-DMA-channel sizing remains the missing piece.
-2. **Bounded-schedule filler records.** Emitting an idle/epoch record when no
-   channel dumps makes buffer completion depend on wall-clock rather than on
-   how many channels are locked. That is the mechanism issue #7 needs anyway,
-   and words 6/7 plus a flag bit are reserved for it. It bounds the *worst*
-   case (1 locked channel: 128 ms → 32 ms) but cannot get below the 32 ms floor
+2. **Bounded-schedule filler records** — *implemented* as the epoch strobe
+   (`gnss_epoch_period`, issue #7): one marker record every Δ input samples
+   regardless of what the channels are doing, so buffer completion depends on
+   wall-clock rather than on how many channels are locked. At Δ = 1 ms it adds
+   1000 rec/s, which bounds the *worst* case (1 locked channel: 128 ms →
+   64 ms; nothing locked: never → 128 ms) but cannot get below the 32 ms floor
    set by 128 records/buffer, so it is a complement to (1), not a substitute.
+   Its primary job is the host's epoch clock; the latency bound is a side
+   effect (see `gnss_m2sdr/record_format.py`).
 3. **Until then: close the loop over CSR, use DMA1 for bulk logging.** The CSR
    dump readback (`gnss_m2sdr/gateware/bank.py`, `software/gnss_tracking.py`)
    has no buffering latency, and is what the current hardware bring-up uses.
