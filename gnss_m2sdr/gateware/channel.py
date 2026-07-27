@@ -31,8 +31,10 @@ has no code_phase field or keyword, so the host carries it out of band.
 The timestamp is NOT generated here: `sample_count` is an input, driven by the
 one free-running counter shared by every channel (and by the raw stream) in
 GNSSTracking, so dumps from channels restarted at different times stay on a
-single time axis. `restart` therefore rebases only the code phase and the
-integration accumulators, never the timestamp. `sample_index` is the 0-based
+single time axis. `restart` therefore rebases only the code phase -- onto the
+`code_phase_chip`/`code_phase_frac` inputs, so an acquisition handover can start
+on the code phase the CPU measured -- and the integration accumulators, never
+the timestamp. `sample_index` is the 0-based
 global index of the last sample included in the integration; the host maps it
 to Tracking.jl's 1-based per-chunk convention with
 `sample_index_julia = sample_index - chunk_origin + 1` (see record_format.py).
@@ -65,7 +67,10 @@ class TrackingChannel(LiteXModule):
         self.carrier_phase_in = Signal(carrier_phase_bits)
         self.code_step     = Signal(code_frac_bits)      # code phase increment / sample
         self.spacing       = Signal(code_frac_bits)      # E/L half spacing (chips)
-        self.restart       = Signal()                    # reset code phase + integration
+        self.restart       = Signal()                    # rebase code phase + integration
+        # Code phase loaded by `restart` (0/0 = start of the code).
+        self.code_phase_chip = Signal(max=code_length)
+        self.code_phase_frac = Signal(code_frac_bits)
 
         # Dump outputs (valid for one cycle when dump_stb high, then held).
         self.dump_stb           = Signal()
@@ -99,6 +104,8 @@ class TrackingChannel(LiteXModule):
             code.spacing.eq(self.spacing),
             code.stb.eq(self.sample_stb),
             code.restart.eq(self.restart),
+            code.restart_chip.eq(self.code_phase_chip),
+            code.restart_frac.eq(self.code_phase_frac),
         ]
 
         # Two-stage pipeline (RFIC samples are many sys cycles apart, so extra

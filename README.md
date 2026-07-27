@@ -71,6 +71,10 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
 - [x] Correlator-dump record builder + FIFO + DMA1 (record.py, record_format.py)
 - [x] Multi-channel bank + CSR control (bank.py: carrier/code freq words, spacing,
       runtime PRN code load, per-channel dump readback)
+- [x] Deterministic apply point: NCO updates and acquisition handover (carrier
+      freq/phase + code freq/phase) commit atomically on a host-chosen sample
+      index (`apply_at`), giving `NCOUpdate.apply_at_epoch` a hardware meaning
+      and a fixed feedback delay instead of PCIe jitter.
 - [x] SoC integration via litex_m2sdr#152 hook (soc.py, pcie_dmas=2, RX observer)
 - [x] Host software: pure-Python CSR access (ioctl) + sliding-correlator acquisition
 - [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS

@@ -95,6 +95,61 @@ class GNSSChannel:
         self.csr.write(self.p + "control", 0b11)
         self.csr.write(self.p + "control", 0)
 
+    # ---- scheduled updates (deterministic apply point) -----------------------
+    def carrier_phase_word(self, cycles):
+        return round((cycles % 1.0) * (1 << self.pb)) & ((1 << self.pb) - 1)
+
+    def code_phase_word(self, chips):
+        """Code phase (chips, fractional) -> the chip|frac word of code_phase."""
+        phase = chips % CA_CODE_LENGTH
+        chip  = int(phase)
+        frac  = round((phase - chip) * (1 << self.fb))
+        if frac == (1 << self.fb):                     # rounding carried a chip
+            chip, frac = (chip + 1) % CA_CODE_LENGTH, 0
+        return (chip << self.fb) | frac
+
+    def schedule(self, sample_index, carrier_hz=None, code_doppler_hz=None,
+                 carrier_phase_cycles=None, code_phase_chips=None):
+        """Commit the given values on global sample `sample_index`, atomically.
+
+        `sample_index` lives on the bank's free-running counter
+        (`GNSSBank.sample_count`, the axis records are timestamped on) and is the
+        first input sample processed with the new values -- the hardware meaning
+        of GNSSReceiver.jl's `NCOUpdate.apply_at_epoch`, which is what lets the
+        loop filter work with a fixed feedback delay instead of PCIe jitter.
+        Only the values passed are committed; passing `code_phase_chips` (i.e. an
+        acquisition handover) also restarts the integration on that sample.
+
+        Call `apply_status()` afterwards: `late` means the writes did not make it
+        to the board in time and the commit slipped to a later sample.
+        """
+        w, p = self.csr.write, self.p
+        flags = 0b1                                    # arm
+        if carrier_hz is not None:
+            w(p + "carrier_freq_next", self.carrier_word(carrier_hz))
+            flags |= 1 << 3
+        if code_doppler_hz is not None:
+            w(p + "code_freq_next", self.code_word(code_doppler_hz))
+            flags |= 1 << 4
+        if carrier_phase_cycles is not None:
+            w(p + "carrier_phase", self.carrier_phase_word(carrier_phase_cycles))
+            flags |= 1 << 2
+        if code_phase_chips is not None:
+            w(p + "code_phase", self.code_phase_word(code_phase_chips))
+            flags |= 1 << 1
+        w(p + "apply_at", sample_index)
+        w(p + "apply", 0)                              # arm is 0->1 edge-triggered
+        w(p + "apply", flags)
+
+    def apply_status(self):
+        """(armed, late) of the last scheduled commit."""
+        s = self.csr.read(self.p + "apply_status")
+        return bool(s & 0b01), bool(s & 0b10)
+
+    def applied_at(self):
+        """Global sample index the last scheduled commit actually took effect for."""
+        return self.csr.read(self.p + "applied_at")
+
     def configure(self, prn, carrier_hz, code_doppler_hz=0.0, spacing=0.5):
         self.load_code(prn)
         self.set_spacing_chips(spacing, code_doppler_hz)

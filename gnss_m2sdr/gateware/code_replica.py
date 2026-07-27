@@ -22,6 +22,11 @@ chip fraction: Tracking.jl quantises the preferred chip shift the same way
 quantised spacing, so anything else mis-scales the DLL loop gain. The host does
 that quantisation (`GNSSChannel.spacing_word`); it also enforces
 `spacing_word < 2**frac_bits`, since the E/L taps only reach `idx +/- 1`.
+
+``restart`` rebases the accumulator onto ``(restart_chip, restart_frac)`` rather
+than always onto 0, so an acquisition handover can start tracking at the code
+phase the CPU measured. Both inputs default to 0, which is the plain
+"restart at the beginning of the code" behaviour.
 """
 
 from migen import *
@@ -45,7 +50,9 @@ class CodeReplica(LiteXModule):
     code_step : in  (frac_bits) - fractional chips advanced per enabled sample.
     spacing   : in  (frac_bits) - E/L half-spacing in chips (0..1), fixed-point.
     stb       : in  - advance one sample when high.
-    restart   : in  - reset code phase and chip index to 0.
+    restart   : in  - rebase code phase onto (restart_chip, restart_frac).
+    restart_chip : in - chip index loaded by ``restart`` (0 = start of code).
+    restart_frac : in (frac_bits) - fractional chip phase loaded by ``restart``.
     early, prompt, late : out (2, signed) - replica chips (-1/+1) this sample.
     chip_index : out - current prompt chip index (0..code_length-1).
     code_frac  : out (frac_bits) - fractional code phase this sample.
@@ -56,6 +63,12 @@ class CodeReplica(LiteXModule):
         self.spacing    = Signal(frac_bits)
         self.stb        = Signal()
         self.restart    = Signal()
+        # Phase loaded by `restart`. Both default to 0, i.e. plain "restart at
+        # the start of the code"; the host sets them to hand a CPU-acquired code
+        # phase over, so the first integration starts on the measured phase
+        # instead of chip 0.
+        self.restart_chip = Signal(max=code_length)
+        self.restart_frac = Signal(frac_bits)
         self.early      = Signal((2, True))
         self.prompt     = Signal((2, True))
         self.late       = Signal((2, True))
@@ -130,8 +143,8 @@ class CodeReplica(LiteXModule):
             self.stb & ~self.restart & acc_next[frac_bits] & (idx == (code_length - 1)))
         self.sync += [
             If(self.restart,
-                self.code_frac.eq(0),
-                self.chip_index.eq(0),
+                self.code_frac.eq(self.restart_frac),
+                self.chip_index.eq(self.restart_chip),
             ).Elif(self.stb,
                 self.code_frac.eq(acc_next[:frac_bits]),
                 If(acc_next[frac_bits],  # chip boundary crossed
