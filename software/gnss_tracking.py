@@ -28,6 +28,7 @@ class GNSSChannel:
         self.pb  = carrier_phase_bits
         self.fb  = code_frac_bits
         self.p   = f"gnss_ch{index}_"
+        self._num_ants = None    # discovered from the CSR set on first use
 
     # ---- configuration -------------------------------------------------------
     def carrier_word(self, hz):
@@ -158,17 +159,38 @@ class GNSSChannel:
         self.restart()
 
     # ---- readback ------------------------------------------------------------
+    def num_ants(self):
+        """Antennas this channel reports, discovered from the CSR set.
+
+        A 2-antenna build adds a suffixed register set (ip_ant1, ...); antenna 0
+        keeps the bare names, so this works against either gateware.
+        """
+        if self._num_ants is None:
+            n = 1
+            while f"{self.p}ip_ant{n}" in self.csr.regs:
+                n += 1
+            self._num_ants = n
+        return self._num_ants
+
     def read_dump(self):
         r = self.csr.read
         rs = lambda n: self.csr.read_signed(self.p + n, 32)
+        # One E/P/L set per antenna; the replicas are shared, so there is a
+        # single integrated_samples / sample_index / code_phase for all of them.
+        # Antenna 0 is also spliced in flat, exactly as in the DMA record.
+        ants = []
+        for a in range(self.num_ants()):
+            s = "" if a == 0 else f"_ant{a}"
+            ants.append(dict(ip=rs("ip" + s), qp=rs("qp" + s),
+                             ie=rs("ie" + s), qe=rs("qe" + s),
+                             il=rs("il" + s), ql=rs("ql" + s)))
         return dict(
             count = r(self.p + "dump_count"),
-            ip = rs("ip"), qp = rs("qp"),
-            ie = rs("ie"), qe = rs("qe"),
-            il = rs("il"), ql = rs("ql"),
+            ants = ants,
             n  = r(self.p + "integrated_samples"),
             sample_index = r(self.p + "sample_index"),
             code_phase   = r(self.p + "dump_code_phase"),
+            **ants[0],
         )
 
     def wait_dump(self, timeout=1.0):

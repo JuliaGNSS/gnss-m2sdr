@@ -4,9 +4,9 @@
 # Single GNSS tracking channel: carrier wipe-off + E/P/L correlation + I&D.
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""One GPS L1 C/A tracking channel.
+"""One GPS L1 C/A tracking channel, over `num_ants` coherent antennas.
 
-Per enabled input sample (I, Q):
+Per enabled input sample (I, Q) of every antenna:
   1. Carrier NCO -> cos/sin replica; complex mix (multiply by conjugate) to
      wipe off the residual carrier:  I_bb = I*cos + Q*sin,  Q_bb = Q*cos - I*sin.
   2. Code NCO -> Early/Prompt/Late code chips (+/-1).
@@ -16,7 +16,19 @@ The accumulators saturate at `accum_bits` rather than wrapping: a wrapped sum
 still looks like a valid correlator value to the host, so overflow would be
 silent. `dump_saturated` marks the dump whose integration clamped, and
 `saturated` is the sticky per-channel version (cleared by `restart`) that the
-bank exposes over CSR.
+bank exposes over CSR. Both are per channel, not per antenna: a clamp anywhere
+in the array invalidates the dump the host would beamform.
+
+Steps 1 and 2 need the carrier NCO, the code NCO and the three code replicas --
+by far the expensive part -- and all antennas of a coherent array track the
+*same* signal (shared LO, only the spatial phase differs), so those are
+instantiated once and shared; only the six accumulators and their multipliers
+are per antenna. `num_ants` therefore scales cheaply, which is why the
+accumulators must stay separate: GNSSReceiver.jl#107 beamforms
+post-correlation on the CPU from the per-antenna prompt covariance, so summing
+antennas here would destroy the spatial information (and one NCOUpdate per
+channel, not per antenna, is what #107 specifies). Antenna 0's ports keep their
+scalar names, so single-antenna wiring is unchanged.
 
 On each code epoch (one 1023-chip period) the accumulators are latched to the
 dump registers, the integrated-sample count and the sample-counter value are
@@ -47,17 +59,26 @@ from litex.gen import *
 from gnss_m2sdr.gateware.carrier_nco import CarrierNCO
 from gnss_m2sdr.gateware.code_replica import CodeReplica
 from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
+from gnss_m2sdr.record_format import ACC_SIGNALS, N_ANTS_MAX
 
 
 class TrackingChannel(LiteXModule):
     def __init__(self, prn=1, sample_bits=16, carrier_phase_bits=32,
                  carrier_lut_addr_bits=8, carrier_amp_bits=8,
-                 code_frac_bits=24, accum_bits=32, code_length=CA_CODE_LENGTH):
-        # Sample input. sample_count is the global free-running input-sample
-        # counter (0-based index of the sample presented this strobe), owned by
-        # GNSSTracking and shared by all channels.
-        self.sample_i     = Signal((sample_bits, True))
-        self.sample_q     = Signal((sample_bits, True))
+                 code_frac_bits=24, accum_bits=32, code_length=CA_CODE_LENGTH,
+                 num_ants=1):
+        assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
+
+        # Sample inputs, one I/Q pair per antenna. All antennas are presented on
+        # the same sample_stb: they sample simultaneously off the shared LO, so
+        # one strobe carries one time instant across the array.
+        # sample_count is the global free-running input-sample counter (0-based
+        # index of the sample presented this strobe), owned by GNSSTracking and
+        # shared by all channels.
+        self.sample_i_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.sample_q_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.sample_i     = self.sample_i_ants[0]   # same Signal, not a copy
+        self.sample_q     = self.sample_q_ants[0]
         self.sample_stb   = Signal()
         self.sample_count = Signal(64)
 
@@ -73,14 +94,14 @@ class TrackingChannel(LiteXModule):
         self.code_phase_frac = Signal(code_frac_bits)
 
         # Dump outputs (valid for one cycle when dump_stb high, then held).
+        # acc[n] holds antenna n's six accumulators; antenna 0's are also
+        # exposed under the original scalar names.
         self.dump_stb           = Signal()
         self.dump_saturated     = Signal()  # the dumped integration clamped
-        self.ie = Signal((accum_bits, True))
-        self.qe = Signal((accum_bits, True))
-        self.ip = Signal((accum_bits, True))
-        self.qp = Signal((accum_bits, True))
-        self.il = Signal((accum_bits, True))
-        self.ql = Signal((accum_bits, True))
+        self.acc = [{k: Signal((accum_bits, True)) for k in ACC_SIGNALS}
+                    for _ in range(num_ants)]
+        for k, sig in self.acc[0].items():
+            setattr(self, k, sig)
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.dump_code_phase    = Signal(code_frac_bits)
@@ -114,10 +135,13 @@ class TrackingChannel(LiteXModule):
         #   Stage 1 (on sample_stb): carrier wipe-off (multiply by conjugate)
         #     + register the code chips / epoch / code phase.
         #   Stage 2 (next cycle):    code sign multiply + integrate-and-dump.
+        # The replica state (chips, epoch, code phase) is registered once and
+        # reused by every antenna; only the wipe-off multiply is per antenna.
         prod_bits = sample_bits + carrier_amp_bits + 1
 
         s1_valid  = Signal()
-        i_bb = Signal((prod_bits, True)); q_bb = Signal((prod_bits, True))
+        i_bb = [Signal((prod_bits, True)) for _ in range(num_ants)]
+        q_bb = [Signal((prod_bits, True)) for _ in range(num_ants)]
         early_r  = Signal((2, True)); prompt_r = Signal((2, True)); late_r = Signal((2, True))
         epoch_r  = Signal()
         cphase_r = Signal(code_frac_bits)
@@ -125,8 +149,12 @@ class TrackingChannel(LiteXModule):
         self.sync += [
             s1_valid.eq(self.sample_stb),
             If(self.sample_stb,
-                i_bb.eq(self.sample_i * carrier.cos + self.sample_q * carrier.sin),
-                q_bb.eq(self.sample_q * carrier.cos - self.sample_i * carrier.sin),
+                *[i_bb[n].eq(self.sample_i_ants[n] * carrier.cos
+                             + self.sample_q_ants[n] * carrier.sin)
+                  for n in range(num_ants)],
+                *[q_bb[n].eq(self.sample_q_ants[n] * carrier.cos
+                             - self.sample_i_ants[n] * carrier.sin)
+                  for n in range(num_ants)],
                 early_r.eq(code.early), prompt_r.eq(code.prompt), late_r.eq(code.late),
                 epoch_r.eq(code.epoch), cphase_r.eq(code.code_frac),
                 # Global index of *this* sample, carried alongside it into
@@ -135,11 +163,11 @@ class TrackingChannel(LiteXModule):
             ),
         ]
 
-        # Running accumulators + integrated-sample bookkeeping. No sample-index
-        # state here: restart must not rebase the (global) timestamp.
-        ie = Signal((accum_bits, True)); qe = Signal((accum_bits, True))
-        ip = Signal((accum_bits, True)); qp = Signal((accum_bits, True))
-        il = Signal((accum_bits, True)); ql = Signal((accum_bits, True))
+        # Running accumulators + integrated-sample bookkeeping, one set of six
+        # per antenna. No sample-index state here: restart must not rebase the
+        # (global) timestamp.
+        acc = [{k: Signal((accum_bits, True)) for k in ACC_SIGNALS}
+               for _ in range(num_ants)]
         nsamp = Signal(32)
 
         # Saturating multiply-accumulate. Nominal GNSS operation stays far from
@@ -154,13 +182,13 @@ class TrackingChannel(LiteXModule):
         # +1 more for the accumulate, which must not wrap before it is clamped.
         sum_bits = max(accum_bits, prod_bits + 2) + 1
 
-        def sat_mac(acc, sign, bb):
+        def sat_mac(acc_sig, sign, bb):
             """acc + sign*bb clamped to accum_bits; returns (value, clamped)."""
             raw = Signal((sum_bits, True))
             val = Signal((accum_bits, True))
             sat = Signal()
             self.comb += [
-                raw.eq(acc + sign * bb),
+                raw.eq(acc_sig + sign * bb),
                 If(raw > acc_max,
                     val.eq(acc_max), sat.eq(1),
                 ).Elif(raw < acc_min,
@@ -171,14 +199,18 @@ class TrackingChannel(LiteXModule):
             ]
             return val, sat
 
+        # nxt[n][k] is antenna n's accumulator k after this sample. The clamp
+        # bits are OR-ed across the whole array: saturation is reported per
+        # channel, because a clamped antenna spoils the dump the host beamforms.
         nxt, sat_bits = [], []
-        for acc, sign, bb in ((ie, early_r,  i_bb), (qe, early_r,  q_bb),
-                              (ip, prompt_r, i_bb), (qp, prompt_r, q_bb),
-                              (il, late_r,   i_bb), (ql, late_r,   q_bb)):
-            v, s = sat_mac(acc, sign, bb)
-            nxt.append(v)
-            sat_bits.append(s)
-        ie_n, qe_n, ip_n, qp_n, il_n, ql_n = nxt
+        for n in range(num_ants):
+            vals = {}
+            for k, sign, bb in (("ie", early_r,  i_bb[n]), ("qe", early_r,  q_bb[n]),
+                                ("ip", prompt_r, i_bb[n]), ("qp", prompt_r, q_bb[n]),
+                                ("il", late_r,   i_bb[n]), ("ql", late_r,   q_bb[n])):
+                vals[k], s = sat_mac(acc[n][k], sign, bb)
+                sat_bits.append(s)
+            nxt.append(vals)
         any_sat = Signal()
         self.comb += any_sat.eq(Cat(*sat_bits) != 0)
 
@@ -186,29 +218,34 @@ class TrackingChannel(LiteXModule):
         # accumulators it describes and cleared with them.
         sat_r = Signal()
 
+        def store(dst):
+            """Latch every antenna's post-MAC value into `dst` (the running
+            accumulators, or the dump registers on the epoch sample)."""
+            return [dst[n][k].eq(nxt[n][k])
+                    for n in range(num_ants) for k in ACC_SIGNALS]
+
+        def clear():
+            return [acc[n][k].eq(0) for n in range(num_ants) for k in ACC_SIGNALS]
+
         self.sync += [
             self.dump_stb.eq(0),
             If(self.restart,
-                ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
+                *clear(),
                 nsamp.eq(0), sat_r.eq(0), self.saturated.eq(0),
             ).Elif(s1_valid,
-                ie.eq(ie_n), qe.eq(qe_n),
-                ip.eq(ip_n), qp.eq(qp_n),
-                il.eq(il_n), ql.eq(ql_n),
+                *store(acc),
                 nsamp.eq(nsamp + 1),
                 If(any_sat, sat_r.eq(1), self.saturated.eq(1)),
                 # Dump on the sample that completes a code period.
                 If(epoch_r,
                     self.dump_stb.eq(1),
-                    self.ie.eq(ie_n), self.qe.eq(qe_n),
-                    self.ip.eq(ip_n), self.qp.eq(qp_n),
-                    self.il.eq(il_n), self.ql.eq(ql_n),
+                    *store(self.acc),
                     self.integrated_samples.eq(nsamp + 1),
                     self.sample_index.eq(sidx_r),
                     self.dump_code_phase.eq(cphase_r),
                     self.dump_saturated.eq(sat_r | any_sat),
                     # Reset accumulators for the next integration.
-                    ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
+                    *clear(),
                     nsamp.eq(0), sat_r.eq(0),
                 ),
             ),

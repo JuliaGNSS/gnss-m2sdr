@@ -42,6 +42,16 @@ handover and downstream vector tracking.
 > ~2.3 % DLL loop-gain error. The Julia glue must quantise the same way and hand
 > the correlator the same integer sample shift it programmed.
 
+> **Antennas.** Beamforming in GNSSReceiver.jl is *post-correlation* on the CPU
+> (`EigenBeamformer`, adapting from the per-antenna prompt covariance), so the
+> device streams **per-antenna** accumulators — one E/P/L block per antenna in
+> every record, `T = SVector{N,Complex}` on the host. The replica generation
+> (carrier NCO, code NCO, three code RAMs) is shared across antennas, since they
+> all track the same signal and only the spatial phase differs; `NCOUpdate` stays
+> one per channel. N ≤ 2 on one board: the AD9361 is 2T2R and its shared LO is
+> what makes the two RX chains phase-coherent. Larger arrays need
+> phase-synchronised multi-board setups and are out of scope.
+
 ## Integration with litex_m2sdr (no fork)
 
 The base SoC (PCIe, clocking, SI5351, time) is reused via the upstream
@@ -82,6 +92,9 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
 - [x] Periodic **epoch-strobe records** (`gnss_epoch_period` CSR): a timebase marker
       on the shared sample counter, so the host closes epochs even with no channel
       locked (GNSSReceiver.jl#107).
+- [x] **Multi-antenna (N≤2, the AD9361's 2T2R limit)**: `num_ants` per channel —
+      one carrier/code NCO and one E/P/L replica set shared, `num_ants × 6`
+      accumulators, one E/P/L block per antenna in the record (`--num-ants 2`).
 - [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS
       satellite (PRN 24, peak/median >> 100) from the antenna.**
 

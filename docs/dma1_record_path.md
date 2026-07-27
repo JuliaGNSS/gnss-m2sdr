@@ -17,14 +17,15 @@ the same buffer size but `DMA_BUFFER_PER_IRQ = 32`):
 
 ## Framing (fixed)
 
-The record is **64 bytes** (`RECORD_WORDS = 8`), not the 48 bytes the payload
-needs:
+The record is **128 bytes** (`RECORD_WORDS = 16`), not the 80 bytes the
+two-antenna payload needs:
 
-- `8192 % 48 = 32`, so 48-byte records straddle buffer boundaries. The driver
-  drops *whole* buffers on ring overrun, so one drop shifted every subsequent
-  record by 32 bytes — permanently, with nothing to resynchronise on.
-- `8192 / 64 = 128` exactly: every DMA buffer starts on a record boundary, a
-  dropped buffer costs exactly 128 records, and the property survives any
+- `8192 % 48 = 32`, so the original 48-byte records straddled buffer boundaries.
+  The driver drops *whole* buffers on ring overrun, so one drop shifted every
+  subsequent record by 32 bytes — permanently, with nothing to resynchronise on.
+  80 and 96 bytes leave the same remainder, so neither helps.
+- `8192 / 128 = 64` exactly: every DMA buffer starts on a record boundary, a
+  dropped buffer costs exactly 64 records, and the property survives any
   power-of-two buffer size a future per-DMA length would pick.
 
 The upper half of word 5 carries `RECORD_MAGIC = 0x53534E47` ("GNSS" in wire
@@ -35,27 +36,31 @@ side, `find_record_offset()` locks onto the stream (mid-record attach, torn
 buffer) and `parse_records()` unpacks a raw byte stream, resynchronising instead
 of misparsing.
 
-The extra 16 B/record costs 64 kB/s per channel at 1 kHz dumps — free at these
-rates. Words 6 and 7 are reserved (zero) and are where a format extension
-(a second antenna's accumulators) can go without moving any existing field;
-bump `RECORD_MAGIC` if a layout ever changes incompatibly. The epoch strobe
-(#7) needed no extra words: it is a normal record with `channel = 0xFF`,
-`flags` bit 1 set and a zero payload.
+The padding costs 128 kB/s per channel at 1 kHz dumps — free at these rates. It
+buys a record whose size does not depend on gateware build options: words 2–4
+and 6–8 are one E/P/L block per antenna (`num_ants` in word 9 says how many are
+valid, the rest read zero), so a single-antenna build and a two-antenna one are
+parsed identically. Words 10–15 are reserved (zero) and are where a further
+extension can go without moving any existing field; bump `RECORD_MAGIC` if a
+layout ever changes incompatibly. The epoch strobe (#7) needed no extra words:
+it is a normal record with `channel = 0xFF`, `flags` bit 1 set and a zero
+payload — including zero antenna blocks and a zero `num_ants`.
 
 ## Latency (not fixed here — a driver/transport limit)
 
-A buffer completes only when 128 records have been written, and `hw_count` (the
+A buffer completes only when 64 records have been written, and `hw_count` (the
 only thing `read()`/`poll()`/`LITEPCIE_IOCTL_DMA_WRITER` expose) is advanced
 *only in the MSI handler* — so polling cannot beat the IRQ cadence either.
 
 | channels | record rate | buffer completes every | MSI (every 8 buffers) |
 |---|---|---|---|
-| 4 | 4000 rec/s (256 kB/s) | 32 ms  | 256 ms |
-| 2 | 2000 rec/s (128 kB/s) | 64 ms  | 512 ms |
-| 1 | 1000 rec/s ( 64 kB/s) | 128 ms | 1.02 s |
+| 4 | 4000 rec/s (512 kB/s) | 16 ms | 128 ms |
+| 2 | 2000 rec/s (256 kB/s) | 32 ms | 256 ms |
+| 1 | 1000 rec/s (128 kB/s) | 64 ms | 512 ms |
 
-(64-byte records make this *better* than the 48-byte figures in issue #4 —
-42.7 ms/4 ch — because a buffer holds fewer, larger records.)
+(128-byte records make this *better* than the 48-byte figures in issue #4 —
+42.7 ms/4 ch — because a buffer holds fewer, larger records. Padding for
+framing trades bandwidth, which is free here, for latency, which is not.)
 
 A `doppler_update_interval` of ~1 ms cannot be closed through this: tens to
 hundreds of epochs of transport delay will not stabilise at a normal PLL/DLL
@@ -70,7 +75,7 @@ Consequences for the design, in preference order:
 1. **Per-DMA buffer sizing in the driver.** The descriptor length field is
    per-descriptor and host-programmable; the driver just uses one compile-time
    constant for both channels. A 512-byte DMA1 buffer with
-   `DMA_BUFFER_PER_IRQ = 1` gives 8 records → 2 ms at 4 channels. This is the
+   `DMA_BUFFER_PER_IRQ = 1` gives 4 records → 1 ms at 4 channels. This is the
    real fix and it belongs in the (already required) "expose the 2nd DMA
    channel" driver work, not in gateware.
 
@@ -94,9 +99,9 @@ Consequences for the design, in preference order:
    (`gnss_epoch_period`, issue #7): one marker record every Δ input samples
    regardless of what the channels are doing, so buffer completion depends on
    wall-clock rather than on how many channels are locked. At Δ = 1 ms it adds
-   1000 rec/s, which bounds the *worst* case (1 locked channel: 128 ms →
-   64 ms; nothing locked: never → 128 ms) but cannot get below the 32 ms floor
-   set by 128 records/buffer, so it is a complement to (1), not a substitute.
+   1000 rec/s, which bounds the *worst* case (1 locked channel: 64 ms →
+   32 ms; nothing locked: never → 64 ms) but cannot get below the 16 ms floor
+   set by 64 records/buffer, so it is a complement to (1), not a substitute.
    Its primary job is the host's epoch clock; the latency bound is a side
    effect (see `gnss_m2sdr/record_format.py`).
 3. **Until then: close the loop over CSR, use DMA1 for bulk logging.** The CSR

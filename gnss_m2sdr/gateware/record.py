@@ -11,16 +11,21 @@ register with a per-channel sequence counter; an overflow flag is raised if a
 new dump arrives before the previous one has been serialized (should not happen
 at ~1 kHz dumps) -- a dump landing on the very cycle the previous record is
 retired still fits, because the holding register frees on that cycle. A
-round-robin FSM emits the 8-word record (see
+round-robin FSM emits the 16-word record (see
 record_format.py) for each pending channel into an output SyncFIFO, whose
 source is connected to the DMA1 sink at SoC level.
 
-The record is 64 bytes rather than the 48 the payload needs so that it divides
-litepcie's 8192-byte DMA buffer exactly (8192 % 48 = 32 would leave the stream
-permanently misaligned after the driver drops a buffer), and every record
-carries RECORD_MAGIC in the upper half of word 5 as the host's resync anchor --
-litepcie's DMA writer ignores the stream's first/last, so framing has to live
-in the payload.
+The record is 128 bytes rather than the 80 the two-antenna payload needs so that
+it divides litepcie's 8192-byte DMA buffer exactly (8192 % 48 = 32, and 80 and 96
+leave 32 too, which would leave the stream permanently misaligned after the
+driver drops a buffer), and every record carries RECORD_MAGIC in the upper half
+of word 5 as the host's resync anchor -- litepcie's DMA writer ignores the
+stream's first/last, so framing has to live in the payload.
+
+The per-antenna E/P/L blocks are always reserved, whatever `num_ants` the bank
+was built with, so the host does not have to know the build option to find a
+record; the words of an absent antenna read zero and the record's num_ants field
+says how many are valid.
 
 A lost dump is reported on two separate paths, because they answer different
 questions:
@@ -60,18 +65,24 @@ from litex.soc.interconnect import stream
 from litepcie.common import dma_layout
 
 from gnss_m2sdr.record_format import (
-    MAGIC_SHIFT, RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
+    ACC_SIGNALS, ANT_PROMPT_WORD, MAGIC_SHIFT, MAGIC_WORD, NANTS_WORD,
+    N_ANTS_MAX, RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
     FLAG_EPOCH_STROBE, FLAG_OVERFLOW,
 )
 
 
 class ChannelDumpPort:
-    """Signals a TrackingChannel drives into the recorder (one per channel)."""
-    def __init__(self, accum_bits, code_frac_bits):
+    """Signals a TrackingChannel drives into the recorder (one per channel).
+
+    acc[n] is antenna n's six accumulators; antenna 0's are also exposed under
+    the original scalar names (ie/qe/ip/qp/il/ql).
+    """
+    def __init__(self, accum_bits, code_frac_bits, num_ants=1):
         self.stb                = Signal()
-        self.ie = Signal((accum_bits, True)); self.qe = Signal((accum_bits, True))
-        self.ip = Signal((accum_bits, True)); self.qp = Signal((accum_bits, True))
-        self.il = Signal((accum_bits, True)); self.ql = Signal((accum_bits, True))
+        self.acc = [{k: Signal((accum_bits, True)) for k in ACC_SIGNALS}
+                    for _ in range(num_ants)]
+        for k, sig in self.acc[0].items():
+            setattr(self, k, sig)
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.code_phase         = Signal(code_frac_bits)
@@ -80,9 +91,11 @@ class ChannelDumpPort:
 
 class CorrelatorRecorder(LiteXModule):
     def __init__(self, n_channels, accum_bits=32, code_frac_bits=24, fifo_depth=64,
-                 drop_count_bits=16):
+                 drop_count_bits=16, num_ants=1):
         assert code_frac_bits <= 32, "code_phase shares word 5 with the magic"
-        self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits) for _ in range(n_channels)]
+        assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
+        self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits, num_ants)
+                       for _ in range(n_channels)]
         self.source = stream.Endpoint(dma_layout(64))
 
         # Slots = one per channel, plus the epoch strobe last. Every per-slot
@@ -103,6 +116,12 @@ class CorrelatorRecorder(LiteXModule):
         self.sample_stb   = Signal()
         self.sample_count = Signal(64)
         self.epoch_period = Signal(32)             # input samples per marker; 0 = off
+
+        # How many antenna blocks the records report as valid. Defaults to the
+        # build-time count and may be lowered at runtime (in 1R1T the AD9361
+        # delivers one antenna, whatever the gateware was built for), so it is
+        # latched per dump like any other record field.
+        self.num_ants = Signal(8, reset=num_ants)
 
         # # #
 
@@ -177,9 +196,9 @@ class CorrelatorRecorder(LiteXModule):
                 # cphase is held zero-extended to the 32-bit wire field so the
                 # magic can share word 5 at a fixed offset.
                 sidx=Signal(64), nsamp=Signal(32), cphase=Signal(32),
-                prn=Signal(8), seq=Signal(8), flags=Signal(8),
-                ie=Signal(32), qe=Signal(32), ip=Signal(32), qp=Signal(32),
-                il=Signal(32), ql=Signal(32),
+                prn=Signal(8), seq=Signal(8), flags=Signal(8), nants=Signal(8),
+                # One 32-bit wire field per accumulator per antenna.
+                acc=[{k: Signal(32) for k in ACC_SIGNALS} for _ in range(num_ants)],
             )
             hold.append(h)
             self.sync += slot_status(i, p.stb, [
@@ -189,9 +208,9 @@ class CorrelatorRecorder(LiteXModule):
                 h["prn"].eq(p.prn),
                 h["seq"].eq(seqs[i]),
                 h["flags"].eq(Mux(flag_next[i], FLAG_OVERFLOW, 0)),
-                h["ie"].eq(s32(p.ie)), h["qe"].eq(s32(p.qe)),
-                h["ip"].eq(s32(p.ip)), h["qp"].eq(s32(p.qp)),
-                h["il"].eq(s32(p.il)), h["ql"].eq(s32(p.ql)),
+                h["nants"].eq(self.num_ants),
+                *[h["acc"][n][k].eq(s32(p.acc[n][k]))
+                  for n in range(num_ants) for k in ACC_SIGNALS],
             ])
 
         # Epoch strobe: one marker every `epoch_period` *input samples*, so the
@@ -218,12 +237,13 @@ class CorrelatorRecorder(LiteXModule):
         # The strobe's holding register is the last slot. Only sample_index/seq/
         # flags mean anything, so the rest of the record is wired to constants --
         # a marker is not a correlator dump and the host must not read a payload
-        # out of it.
+        # out of it. That includes every antenna block and the num_ants word: a
+        # strobe record reads zero there, and unpack_record() clamps num_ants up
+        # to 1 rather than indexing a block that carries nothing.
         sh = dict(
             sidx=Signal(64), nsamp=C(0, 32), cphase=C(0, 32), prn=C(0, 8),
-            seq=Signal(8), flags=Signal(8),
-            ie=C(0, 32), qe=C(0, 32), ip=C(0, 32), qp=C(0, 32),
-            il=C(0, 32), ql=C(0, 32),
+            seq=Signal(8), flags=Signal(8), nants=C(0, 8),
+            acc=[{k: C(0, 32) for k in ACC_SIGNALS} for _ in range(num_ants)],
         )
         hold.append(sh)
         self.sync += slot_status(STROBE_SLOT, strobe, [
@@ -237,18 +257,22 @@ class CorrelatorRecorder(LiteXModule):
         widx = Signal(max=RECORD_WORDS)
         word = Signal(64)
 
-        # Selected channel's holding register -> current record word.
+        # Selected channel's holding register -> current record word. Words the
+        # layout does not assign stay zero: the reserved tail that keeps the
+        # record at 128 B (so it divides the DMA buffer), and the block of any
+        # antenna this build does not have.
         def build_words(h, chan_id):
-            return [
-                h["sidx"],
-                Cat(h["seq"], h["flags"], h["prn"], C(chan_id, 8), h["nsamp"]),  # w1 low..high
-                Cat(h["ip"], h["qp"]),
-                Cat(h["ie"], h["qe"]),
-                Cat(h["il"], h["ql"]),
-                Cat(h["cphase"], C(RECORD_MAGIC, 64 - MAGIC_SHIFT)),  # magic in the spare half
-                C(0, 64),   # reserved, keeps the record at 64 B (divides the DMA buffer)
-                C(0, 64),
-            ]
+            words = [C(0, 64)] * RECORD_WORDS
+            words[0] = h["sidx"]
+            words[1] = Cat(h["seq"], h["flags"], h["prn"], C(chan_id, 8), h["nsamp"])  # low..high
+            words[MAGIC_WORD] = Cat(h["cphase"], C(RECORD_MAGIC, 64 - MAGIC_SHIFT))
+            words[NANTS_WORD] = Cat(h["nants"], C(0, 56))
+            for n, a in enumerate(h["acc"]):
+                ant_word = ANT_PROMPT_WORD[n]
+                words[ant_word + 0] = Cat(a["ip"], a["qp"])
+                words[ant_word + 1] = Cat(a["ie"], a["qe"])
+                words[ant_word + 2] = Cat(a["il"], a["ql"])
+            return words
         cases = {}
         for i, h in enumerate(hold):
             words_i = build_words(h, STROBE_CHANNEL if i == STROBE_SLOT else i)

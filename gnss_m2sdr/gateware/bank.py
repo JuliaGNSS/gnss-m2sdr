@@ -24,6 +24,12 @@ Two sticky per-channel health bits are exposed: `overflow` (a dump was dropped
 because the recorder had not drained the previous one) and `saturation` (an
 accumulator hit the `accum_bits` rail). Both say "these records do not describe
 the RF"; saturation is cleared by that channel's restart.
+
+With `num_ants` > 1 every channel correlates all antennas against one shared
+replica set and reports one E/P/L block per antenna (see channel.py); the
+control CSRs, the sample strobe, the counter, the health bits and the record's
+timestamp / code_phase stay one-per-channel, since the antennas track the same
+signal.
 """
 
 from migen import *
@@ -34,6 +40,7 @@ from litex.soc.interconnect.csr import *
 from gnss_m2sdr.gateware.channel import TrackingChannel
 from gnss_m2sdr.gateware.record  import CorrelatorRecorder
 from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
+from gnss_m2sdr.record_format import ACC_SIGNALS, N_ANTS_MAX
 
 
 class ChannelWithCSR(LiteXModule):
@@ -65,15 +72,20 @@ class ChannelWithCSR(LiteXModule):
     integrated_samples + 1`` invariant intact.
     """
     def __init__(self, prn=1, code_frac_bits=24, accum_bits=32,
-                 carrier_phase_bits=32, code_length=CA_CODE_LENGTH):
-        self.sample_i     = Signal((16, True))
-        self.sample_q     = Signal((16, True))
+                 carrier_phase_bits=32, code_length=CA_CODE_LENGTH, num_ants=1):
+        # One I/Q pair per antenna, all on the same strobe. Antenna 0 keeps the
+        # scalar names, so single-antenna wiring is unchanged.
+        self.sample_i_ants = [Signal((16, True)) for _ in range(num_ants)]
+        self.sample_q_ants = [Signal((16, True)) for _ in range(num_ants)]
+        self.sample_i     = self.sample_i_ants[0]
+        self.sample_q     = self.sample_q_ants[0]
         self.sample_stb   = Signal()
         self.sample_count = Signal(64)   # global counter, from GNSSTracking
 
         self.channel = ch = TrackingChannel(
             prn=prn, code_frac_bits=code_frac_bits, accum_bits=accum_bits,
-            carrier_phase_bits=carrier_phase_bits, code_length=code_length)
+            carrier_phase_bits=carrier_phase_bits, code_length=code_length,
+            num_ants=num_ants)
 
         # CSRs. restart/carrier_set are edge-triggered: host writes 1 then 0;
         # a one-cycle pulse is generated on the 0->1 transition.
@@ -131,10 +143,19 @@ class ChannelWithCSR(LiteXModule):
         # Correlator-dump readback (latched on each dump). Driver-free way to
         # run/validate the tracking loop over RemoteClient. For a coherent read,
         # sample dump_count, read the fields, then re-read dump_count.
+        # Antenna 0 keeps the bare names (ip, qp, ...) the host tooling already
+        # reads; further antennas are suffixed (ip_ant1, ...). The CSR names are
+        # passed explicitly because the frame-inspecting default cannot see
+        # through the loop.
         self._dump_count = CSRStatus(32, description="Increments on each correlator dump.")
-        self._ip = CSRStatus(32); self._qp = CSRStatus(32)
-        self._ie = CSRStatus(32); self._qe = CSRStatus(32)
-        self._il = CSRStatus(32); self._ql = CSRStatus(32)
+        self.acc_csr = []
+        for n in range(num_ants):
+            suffix = "" if n == 0 else f"_ant{n}"
+            regs = {}
+            for k in ACC_SIGNALS:
+                regs[k] = CSRStatus(32, name=k + suffix)
+                setattr(self, "_" + k + suffix, regs[k])
+            self.acc_csr.append(regs)
         self._integrated_samples = CSRStatus(32)
         self._sample_index       = CSRStatus(64)
         self._dump_code_phase    = CSRStatus(code_frac_bits)
@@ -207,8 +228,8 @@ class ChannelWithCSR(LiteXModule):
         ]
 
         self.comb += [
-            ch.sample_i.eq(self.sample_i),
-            ch.sample_q.eq(self.sample_q),
+            *[ch.sample_i_ants[n].eq(self.sample_i_ants[n]) for n in range(num_ants)],
+            *[ch.sample_q_ants[n].eq(self.sample_q_ants[n]) for n in range(num_ants)],
             ch.sample_stb.eq(self.sample_stb),
             ch.sample_count.eq(self.sample_count),
             # On the apply cycle the staged word must reach the NCO
@@ -248,9 +269,8 @@ class ChannelWithCSR(LiteXModule):
         # Latch dump fields into readback status registers.
         self.sync += If(ch.dump_stb,
             self._dump_count.status.eq(self._dump_count.status + 1),
-            self._ip.status.eq(ch.ip), self._qp.status.eq(ch.qp),
-            self._ie.status.eq(ch.ie), self._qe.status.eq(ch.qe),
-            self._il.status.eq(ch.il), self._ql.status.eq(ch.ql),
+            *[regs[k].status.eq(ch.acc[n][k])
+              for n, regs in enumerate(self.acc_csr) for k in ACC_SIGNALS],
             self._integrated_samples.status.eq(ch.integrated_samples),
             self._sample_index.status.eq(ch.sample_index),
             self._dump_code_phase.status.eq(ch.dump_code_phase),
@@ -261,9 +281,8 @@ class ChannelWithCSR(LiteXModule):
         ch = self.channel
         return [
             port.stb.eq(ch.dump_stb),
-            port.ie.eq(ch.ie), port.qe.eq(ch.qe),
-            port.ip.eq(ch.ip), port.qp.eq(ch.qp),
-            port.il.eq(ch.il), port.ql.eq(ch.ql),
+            *[port.acc[n][k].eq(ch.acc[n][k])
+              for n in range(len(ch.acc)) for k in ACC_SIGNALS],
             port.integrated_samples.eq(ch.integrated_samples),
             port.sample_index.eq(ch.sample_index),
             port.code_phase.eq(ch.dump_code_phase),
@@ -273,10 +292,12 @@ class ChannelWithCSR(LiteXModule):
 
 class GNSSTracking(LiteXModule):
     """Bank of tracking channels + recorder. Observes the RX sample stream."""
-    def __init__(self, n_channels=4, prns=None, code_frac_bits=24, accum_bits=32):
+    def __init__(self, n_channels=4, prns=None, code_frac_bits=24, accum_bits=32,
+                 num_ants=1):
         if prns is None:
             prns = [i + 1 for i in range(n_channels)]
         assert len(prns) == n_channels
+        assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
         # The wire format and the CSR readback both carry 32-bit accumulators
         # (record_format.py word 2..4, ChannelWithCSR's CSRStatus(32)), and
         # record.py's s32() takes the low 32 bits unconditionally -- any other
@@ -285,9 +306,18 @@ class GNSSTracking(LiteXModule):
         assert accum_bits == 32, (
             f"accum_bits must be 32 (record_format.py word layout), got {accum_bits}")
 
-        self.sample_i   = Signal((16, True))
-        self.sample_q   = Signal((16, True))
+        # One I/Q pair per antenna, all on the same strobe (antenna 0 also under
+        # the scalar names).
+        self.sample_i_ants = [Signal((16, True)) for _ in range(num_ants)]
+        self.sample_q_ants = [Signal((16, True)) for _ in range(num_ants)]
+        self.sample_i   = self.sample_i_ants[0]
+        self.sample_q   = self.sample_q_ants[0]
         self.sample_stb = Signal()
+        # How many antennas the sample stream currently carries: the build-time
+        # count unless something upstream knows better (the RX observer lowers
+        # it to 1 in the AD9361's 1R1T mode, where the two slots of a word are
+        # consecutive samples of one antenna). Left undriven it reads its reset.
+        self.ants_valid = Signal(max=num_ants + 1, reset=num_ants)
 
         self._control = CSRStorage(fields=[
             CSRField("enable", size=1, description="Enable sample processing in all channels."),
@@ -318,6 +348,8 @@ class GNSSTracking(LiteXModule):
         # host never configures streams exactly what it did before.
         self._epoch_period = CSRStorage(32, reset=0,
             description="Epoch-strobe period in input samples (0 = no strobe records).")
+        self._num_ants = CSRStatus(8, description=
+            "Antennas currently reported per dump (1..N_ANTS_MAX); host discovery.")
         # The one time axis: a free-running count of observed sample strobes,
         # ungated by `enable` and never reset (not by a channel restart either),
         # so every channel's dumps -- and the raw DMA0 stream, which the host
@@ -335,12 +367,15 @@ class GNSSTracking(LiteXModule):
 
         # # #
 
-        self.recorder = recorder = CorrelatorRecorder(n_channels, accum_bits, code_frac_bits)
+        self.recorder = recorder = CorrelatorRecorder(n_channels, accum_bits, code_frac_bits,
+                                                      num_ants=num_ants)
         self.source = recorder.source
         self.comb += [
             recorder.sample_stb.eq(self.sample_stb),      # ungated on purpose
             recorder.sample_count.eq(self.sample_count),
             recorder.epoch_period.eq(self._epoch_period.storage),
+            recorder.num_ants.eq(self.ants_valid),
+            self._num_ants.status.eq(self.ants_valid),
         ]
 
         gated_stb = Signal()
@@ -348,12 +383,13 @@ class GNSSTracking(LiteXModule):
 
         self.channels = []
         for i in range(n_channels):
-            chan = ChannelWithCSR(prn=prns[i], code_frac_bits=code_frac_bits, accum_bits=accum_bits)
+            chan = ChannelWithCSR(prn=prns[i], code_frac_bits=code_frac_bits,
+                                  accum_bits=accum_bits, num_ants=num_ants)
             setattr(self.submodules, f"ch{i}", chan)
             self.channels.append(chan)
             self.comb += [
-                chan.sample_i.eq(self.sample_i),
-                chan.sample_q.eq(self.sample_q),
+                *[chan.sample_i_ants[n].eq(self.sample_i_ants[n]) for n in range(num_ants)],
+                *[chan.sample_q_ants[n].eq(self.sample_q_ants[n]) for n in range(num_ants)],
                 chan.sample_stb.eq(gated_stb),
                 chan.sample_count.eq(self.sample_count),
             ]
