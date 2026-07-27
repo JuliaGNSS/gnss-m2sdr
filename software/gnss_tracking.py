@@ -186,7 +186,23 @@ class GNSSBank:
         self.csr.write("gnss_control", 1 if on else 0)
 
     def overflow(self):
+        """Sticky per-channel overflow mask: a set bit means that channel lost at
+        least one correlator dump since the last clear_overflow(). Sticky, so a
+        slow poller cannot miss it (the per-record FLAG_OVERFLOW marks *where*).
+        """
         return self.csr.read("gnss_overflow")
+
+    def dropped(self, index):
+        """Saturating count of dumps lost on channel `index` since the last clear."""
+        return self.csr.read(f"gnss_dropped{index}")
+
+    def clear_overflow(self, mask=0xFFFFFFFF):
+        """Write-1-to-clear the sticky overflow bits and their drop counters.
+
+        Read overflow()/dropped() first: a drop landing on the clear cycle is
+        kept (the counter restarts at 1), so no event is lost to the clear.
+        """
+        self.csr.write("gnss_overflow_clear", mask)
 
     def sample_count(self, tries=3):
         """Global free-running input-sample counter (the record timestamp axis).
