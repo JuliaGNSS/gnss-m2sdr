@@ -12,6 +12,12 @@ Per enabled input sample (I, Q):
   2. Code NCO -> Early/Prompt/Late code chips (+/-1).
   3. Accumulate code * baseband into six I&D accumulators (I/Q x E/P/L).
 
+The accumulators saturate at `accum_bits` rather than wrapping: a wrapped sum
+still looks like a valid correlator value to the host, so overflow would be
+silent. `dump_saturated` marks the dump whose integration clamped, and
+`saturated` is the sticky per-channel version (cleared by `restart`) that the
+bank exposes over CSR.
+
 On each code epoch (one 1023-chip period) the accumulators are latched to the
 dump registers, the integrated-sample count and the sample-counter value are
 captured, and the accumulators reset. The dump maps onto Tracking.jl's
@@ -63,6 +69,7 @@ class TrackingChannel(LiteXModule):
 
         # Dump outputs (valid for one cycle when dump_stb high, then held).
         self.dump_stb           = Signal()
+        self.dump_saturated     = Signal()  # the dumped integration clamped
         self.ie = Signal((accum_bits, True))
         self.qe = Signal((accum_bits, True))
         self.ip = Signal((accum_bits, True))
@@ -72,6 +79,11 @@ class TrackingChannel(LiteXModule):
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.dump_code_phase    = Signal(code_frac_bits)
+
+        # Sticky "an accumulator hit the rail since the last restart" status,
+        # for the bank's saturation CSR. Unlike dump_saturated this survives
+        # across dumps, so a host polling at its own pace cannot miss it.
+        self.saturated = Signal()
 
         # # #
 
@@ -123,35 +135,74 @@ class TrackingChannel(LiteXModule):
         il = Signal((accum_bits, True)); ql = Signal((accum_bits, True))
         nsamp = Signal(32)
 
+        # Saturating multiply-accumulate. Nominal GNSS operation stays far from
+        # the rail (the sum is noise-dominated and grows as sqrt(N)), but a
+        # strong in-band interferer, a badly set AD9361 gain or a high fs x long
+        # integration can overrun accum_bits -- and a wrapped accumulator is
+        # indistinguishable from a plausible correlator value once it reaches
+        # the host. Clamp instead, and say so, so a bad dump is recognisable.
+        acc_max =  (1 << (accum_bits - 1)) - 1
+        acc_min = -(1 << (accum_bits - 1))
+        # code.*_r are +/-1 (2 bits signed), so the product is prod_bits+2 wide;
+        # +1 more for the accumulate, which must not wrap before it is clamped.
+        sum_bits = max(accum_bits, prod_bits + 2) + 1
+
+        def sat_mac(acc, sign, bb):
+            """acc + sign*bb clamped to accum_bits; returns (value, clamped)."""
+            raw = Signal((sum_bits, True))
+            val = Signal((accum_bits, True))
+            sat = Signal()
+            self.comb += [
+                raw.eq(acc + sign * bb),
+                If(raw > acc_max,
+                    val.eq(acc_max), sat.eq(1),
+                ).Elif(raw < acc_min,
+                    val.eq(acc_min), sat.eq(1),
+                ).Else(
+                    val.eq(raw),
+                ),
+            ]
+            return val, sat
+
+        nxt, sat_bits = [], []
+        for acc, sign, bb in ((ie, early_r,  i_bb), (qe, early_r,  q_bb),
+                              (ip, prompt_r, i_bb), (qp, prompt_r, q_bb),
+                              (il, late_r,   i_bb), (ql, late_r,   q_bb)):
+            v, s = sat_mac(acc, sign, bb)
+            nxt.append(v)
+            sat_bits.append(s)
+        ie_n, qe_n, ip_n, qp_n, il_n, ql_n = nxt
+        any_sat = Signal()
+        self.comb += any_sat.eq(Cat(*sat_bits) != 0)
+
+        # Per-integration saturation, latched into dump_saturated alongside the
+        # accumulators it describes and cleared with them.
+        sat_r = Signal()
+
         self.sync += [
             self.dump_stb.eq(0),
             If(self.restart,
                 ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
-                nsamp.eq(0),
+                nsamp.eq(0), sat_r.eq(0), self.saturated.eq(0),
             ).Elif(s1_valid,
-                # code.*_r are +/-1; multiply-accumulate the registered baseband.
-                ie.eq(ie + early_r  * i_bb),
-                qe.eq(qe + early_r  * q_bb),
-                ip.eq(ip + prompt_r * i_bb),
-                qp.eq(qp + prompt_r * q_bb),
-                il.eq(il + late_r   * i_bb),
-                ql.eq(ql + late_r   * q_bb),
+                ie.eq(ie_n), qe.eq(qe_n),
+                ip.eq(ip_n), qp.eq(qp_n),
+                il.eq(il_n), ql.eq(ql_n),
                 nsamp.eq(nsamp + 1),
+                If(any_sat, sat_r.eq(1), self.saturated.eq(1)),
                 # Dump on the sample that completes a code period.
                 If(epoch_r,
                     self.dump_stb.eq(1),
-                    self.ie.eq(ie + early_r  * i_bb),
-                    self.qe.eq(qe + early_r  * q_bb),
-                    self.ip.eq(ip + prompt_r * i_bb),
-                    self.qp.eq(qp + prompt_r * q_bb),
-                    self.il.eq(il + late_r   * i_bb),
-                    self.ql.eq(ql + late_r   * q_bb),
+                    self.ie.eq(ie_n), self.qe.eq(qe_n),
+                    self.ip.eq(ip_n), self.qp.eq(qp_n),
+                    self.il.eq(il_n), self.ql.eq(ql_n),
                     self.integrated_samples.eq(nsamp + 1),
                     self.sample_index.eq(sidx_r),
                     self.dump_code_phase.eq(cphase_r),
+                    self.dump_saturated.eq(sat_r | any_sat),
                     # Reset accumulators for the next integration.
                     ie.eq(0), qe.eq(0), ip.eq(0), qp.eq(0), il.eq(0), ql.eq(0),
-                    nsamp.eq(0),
+                    nsamp.eq(0), sat_r.eq(0),
                 ),
             ),
         ]

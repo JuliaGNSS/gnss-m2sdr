@@ -14,6 +14,11 @@ dump so channels handed over at different times stay comparable (and which the
 host can read over CSR to place the raw DMA0 stream on the same axis).
 Correlator dumps are serialized by a CorrelatorRecorder into a 64-bit record
 stream for DMA1.
+
+Two sticky per-channel health bits are exposed: `overflow` (a dump was dropped
+because the recorder had not drained the previous one) and `saturation` (an
+accumulator hit the `accum_bits` rail). Both say "these records do not describe
+the RF"; saturation is cleared by that channel's restart.
 """
 
 from migen import *
@@ -22,7 +27,7 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 
 from gnss_m2sdr.gateware.channel import TrackingChannel
-from gnss_m2sdr.gateware.record  import CorrelatorRecorder, ChannelDumpPort
+from gnss_m2sdr.gateware.record  import CorrelatorRecorder
 from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
 
 
@@ -67,6 +72,8 @@ class ChannelWithCSR(LiteXModule):
         self._integrated_samples = CSRStatus(32)
         self._sample_index       = CSRStatus(64)
         self._dump_code_phase    = CSRStatus(code_frac_bits)
+        self._dump_saturated     = CSRStatus(1,
+            description="Set if the integration behind the latched dump clamped.")
 
         # # #
 
@@ -119,6 +126,7 @@ class ChannelWithCSR(LiteXModule):
             self._integrated_samples.status.eq(ch.integrated_samples),
             self._sample_index.status.eq(ch.sample_index),
             self._dump_code_phase.status.eq(ch.dump_code_phase),
+            self._dump_saturated.status.eq(ch.dump_saturated),
         )
 
     def connect_dump(self, port):
@@ -141,6 +149,13 @@ class GNSSTracking(LiteXModule):
         if prns is None:
             prns = [i + 1 for i in range(n_channels)]
         assert len(prns) == n_channels
+        # The wire format and the CSR readback both carry 32-bit accumulators
+        # (record_format.py word 2..4, ChannelWithCSR's CSRStatus(32)), and
+        # record.py's s32() takes the low 32 bits unconditionally -- any other
+        # accum_bits would be truncated on the way out without a word of
+        # warning. Fail the build instead of shipping mangled correlators.
+        assert accum_bits == 32, (
+            f"accum_bits must be 32 (record_format.py word layout), got {accum_bits}")
 
         self.sample_i   = Signal((16, True))
         self.sample_q   = Signal((16, True))
@@ -158,8 +173,11 @@ class GNSSTracking(LiteXModule):
         # FLAG_OVERFLOW remains the transient, per-dump marker.
         self._overflow = CSRStatus(n_channels,
             description="Sticky per-channel record overflow; cleared only via overflow_clear.")
+
         self._overflow_clear = CSRStorage(n_channels,
             description="Write 1 to a bit to clear that channel's overflow bit + drop counter.")
+        self._saturation = CSRStatus(n_channels,
+            description="Sticky per-channel accumulator saturation (cleared by that channel's restart).")
         # The one time axis: a free-running count of observed sample strobes,
         # ungated by `enable` and never reset (not by a channel restart either),
         # so every channel's dumps -- and the raw DMA0 stream, which the host
@@ -209,3 +227,7 @@ class GNSSTracking(LiteXModule):
             recorder.overflow_clear.eq(self._overflow_clear.storage
                                        & Replicate(self._overflow_clear.re, n_channels)),
         ]
+        # Saturation is reported per channel next to overflow: both mean "the
+        # records you are reading are not what the RF actually correlated to".
+        self.comb += self._saturation.status.eq(
+            Cat(*[c.channel.saturated for c in self.channels]))

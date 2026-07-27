@@ -19,19 +19,59 @@ path (LITEX_M2SDR_DIR) rather than imported as a package.
 import os
 import importlib.util
 
-LITEX_M2SDR_DIR = os.environ.get(
-    "LITEX_M2SDR_DIR", "/workspace/litex_m2sdr-worktrees/create-new-gateware")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Where to look for the litex_m2sdr checkout when LITEX_M2SDR_DIR is unset.
+# Conventional locations only -- no developer's worktree path.
+LITEX_M2SDR_DIR_CANDIDATES = (
+    os.path.expanduser("~/litex_m2sdr"),
+    os.path.join(os.path.dirname(_REPO_ROOT), "litex_m2sdr"),   # sibling checkout
+)
+
+
+def find_litex_m2sdr_dir(env=None, candidates=None):
+    """Directory holding litex_m2sdr.py.
+
+    $LITEX_M2SDR_DIR wins outright when set (and is not silently ignored when
+    it is wrong); otherwise the conventional locations are tried. If nothing
+    matches, the error names every path that was tried -- the previous default
+    pointed at one developer's worktree, so everyone else hit a
+    FileNotFoundError for a directory they had never heard of.
+    """
+    env       = os.environ if env is None else env
+    candidates = LITEX_M2SDR_DIR_CANDIDATES if candidates is None else candidates
+    explicit  = env.get("LITEX_M2SDR_DIR")
+    tried     = [explicit] if explicit else list(candidates)
+    for directory in tried:
+        if os.path.exists(os.path.join(directory, "litex_m2sdr.py")):
+            return directory
+    raise FileNotFoundError(
+        "litex_m2sdr.py not found; set LITEX_M2SDR_DIR to the litex_m2sdr "
+        "checkout (the directory containing litex_m2sdr.py). Tried: "
+        + ", ".join(tried))
+
+
+def require_record_dma(soc):
+    """Fail loudly if the correlator-record DMA is missing.
+
+    GNSSSoC forces pcie_dmas=2, so an absent pcie_dma1 is a build bug. Leaving
+    the record stream unconnected is the worst possible failure mode: the FIFO
+    fills, the recorder stalls in EMIT and every channel starts reporting
+    overflow, with nothing anywhere pointing at the actual cause.
+    """
+    if not hasattr(soc, "pcie_dma1"):
+        raise AttributeError(
+            "no pcie_dma1: GNSSSoC needs a second PCIe DMA to stream correlator "
+            "records (build with with_pcie=True; GNSSSoC sets pcie_dmas=2).")
 
 
 def load_base_module():
-    path = os.path.join(LITEX_M2SDR_DIR, "litex_m2sdr.py")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"litex_m2sdr.py not found at {path}; set LITEX_M2SDR_DIR.")
+    directory = find_litex_m2sdr_dir()
+    path = os.path.join(directory, "litex_m2sdr.py")
     # Ensure the litex_m2sdr package + platform module resolve from that tree.
     import sys
-    if LITEX_M2SDR_DIR not in sys.path:
-        sys.path.insert(0, LITEX_M2SDR_DIR)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
     spec = importlib.util.spec_from_file_location("litex_m2sdr_build", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -77,9 +117,9 @@ class GNSSSoC(BaseSoC):
             self.gnss.sample_q.eq(self.gnss_rx.sample_q),
             self.gnss.sample_stb.eq(self.gnss_rx.sample_stb),
         ]
-        if hasattr(self, "pcie_dma1"):
-            self.comb += [
-                self.gnss.source.connect(self.pcie_dma1.sink),
-                self.pcie_dma1.synchronizer.pps.eq(self.pps_gen.pps_pulse),
-            ]
+        require_record_dma(self)
+        self.comb += [
+            self.gnss.source.connect(self.pcie_dma1.sink),
+            self.pcie_dma1.synchronizer.pps.eq(self.pps_gen.pps_pulse),
+        ]
         return rx_stream
