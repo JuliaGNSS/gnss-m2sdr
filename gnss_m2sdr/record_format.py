@@ -56,6 +56,29 @@ where chunk_origin is the counter value at the first sample of the chunk. The
 `+1` is deliberate, not an off-by-one. The companion invariant holds on both
 sides: first_sample = sample_index - integrated_samples + 1.
 
+Epoch strobes
+-------------
+`channel == STROBE_CHANNEL` (0xFF) with `flags` bit 1 (`FLAG_EPOCH_STROBE`) set
+marks a **timebase record**, not a correlator dump: the recorder emits one every
+`epoch_period` input samples (`gnss_epoch_period` CSR, 0 = off), carrying only
+`sample_index` on the same free-running counter as the dumps -- every other
+payload field is zero. The host's epoch rule ("close epoch e once something with
+`sample_index >= (e+1)*delta` arrives", GNSSReceiver.jl#107) then has a clock
+that does not depend on a satellite being locked: without it a receiver with
+nothing acquired, or one that has just lost lock on every channel, stalls the
+loop indefinitely, and with only one channel dumping the boundary jitters with
+that satellite's code phase. Set `epoch_period` to the host's delta so a strobe
+lands exactly on each boundary.
+
+The strobe is a recorder slot like a channel, so it inherits the whole
+lost-record story unchanged: `FLAG_OVERFLOW` on a marker means a previous marker
+was dropped (period shorter than a record takes to serialize), bit `n_channels`
+of `gnss_overflow` is its sticky status, `gnss_droppedstrobe` counts the losses,
+and the same `gnss_overflow_clear` bit clears both.
+
+Host glue must skip these when building CorrelatorOutputs -- use
+`is_epoch_strobe()` -- and use them only to advance the epoch clock.
+
 Framing
 -------
 The record is 64 bytes -- not the 48 bytes the payload needs -- because
@@ -90,7 +113,12 @@ MAGIC_OFFSET  = MAGIC_WORD * 8 + MAGIC_SHIFT // 8   # byte offset within a recor
 
 assert DMA_BUFFER_SIZE % RECORD_BYTES == 0, "record must divide the DMA buffer"
 
-FLAG_OVERFLOW = 1 << 0
+FLAG_OVERFLOW      = 1 << 0
+FLAG_EPOCH_STROBE  = 1 << 1
+
+# Reserved `channel` id for the periodic timebase marker. 0xFF cannot collide
+# with a real channel: the round-robin serializer only reaches n_channels.
+STROBE_CHANNEL = 0xFF
 
 
 def pack_record(sample_index, integrated_samples, channel, prn, seq, flags,
@@ -129,6 +157,11 @@ def unpack_record(words):
         code_phase = w5 & 0xFFFFFFFF,
         magic      = (w5 >> MAGIC_SHIFT) & 0xFFFFFFFF,
     )
+
+
+def is_epoch_strobe(rec):
+    """True for a timebase marker (no correlator payload), false for a dump."""
+    return bool(rec["flags"] & FLAG_EPOCH_STROBE) and rec["channel"] == STROBE_CHANNEL
 
 
 def has_magic_at(data, offset):

@@ -185,14 +185,18 @@ class TestBankOverflowCSRs(unittest.TestCase):
         self.assertEqual([p for p in pulses if p], [0b10],
                          "a CSR write must produce exactly one masked clear pulse")
 
-    def test_dropped_csrs_are_per_channel_and_wired(self):
+    def test_dropped_csrs_are_per_slot_and_wired(self):
+        # One bit/counter per recorder *slot*: the channels, then the epoch
+        # strobe last (test_epoch_strobe.py owns its behaviour; here we only
+        # pin that it is on the same footing as a channel).
         dut = GNSSTracking(n_channels=2)
-        self.assertEqual(len(dut._overflow.status), 2)
-        self.assertEqual(len(dut._overflow_clear.storage), 2)
+        self.assertEqual(len(dut._overflow.status), 3)
+        self.assertEqual(len(dut._overflow_clear.storage), 3)
         for i in range(2):
             csr = getattr(dut, f"_dropped{i}")
             self.assertEqual(csr.name, f"dropped{i}")
             self.assertEqual(len(csr.status), len(dut.recorder.dropped[i]))
+        self.assertEqual(len(dut._droppedstrobe.status), len(dut.recorder.dropped[2]))
 
 
 if __name__ == "__main__":

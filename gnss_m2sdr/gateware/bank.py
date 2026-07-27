@@ -16,7 +16,9 @@ one 64-bit counter per bank, ungated and never reset, which timestamps every
 dump so channels handed over at different times stay comparable (and which the
 host can read over CSR to place the raw DMA0 stream on the same axis).
 Correlator dumps are serialized by a CorrelatorRecorder into a 64-bit record
-stream for DMA1.
+stream for DMA1, alongside an optional epoch strobe (`epoch_period` CSR): a
+marker record every N samples of that same counter, so the host's epoch clock
+does not depend on a channel being locked.
 
 Two sticky per-channel health bits are exposed: `overflow` (a dump was dropped
 because the recorder had not drained the previous one) and `saturation` (an
@@ -297,13 +299,25 @@ class GNSSTracking(LiteXModule):
         # rate. droppedN counts the lost dumps so "one missed epoch" and "the
         # loop stalled for 200 ms" are distinguishable; the per-record
         # FLAG_OVERFLOW remains the transient, per-dump marker.
-        self._overflow = CSRStatus(n_channels,
-            description="Sticky per-channel record overflow; cleared only via overflow_clear.")
-
-        self._overflow_clear = CSRStorage(n_channels,
-            description="Write 1 to a bit to clear that channel's overflow bit + drop counter.")
+        # Bit i is channel i; bit n_channels is the epoch strobe, which is a
+        # recorder slot like any other and so gets the same sticky bit, the same
+        # write-1-to-clear and its own drop counter (droppedstrobe).
+        n_slots = n_channels + 1
+        self._overflow = CSRStatus(n_slots,
+            description="Sticky per-slot record overflow (bit n_channels = epoch strobe); "
+                        "cleared only via overflow_clear.")
+        self._overflow_clear = CSRStorage(n_slots,
+            description="Write 1 to a bit to clear that slot's overflow bit + drop counter.")
+        # Saturation stays per *channel*: the strobe slot has no accumulators.
         self._saturation = CSRStatus(n_channels,
             description="Sticky per-channel accumulator saturation (cleared by that channel's restart).")
+        # Epoch strobe: a timebase marker record every N input samples, so the
+        # host can close an epoch without waiting for a satellite to dump (see
+        # record_format.py). Ungated by `enable` -- the case it exists for is
+        # precisely "no channel is producing anything". 0 = off, so a build the
+        # host never configures streams exactly what it did before.
+        self._epoch_period = CSRStorage(32, reset=0,
+            description="Epoch-strobe period in input samples (0 = no strobe records).")
         # The one time axis: a free-running count of observed sample strobes,
         # ungated by `enable` and never reset (not by a channel restart either),
         # so every channel's dumps -- and the raw DMA0 stream, which the host
@@ -323,6 +337,11 @@ class GNSSTracking(LiteXModule):
 
         self.recorder = recorder = CorrelatorRecorder(n_channels, accum_bits, code_frac_bits)
         self.source = recorder.source
+        self.comb += [
+            recorder.sample_stb.eq(self.sample_stb),      # ungated on purpose
+            recorder.sample_count.eq(self.sample_count),
+            recorder.epoch_period.eq(self._epoch_period.storage),
+        ]
 
         gated_stb = Signal()
         self.comb += gated_stb.eq(self.sample_stb & self._control.storage[0])  # enable
@@ -346,12 +365,17 @@ class GNSSTracking(LiteXModule):
             setattr(self, f"_dropped{i}", dropped)
             self.comb += dropped.status.eq(recorder.dropped[i])
 
+        # ... and one for the strobe slot, on the same footing as a channel's.
+        self._droppedstrobe = CSRStatus(len(recorder.dropped[n_channels]),
+            description="Saturating count of epoch strobes dropped.")
+        self.comb += self._droppedstrobe.status.eq(recorder.dropped[n_channels])
+
         # Write-1-to-clear: `re` pulses for one cycle with `storage` already
         # holding the written mask (same pattern as the code_load strobe above).
         self.comb += [
             self._overflow.status.eq(recorder.overflow),
             recorder.overflow_clear.eq(self._overflow_clear.storage
-                                       & Replicate(self._overflow_clear.re, n_channels)),
+                                       & Replicate(self._overflow_clear.re, n_slots)),
         ]
         # Saturation is reported per channel next to overflow: both mean "the
         # records you are reading are not what the RF actually correlated to".

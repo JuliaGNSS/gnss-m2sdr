@@ -241,15 +241,36 @@ class GNSSBank:
         self.csr.write("gnss_control", 1 if on else 0)
 
     def overflow(self):
-        """Sticky per-channel overflow mask: a set bit means that channel lost at
-        least one correlator dump since the last clear_overflow(). Sticky, so a
-        slow poller cannot miss it (the per-record FLAG_OVERFLOW marks *where*).
+        """Sticky per-slot overflow mask: a set bit means that slot lost at
+        least one record since the last clear_overflow(). Sticky, so a slow
+        poller cannot miss it (the per-record FLAG_OVERFLOW marks *where*).
+
+        Bit i is channel i; bit n_channels is the epoch strobe (see
+        strobe_overflow()).
         """
         return self.csr.read("gnss_overflow")
 
     def dropped(self, index):
         """Saturating count of dumps lost on channel `index` since the last clear."""
         return self.csr.read(f"gnss_dropped{index}")
+
+    def set_epoch_period(self, samples):
+        """Emit a timebase-marker record every `samples` input samples (0 = off).
+
+        Set this to the host's epoch length so an epoch boundary is delimited
+        even when no channel dumps -- with correlator dumps as the only trigger
+        a receiver with nothing locked never closes an epoch at all. Markers
+        arrive as records with channel == STROBE_CHANNEL (see record_format.py).
+        """
+        self.csr.write("gnss_epoch_period", samples)
+
+    def strobe_overflow(self, n_channels):
+        """True if an epoch strobe was dropped: bit n_channels of overflow()."""
+        return bool(self.overflow() & (1 << n_channels))
+
+    def dropped_strobe(self):
+        """Saturating count of epoch strobes lost since the last clear."""
+        return self.csr.read("gnss_droppedstrobe")
 
     def clear_overflow(self, mask=0xFFFFFFFF):
         """Write-1-to-clear the sticky overflow bits and their drop counters.

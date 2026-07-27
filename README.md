@@ -77,6 +77,9 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
       and a fixed feedback delay instead of PCIe jitter.
 - [x] SoC integration via litex_m2sdr#152 hook (soc.py, pcie_dmas=2, RX observer)
 - [x] Host software: pure-Python CSR access (ioctl) + sliding-correlator acquisition
+- [x] Periodic **epoch-strobe records** (`gnss_epoch_period` CSR): a timebase marker
+      on the shared sample counter, so the host closes epochs even with no channel
+      locked (GNSSReceiver.jl#107).
 - [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS
       satellite (PRN 24, peak/median >> 100) from the antenna.**
 
