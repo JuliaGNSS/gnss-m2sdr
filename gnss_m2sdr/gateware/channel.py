@@ -16,9 +16,11 @@ On each code epoch (one 1023-chip period) the accumulators are latched to the
 dump registers, the integrated-sample count and the sample-counter value are
 captured, and the accumulators reset. The dump maps onto Tracking.jl's
 CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing),
-integrated_samples, sample_index; code_phase) -- note that Tracking.jl orders its
+integrated_samples, sample_index) -- note that Tracking.jl orders its
 accumulators latest-first, so E and L go in reversed relative to the names used
-here; see record_format.py for why getting that backwards inverts the DLL.
+here; see record_format.py for why getting that backwards inverts the DLL. The
+dumped `code_phase` is extra device-side metadata: Tracking.jl's CorrelatorOutput
+has no code_phase field or keyword, so the host carries it out of band.
 
 The timestamp is NOT generated here: `sample_count` is an input, driven by the
 one free-running counter shared by every channel (and by the raw stream) in

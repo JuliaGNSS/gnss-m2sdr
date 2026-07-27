@@ -15,9 +15,14 @@ Acquisition stays on the CPU; **signal tracking runs on the FPGA**:
 4. Dumps stream losslessly to the host over a dedicated DMA channel; the host runs
    the tracking loops (Doppler/NCO-update estimation) and writes NCO updates back.
 
-The dumps map 1:1 onto `Tracking.jl`'s `CorrelatorOutput(correlator,
-integrated_samples, sample_index; code_phase)` external-producer contract
-(JuliaGNSS/Tracking.jl #205, #207).
+The dumps map onto `Tracking.jl`'s `CorrelatorOutput(correlator,
+integrated_samples, sample_index)` external-producer contract
+(JuliaGNSS/Tracking.jl #205, #207). The record's `code_phase` is *additional
+device-side metadata that Tracking.jl does not currently consume*: as of
+Tracking.jl v4.1.1 (with #207 merged) the struct has exactly those three fields
+and no `code_phase` keyword constructor exists, despite what #207's description
+advertises. We keep the field because the CPU side needs it for acquisition
+handover and downstream vector tracking.
 
 > **Accumulator order.** `EarlyPromptLateCorrelator.accumulators` is ordered
 > *latest first* — `[late, prompt, early]`, since `get_prompt_index` is 2, late

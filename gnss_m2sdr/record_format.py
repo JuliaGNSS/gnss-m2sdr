@@ -29,12 +29,20 @@ earliest replica"). So the host glue must build
 
     CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early),
                                                spacing),
-                     integrated_samples, sample_index; code_phase)
+                     integrated_samples, sample_index)
 
 i.e. word 4, then word 2, then word 3 -- the reverse of the wire order. Passing
 `SVector(early, prompt, late)` swaps E and L, which inverts the sign of the DLL
 discriminator `(2-d)/2 * (E-L)/(E+L)` and drives the code phase away from lock;
 the symptom is "tracking never converges" rather than an obvious error.
+
+`code_phase` (low half of word 5) is **not** part of that contract -- it is additional
+device-side metadata that Tracking.jl does not currently consume. As of
+Tracking.jl v4.1.1 (with #207 merged) `CorrelatorOutput` has exactly the three
+fields above and no `code_phase` keyword constructor, even though #207's
+description advertises one. The field stays in the record because the host
+needs it for acquisition handover and downstream vector tracking; it just has
+to be carried out of band rather than passed to the constructor.
 
 `sample_index` is the **0-based** index of the last sample included in the
 integration, on the bank's single free-running counter (gnss_sample_count CSR):
