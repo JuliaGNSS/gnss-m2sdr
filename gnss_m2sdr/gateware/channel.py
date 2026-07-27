@@ -15,7 +15,10 @@ Per enabled input sample (I, Q):
 On each code epoch (one 1023-chip period) the accumulators are latched to the
 dump registers, the integrated-sample count and a free-running sample_index are
 captured, and the accumulators reset. The dump maps onto Tracking.jl's
-CorrelatorOutput(correlator=[E,P,L], integrated_samples, sample_index; code_phase).
+CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing),
+integrated_samples, sample_index; code_phase) -- note that Tracking.jl orders its
+accumulators latest-first, so E and L go in reversed relative to the names used
+here; see record_format.py for why getting that backwards inverts the DLL.
 """
 
 from migen import *
