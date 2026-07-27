@@ -149,7 +149,17 @@ class GNSSTracking(LiteXModule):
         self._control = CSRStorage(fields=[
             CSRField("enable", size=1, description="Enable sample processing in all channels."),
         ])
-        self._overflow = CSRStatus(n_channels, description="Sticky per-channel record overflow.")
+        # Overflow status a host can actually poll: the bit stays set until the
+        # host writes 1 to the matching bit of overflow_clear. Self-clearing on
+        # the next captured dump would leave it observable for under a
+        # millisecond at ~1 kHz dumps, i.e. invisible to any realistic poll
+        # rate. droppedN counts the lost dumps so "one missed epoch" and "the
+        # loop stalled for 200 ms" are distinguishable; the per-record
+        # FLAG_OVERFLOW remains the transient, per-dump marker.
+        self._overflow = CSRStatus(n_channels,
+            description="Sticky per-channel record overflow; cleared only via overflow_clear.")
+        self._overflow_clear = CSRStorage(n_channels,
+            description="Write 1 to a bit to clear that channel's overflow bit + drop counter.")
         # The one time axis: a free-running count of observed sample strobes,
         # ungated by `enable` and never reset (not by a channel restart either),
         # so every channel's dumps -- and the raw DMA0 stream, which the host
@@ -185,5 +195,17 @@ class GNSSTracking(LiteXModule):
                 chan.sample_count.eq(self.sample_count),
             ]
             self.comb += chan.connect_dump(recorder.ports[i])
+            # One drop counter per channel (name must be explicit: the tracer
+            # cannot derive a CSR name from a loop variable).
+            dropped = CSRStatus(len(recorder.dropped[i]), name=f"dropped{i}",
+                description=f"Saturating count of dumps dropped on channel {i}.")
+            setattr(self, f"_dropped{i}", dropped)
+            self.comb += dropped.status.eq(recorder.dropped[i])
 
-        self.comb += self._overflow.status.eq(recorder.overflow)
+        # Write-1-to-clear: `re` pulses for one cycle with `storage` already
+        # holding the written mask (same pattern as the code_load strobe above).
+        self.comb += [
+            self._overflow.status.eq(recorder.overflow),
+            recorder.overflow_clear.eq(self._overflow_clear.storage
+                                       & Replicate(self._overflow_clear.re, n_channels)),
+        ]
