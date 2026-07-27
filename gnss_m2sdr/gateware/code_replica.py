@@ -14,7 +14,14 @@ selected by a runtime ``spacing`` (chips, fixed-point like ``frac_bits``), so
 the correlator spacing is configurable as in Tracking.jl.
 
     code_step    = round(f_chip / fs * 2**frac_bits)   (f_chip = chip_rate*(1+doppler))
-    spacing_word = round(spacing_chips * 2**frac_bits)  (0 < spacing < 1)
+    spacing_word = sample_shift * code_step             (0 < spacing_word < 2**frac_bits)
+
+The spacing is a *whole number of input samples* times `code_step`, not a raw
+chip fraction: Tracking.jl quantises the preferred chip shift the same way
+(`calc_preferred_code_shift_to_sample_shift`) and `dll_disc` normalises with the
+quantised spacing, so anything else mis-scales the DLL loop gain. The host does
+that quantisation (`GNSSChannel.spacing_word`); it also enforces
+`spacing_word < 2**frac_bits`, since the E/L taps only reach `idx +/- 1`.
 """
 
 from migen import *
