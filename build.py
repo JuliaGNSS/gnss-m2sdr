@@ -17,6 +17,8 @@ def main():
     p = argparse.ArgumentParser(description="GNSS-M2SDR gateware builder.")
     p.add_argument("--build",    action="store_true", help="Build bitstream.")
     p.add_argument("--channels", default=4, type=int,  help="Number of tracking channels.")
+    p.add_argument("--num-ants", default=1, type=int, choices=[1, 2],
+                   help="Coherent RX antennas per channel (2 needs the AD9361 in 2R2T).")
     p.add_argument("--variant",  default="m2",         help="Board variant.", choices=["m2", "baseboard"])
     p.add_argument("--pcie-lanes", default=1, type=int, choices=[1, 2, 4])
     p.add_argument("--output-dir", default="build",     help="Build output directory.")
@@ -24,11 +26,13 @@ def main():
 
     soc = GNSSSoC(
         gnss_channels = args.channels,
+        gnss_num_ants = args.num_ants,
         variant       = args.variant,
         with_pcie     = True,
         pcie_lanes    = args.pcie_lanes,
     )
-    build_name = f"gnss_m2sdr_{args.variant}_x{args.pcie_lanes}_ch{args.channels}"
+    build_name = (f"gnss_m2sdr_{args.variant}_x{args.pcie_lanes}"
+                  f"_ch{args.channels}_ant{args.num_ants}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),
                       csr_csv=os.path.join(args.output_dir, build_name, "csr.csv"))
     builder.build(build_name=build_name, run=args.build)
