@@ -6,8 +6,11 @@
 
 """A bank of GPS L1 C/A tracking channels driven by the RX sample stream.
 
-Each channel is CSR-controlled (carrier/code frequency words, carrier phase,
-E/L spacing, PRN tag, runtime code loading, integration restart). All channels
+Each channel is CSR-controlled (carrier/code frequency words, carrier/code
+phase, E/L spacing, PRN tag, runtime code loading, integration restart), either
+immediately or -- for NCO updates and acquisition handover, where "whenever the
+PCIe write landed" is not good enough -- atomically on a sample index the host
+picks (``apply_at``; see ChannelWithCSR). All channels
 observe the same RX sample strobe and the same free-running sample counter --
 one 64-bit counter per bank, ungated and never reset, which timestamps every
 dump so channels handed over at different times stay comparable (and which the
@@ -32,7 +35,33 @@ from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
 
 
 class ChannelWithCSR(LiteXModule):
-    """One TrackingChannel + its control/status CSRs and runtime code loader."""
+    """One TrackingChannel + its control/status CSRs and runtime code loader.
+
+    Two ways to get a parameter into the channel:
+
+    * **Immediately** -- write ``carrier_freq`` / ``code_freq`` / ``spacing``,
+      pulse ``control.restart`` / ``control.carrier_set``. Each write takes
+      effect on whatever sample happens to be in flight. Fine for bring-up,
+      acquisition sweeps and static configuration.
+    * **At a known sample** -- stage ``carrier_freq_next`` / ``code_freq_next``
+      (and ``carrier_phase`` / ``code_phase`` for the phase loads), write the
+      target sample index to ``apply_at``, then arm ``apply`` with the selects
+      for what to commit. Everything commits in *one* cycle, on the strobe that
+      carries sample ``apply_at - 1``, so ``apply_at`` is the first input sample
+      processed with the new parameters -- on the bank's global counter, the same
+      axis the records are timestamped on. ``apply_status.late`` /
+      ``applied_at`` report what actually happened.
+
+    The second path is what makes an NCO update's round-trip delay a known
+    number of epochs (GNSSReceiver.jl's ``NCOUpdate.apply_at_epoch``) instead of
+    PCIe jitter, and what makes acquisition handover atomic: carrier frequency,
+    carrier phase, code frequency and code phase all change on the same sample.
+    A scheduled ``restart`` clears the accumulators on the commit strobe, one
+    cycle before sample ``apply_at - 1`` reaches the accumulate stage, so that
+    sample joins the new integration period; ``integrated_samples`` counts it,
+    which keeps the record's ``first_sample = sample_index -
+    integrated_samples + 1`` invariant intact.
+    """
     def __init__(self, prn=1, code_frac_bits=24, accum_bits=32,
                  carrier_phase_bits=32, code_length=CA_CODE_LENGTH):
         self.sample_i     = Signal((16, True))
@@ -56,11 +85,46 @@ class ChannelWithCSR(LiteXModule):
         self._spacing       = CSRStorage(code_frac_bits, reset=(1 << (code_frac_bits - 1)),
                                           description="E/L half spacing in chips (fixed-point). Default 0.5.")
         self._prn           = CSRStorage(8, reset=prn, description="PRN tag emitted in records.")
+        # atomic_write: chip+frac spans two bus words and a restart may fire
+        # between them, which would load a half-written phase.
+        self._code_phase    = CSRStorage(atomic_write=True, fields=[
+            CSRField("frac", size=code_frac_bits,            description="Fractional chip phase loaded on restart."),
+            CSRField("chip", size=bits_for(code_length - 1), description="Chip index loaded on restart."),
+        ], description="Code phase to load on restart (0 = start of the code).")
         self._code_load     = CSRStorage(fields=[
             CSRField("dat",        size=1, description="Chip value to write."),
             CSRField("we",         size=1, description="Write dat at the current load address, then increment."),
             CSRField("reset_addr", size=1, description="Reset the load address to 0."),
         ])
+
+        # Deterministic apply point. The staged frequency words sit in
+        # write-only shadow registers until the commit, so the host can prepare
+        # an update without perturbing the loop; the phase registers
+        # (carrier_phase, code_phase) need no shadow because they are only
+        # sampled by the load event itself, which is what gets scheduled.
+        self._carrier_freq_next = CSRStorage(carrier_phase_bits,
+            description="Staged carrier phase increment, committed at apply_at.")
+        self._code_freq_next    = CSRStorage(code_frac_bits,
+            description="Staged code phase increment, committed at apply_at.")
+        # atomic_write: a 64-bit CSR takes two bus writes, and a half-updated
+        # target would be compared against the counter in between.
+        self._apply_at = CSRStorage(64, atomic_write=True,
+            description="Global sample index of the first sample to be processed with the staged values.")
+        self._apply    = CSRStorage(fields=[
+            CSRField("arm",          size=1, description="0->1: arm the commit (cleared again by the commit)."),
+            CSRField("restart",      size=1, description="Commit also rebases code phase + integration."),
+            CSRField("carrier_set",  size=1, description="Commit also loads carrier_phase."),
+            CSRField("carrier_freq", size=1, description="Commit carrier_freq_next."),
+            CSRField("code_freq",    size=1, description="Commit code_freq_next."),
+        ], description="Scheduled-commit control: what the commit does. The selects say which "
+                       "staged values it takes, so a carrier-only update cannot drag a stale "
+                       "code word in with it. Keep all bits stable while armed.")
+        self._apply_status = CSRStatus(2,
+            description="bit0: a commit is pending. bit1: the last commit fired after its target "
+                        "sample (host too late, so the feedback delay was longer than planned); "
+                        "cleared when the next commit is armed.")
+        self._applied_at = CSRStatus(64,
+            description="Sample index actually governed by the last commit (== apply_at unless late).")
 
         # Correlator-dump readback (latched on each dump). Driver-free way to
         # run/validate the tracking loop over RemoteClient. For a coherent read,
@@ -86,17 +150,79 @@ class ChannelWithCSR(LiteXModule):
             restart_d.eq(ctl_restart),
             carrier_set_d.eq(ctl_carrier_set),
         ]
+
+        # Scheduled commit. `apply_at` names the first sample to be processed
+        # with the staged values, so the commit has to fire one sample earlier:
+        # the NCOs advance *into* that sample on the strobe that carries
+        # apply_at-1, and a phase load done on that strobe is what the next
+        # sample sees. Compare with >= (not ==) so an already-passed target
+        # commits on the next strobe with `late` set, instead of the channel
+        # waiting 2**64 samples for a compare that can never match. The compare
+        # is against the channel's (enable-gated) strobe: with the bank disabled
+        # no sample is being processed, so the commit waits for the next one.
+        armed     = Signal()
+        late      = Signal()
+        apply_stb = Signal()
+        arm_bit   = self._apply.storage[0]
+        arm_d     = Signal()
+        first_governed = Signal(64)     # sample index the commit takes effect for
+        self.comb += [
+            first_governed.eq(self.sample_count + 1),
+            apply_stb.eq(armed & self.sample_stb & (first_governed >= self._apply_at.storage)),
+            self._apply_status.status.eq(Cat(armed, late)),
+        ]
+        self.sync += [
+            arm_d.eq(arm_bit),
+            If(apply_stb,
+                armed.eq(0),
+                late.eq(first_governed != self._apply_at.storage),
+                self._applied_at.status.eq(first_governed),
+            ).Elif(arm_bit & ~arm_d,
+                armed.eq(1),
+                late.eq(0),
+            ),
+        ]
+
+        # Committed frequency words. Each stays in force until the host writes
+        # its immediate CSR again (`re`), so staging the *next* update cannot
+        # leak in ahead of its own apply point.
+        # apply storage: bit0=arm, 1=restart, 2=carrier_set, 3=carrier_freq, 4=code_freq.
+        apply_carrier_fw = Signal()
+        apply_code_fw    = Signal()
+        carrier_fw_act   = Signal(carrier_phase_bits)
+        code_step_act    = Signal(code_frac_bits)
+        sched_carrier    = Signal()
+        sched_code       = Signal()
+        self.comb += [
+            apply_carrier_fw.eq(apply_stb & self._apply.storage[3]),
+            apply_code_fw.eq(apply_stb & self._apply.storage[4]),
+        ]
+        self.sync += [
+            If(apply_carrier_fw, carrier_fw_act.eq(self._carrier_freq_next.storage)),
+            If(apply_code_fw,    code_step_act.eq(self._code_freq_next.storage)),
+            If(apply_carrier_fw, sched_carrier.eq(1)).Elif(self._carrier_freq.re, sched_carrier.eq(0)),
+            If(apply_code_fw,    sched_code.eq(1)).Elif(self._code_freq.re,       sched_code.eq(0)),
+        ]
+
         self.comb += [
             ch.sample_i.eq(self.sample_i),
             ch.sample_q.eq(self.sample_q),
             ch.sample_stb.eq(self.sample_stb),
             ch.sample_count.eq(self.sample_count),
-            ch.carrier_fw.eq(self._carrier_freq.storage),
+            # On the apply cycle the staged word must reach the NCO
+            # combinationally -- the phase advance into apply_at happens on that
+            # very strobe -- so bypass the register that latches it.
+            ch.carrier_fw.eq(Mux(apply_carrier_fw, self._carrier_freq_next.storage,
+                             Mux(sched_carrier, carrier_fw_act, self._carrier_freq.storage))),
+            ch.code_step.eq(Mux(apply_code_fw, self._code_freq_next.storage,
+                            Mux(sched_code, code_step_act, self._code_freq.storage))),
             ch.carrier_phase_in.eq(self._carrier_phase.storage),
-            ch.code_step.eq(self._code_freq.storage),
+            # code_phase storage: [code_frac_bits-1:0]=frac, above it=chip.
+            ch.code_phase_frac.eq(self._code_phase.storage[:code_frac_bits]),
+            ch.code_phase_chip.eq(self._code_phase.storage[code_frac_bits:]),
             ch.spacing.eq(self._spacing.storage),
-            ch.restart.eq(ctl_restart & ~restart_d),
-            ch.carrier_set.eq(ctl_carrier_set & ~carrier_set_d),
+            ch.restart.eq((ctl_restart & ~restart_d) | (apply_stb & self._apply.storage[1])),
+            ch.carrier_set.eq((ctl_carrier_set & ~carrier_set_d) | (apply_stb & self._apply.storage[2])),
         ]
 
         # Runtime code loader: auto-incrementing write address.
