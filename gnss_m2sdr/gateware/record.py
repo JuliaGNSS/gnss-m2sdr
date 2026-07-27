@@ -11,9 +11,16 @@ register with a per-channel sequence counter; an overflow flag is raised if a
 new dump arrives before the previous one has been serialized (should not happen
 at ~1 kHz dumps) -- a dump landing on the very cycle the previous record is
 retired still fits, because the holding register frees on that cycle. A
-round-robin FSM emits the 6-word record (see
+round-robin FSM emits the 8-word record (see
 record_format.py) for each pending channel into an output SyncFIFO, whose
 source is connected to the DMA1 sink at SoC level.
+
+The record is 64 bytes rather than the 48 the payload needs so that it divides
+litepcie's 8192-byte DMA buffer exactly (8192 % 48 = 32 would leave the stream
+permanently misaligned after the driver drops a buffer), and every record
+carries RECORD_MAGIC in the upper half of word 5 as the host's resync anchor --
+litepcie's DMA writer ignores the stream's first/last, so framing has to live
+in the payload.
 """
 
 from migen import *
@@ -23,7 +30,9 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 from litepcie.common import dma_layout
 
-from gnss_m2sdr.record_format import RECORD_WORDS, FLAG_OVERFLOW
+from gnss_m2sdr.record_format import (
+    MAGIC_SHIFT, RECORD_MAGIC, RECORD_WORDS, FLAG_OVERFLOW,
+)
 
 
 class ChannelDumpPort:
@@ -41,6 +50,7 @@ class ChannelDumpPort:
 
 class CorrelatorRecorder(LiteXModule):
     def __init__(self, n_channels, accum_bits=32, code_frac_bits=24, fifo_depth=64):
+        assert code_frac_bits <= 32, "code_phase shares word 5 with the magic"
         self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits) for _ in range(n_channels)]
         self.source = stream.Endpoint(dma_layout(64))
         self.overflow = Signal(n_channels)  # sticky per-channel overflow status
@@ -72,7 +82,9 @@ class CorrelatorRecorder(LiteXModule):
 
         for i, p in enumerate(self.ports):
             h = dict(
-                sidx=Signal(64), nsamp=Signal(32), cphase=Signal(code_frac_bits),
+                # cphase is held zero-extended to the 32-bit wire field so the
+                # magic can share word 5 at a fixed offset.
+                sidx=Signal(64), nsamp=Signal(32), cphase=Signal(32),
                 prn=Signal(8), seq=Signal(8), flags=Signal(8),
                 ie=Signal(32), qe=Signal(32), ip=Signal(32), qp=Signal(32),
                 il=Signal(32), ql=Signal(32),
@@ -113,7 +125,9 @@ class CorrelatorRecorder(LiteXModule):
                 Cat(h["ip"], h["qp"]),
                 Cat(h["ie"], h["qe"]),
                 Cat(h["il"], h["ql"]),
-                Cat(h["cphase"], Signal(64 - code_frac_bits)),
+                Cat(h["cphase"], C(RECORD_MAGIC, 64 - MAGIC_SHIFT)),  # magic in the spare half
+                C(0, 64),   # reserved, keeps the record at 64 B (divides the DMA buffer)
+                C(0, 64),
             ]
         cases = {}
         for i, h in enumerate(hold):
