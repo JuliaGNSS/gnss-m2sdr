@@ -54,24 +54,41 @@ class LiteXCSR:
         struct.pack_into("<IIB", buf, 0, addr & 0xFFFFFFFF, val & 0xFFFFFFFF, 1)
         fcntl.ioctl(self.fd, LITEPCIE_IOCTL_REG, buf, True)
 
-    # Named CSR access. Multi-word CSRs use LiteX big-endian ordering
-    # (most-significant word at the lowest address); word stride = 4 bytes.
+    # Named CSR access. A CSR wider than the CSR bus is split into `nwords`
+    # subregisters in LiteX big-endian order (most-significant first). Each
+    # subregister carries `csr_data_width` bits but occupies one full 32-bit
+    # slot in the MMIO map, so the *address* stride is always 4 bytes while the
+    # *shift* per subregister is csr_data_width -- assuming 32 there silently
+    # returns garbage on a csr_data_width=8 build. Matches
+    # litex.tools.remote.csr_builder.
     def read(self, name):
         addr, nwords = self.regs[name]
+        mask = (1 << self.csr_data_width) - 1
         val = 0
         for i in range(nwords):
-            val = (val << 32) | self._readl(addr + 4 * i)
+            val = (val << self.csr_data_width) | (self._readl(addr + 4 * i) & mask)
         return val
 
     def write(self, name, value):
         addr, nwords = self.regs[name]
+        mask = (1 << self.csr_data_width) - 1
         for i in range(nwords):
-            shift = 32 * (nwords - 1 - i)
-            self._writel(addr + 4 * i, (value >> shift) & 0xFFFFFFFF)
+            shift = self.csr_data_width * (nwords - 1 - i)
+            self._writel(addr + 4 * i, (value >> shift) & mask)
 
     def read_signed(self, name, bits=32):
         v = self.read(name)
         return v - (1 << bits) if v & (1 << (bits - 1)) else v
 
     def close(self):
-        os.close(self.fd)
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    # Usable as `with LiteXCSR(csv) as csr:` so scripts stop leaking the fd.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False

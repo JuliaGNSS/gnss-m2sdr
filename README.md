@@ -48,6 +48,15 @@ The base SoC (PCIe, clocking, SI5351, time) is reused via the upstream
 RX stream losslessly into the tracking block, and drives `pcie_dma1` with the
 correlator dumps — DMA0's I/Q path is untouched.
 
+`BaseSoC` lives in litex_m2sdr's top-level `litex_m2sdr.py` script, so it is
+loaded by file path rather than imported. Point `LITEX_M2SDR_DIR` at your
+checkout; without it, `~/litex_m2sdr` and a checkout sitting next to this repo
+are tried, and the error lists every path attempted.
+
+```
+export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
+```
+
 ## Status
 
 - [x] GPS L1 C/A code generator — validated vs IS-GPS-200, autocorrelation/balance,
