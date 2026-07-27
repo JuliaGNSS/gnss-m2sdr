@@ -9,7 +9,9 @@
 Each channel's dump (produced once per code period) is latched into a holding
 register with a per-channel sequence counter; an overflow flag is raised if a
 new dump arrives before the previous one has been serialized (should not happen
-at ~1 kHz dumps). A round-robin FSM emits the 6-word record (see
+at ~1 kHz dumps) -- a dump landing on the very cycle the previous record is
+retired still fits, because the holding register frees on that cycle. A
+round-robin FSM emits the 6-word record (see
 record_format.py) for each pending channel into an output SyncFIFO, whose
 source is connected to the DMA1 sink at SoC level.
 """
@@ -55,6 +57,19 @@ class CorrelatorRecorder(LiteXModule):
         pend  = Array(Signal() for _ in range(n_channels))
         seqs  = Array(Signal(8) for _ in range(n_channels))
         hold  = []
+
+        # `pend` must have exactly one driver.  The serializer FSM below only
+        # pulses `retiring` combinationally (Migen flattens submodule fragments
+        # after the parent's, so a NextValue(pend[ch], 0) inside the FSM would
+        # silently override a same-cycle capture here); the capture block owns
+        # the flag.  `retire[i]` marks the cycle on which channel i's holding
+        # register is freed, so a dump strobing on that cycle is captured -- it
+        # is a fresh integration, not an overflow.
+        ch       = Signal(max=max(2, n_channels))
+        retiring = Signal()
+        retire   = Signal(n_channels)
+        self.comb += [retire[i].eq(retiring & (ch == i)) for i in range(n_channels)]
+
         for i, p in enumerate(self.ports):
             h = dict(
                 sidx=Signal(64), nsamp=Signal(32), cphase=Signal(code_frac_bits),
@@ -65,7 +80,7 @@ class CorrelatorRecorder(LiteXModule):
             hold.append(h)
             self.sync += [
                 If(p.stb,
-                    If(pend[i],
+                    If(pend[i] & ~retire[i],
                         self.overflow[i].eq(1),  # sticky
                     ).Else(
                         pend[i].eq(1),
@@ -81,11 +96,12 @@ class CorrelatorRecorder(LiteXModule):
                         seqs[i].eq(seqs[i] + 1),
                         self.overflow[i].eq(0),  # cleared once captured
                     ),
+                ).Elif(retire[i],
+                    pend[i].eq(0),
                 ),
             ]
 
-        # Round-robin serializer FSM.
-        ch   = Signal(max=max(2, n_channels))
+        # Round-robin serializer FSM (`ch` is declared with `retire` above).
         widx = Signal(max=RECORD_WORDS)
         word = Signal(64)
 
@@ -121,7 +137,7 @@ class CorrelatorRecorder(LiteXModule):
             If(fifo.sink.ready,
                 If(widx == (RECORD_WORDS - 1),
                     NextValue(widx, 0),
-                    NextValue(pend[ch], 0),
+                    retiring.eq(1),  # comb: the capture block clears pend[ch]
                     NextValue(ch, Mux(ch == (n_channels - 1), 0, ch + 1)),
                     NextState("SCAN"),
                 ).Else(
