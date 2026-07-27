@@ -1,5 +1,7 @@
 # gnss-m2sdr
 
+[![tests](https://github.com/JuliaGNSS/gnss-m2sdr/actions/workflows/tests.yml/badge.svg)](https://github.com/JuliaGNSS/gnss-m2sdr/actions/workflows/tests.yml)
+
 On-FPGA GNSS downconversion + correlation for the [LiteX-M2SDR](https://github.com/enjoy-digital/litex_m2sdr)
 board. Companion to [GNSSReceiver.jl#107](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/107).
 
@@ -103,7 +105,23 @@ julia/                 GNSSSignals.jl project used to regenerate golden vectors
 
 ## Running tests
 
+Everything is pure simulation — no board, no Vivado, no numpy:
+
 ```
-PYTHONPATH=. python test/test_ca_code.py
-PYTHONPATH=. python test/test_ca_code_vs_gnsssignals.py
+pip install -r requirements-test.txt            # migen + LiteX + LitePCIe, pinned
+PYTHONPATH=. python test/run_all.py             # the whole suite (auto-discovers test/test_*.py)
+PYTHONPATH=. python -m unittest test.test_record -v   # a single module
 ```
+
+`run_all.py` exits non-zero on failure and is what CI runs
+(`.github/workflows/tests.yml`) on every push and pull request.
+
+**Toolchain.** `requirements-test.txt` pins the exact commits CI runs: migen
+0.9.2 (`e19524c`), LiteX 2026.4 (`93c8d23`), LitePCIe 2026.4 (`e84e0b9`). One
+upstream quirk is worth knowing about: migen's *simulator* cannot lower the
+write-only `Memory` port that `stream.SyncFIFO` creates, so every simulation
+containing the recorder's FIFO dies with `AttributeError: 'NoneType' object has
+no attribute 'eq'` before its first cycle. `test/migen_compat.py` patches that on
+import — simulation only, gateware generation is untouched — which is why the
+suite must be started through `test/run_all.py` or `python -m unittest
+test.<module>` and not by running a test file as a bare script.
