@@ -9,6 +9,8 @@
 import math
 import time
 
+from typing import NamedTuple, Optional
+
 try:
     from m2sdr_csr import LiteXCSR
 except ImportError:                      # when imported as software.gnss_tracking
@@ -99,6 +101,52 @@ def prompt_power(d):
     return d["ip"] ** 2 + d["qp"] ** 2
 
 
+def peak_code_phase(dump, frac_bits, code_length=CA_CODE_LENGTH):
+    """Code phase (chips) of the incoming signal at `dump["sample_index"]`.
+
+    A dump fires on the sample whose advance wraps the last chip, so on that
+    sample the replica sits at chip `code_length - 1` plus the fractional phase
+    reported in `dump_code_phase` -- and on the peak dump the replica is (to
+    within the correlator's resolution) aligned with the signal, so that is the
+    signal's code phase too. There is no separate code-phase readback: the phase
+    is implicit in *which* dump peaked, and `sample_index` is what pins it to
+    the bank's global sample axis.
+    """
+    return (code_length - 1) + dump["code_phase"] / float(1 << frac_bits)
+
+
+class AcquisitionResult(NamedTuple):
+    """What `acquire()` hands over to a tracking channel.
+
+    The first three fields keep the historical (metric, doppler, power) order,
+    so `metric, doppler, power = result[:3]` still works.
+
+    code_phase   : chips [0, code_length), the signal's code phase at
+                   `sample_index`; None if no dump was ever read.
+    sample_index : global input-sample counter value the phase refers to (the
+                   bank's one free-running axis, see record_format.py) -- a code
+                   phase without it is meaningless, since the phase advances by
+                   the code rate every sample.
+    detected     : metric reached the detection threshold.
+    """
+    metric:       float
+    doppler_hz:   float
+    power:        float
+    code_phase:   Optional[float]
+    sample_index: Optional[int]
+    detected:     bool
+
+    def code_phase_at(self, sample_index, fs, code_length=CA_CODE_LENGTH):
+        """Propagate the acquired code phase to another global sample index.
+
+        The handover arithmetic: the code runs on at the acquired Doppler, so a
+        channel started at `sample_index` must begin at this phase.
+        """
+        fc = GPS_CA_CHIP_RATE * (1.0 + self.doppler_hz / GPS_L1_HZ)
+        return (self.code_phase
+                + (sample_index - self.sample_index) * fc / fs) % code_length
+
+
 class GNSSBank:
     def __init__(self, csr):
         self.csr = csr
@@ -138,34 +186,55 @@ def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
     For each trial Doppler, offset the code rate by `slide_chips` chips/s so the
     code phase slides through all 1023 chips within `dwell`; collect prompt
     power over the dumps and score peak/median (noise ~5-10; a live PRN gives
-    tens to hundreds). Returns (best_metric, best_doppler, best_peak_power).
-    Requires DMA0 to be draining (e.g. `m2sdr_record /dev/null &`) so the RX
-    observer sees samples.
+    tens to hundreds).
+
+    Returns an AcquisitionResult: metric, Doppler, peak power, *and* the code
+    phase of the peak plus the global sample index it applies to, which is what
+    a tracking channel has to be started at. Requires DMA0 to be draining (e.g.
+    `m2sdr_record /dev/null &`) so the RX observer sees samples.
+
+    Bring-up limits of this sliding scheme (none of them a sensitivity limit of
+    the correlators themselves):
+      * `wait_dump()` busy-polls CSRs and readback is lossy -- a dump can be
+        replaced before it is read -- so some code-phase bins are skipped and
+        the true peak can be missed. The lossless DMA1 record path
+        (record_format.py) has neither problem.
+      * sliding `slide_chips / 1000` chips *within* each 1 ms integration also
+        smears the correlation peak, costing a few dB.
+      * the code phase is therefore resolved only to about the per-dump slide
+        (+-0.4 chips at the default 800 chips/s); a code-phase-set CSR plus an
+        explicit phase sweep would replace both the sliding and this estimate.
     """
     import statistics
     chan.load_code(prn)
     chan.set_spacing_chips(0.5)
     bank.enable(True)
     off = round(slide_chips / fs * (1 << chan.fb))
-    best = (0.0, 0, 0.0)
+    best = AcquisitionResult(0.0, 0.0, 0.0, None, None, False)
     d = -doppler_range
     while d <= doppler_range:
         chan.set_carrier_hz(d)
         chan.csr.write(chan.p + "code_freq", chan.code_word(d) + off)
         chan.restart()
         t0 = time.time()
-        powers = []
+        dumps = []
         while time.time() - t0 < dwell:
             dd = chan.wait_dump(timeout=0.05)
             if dd is not None:
-                powers.append(prompt_power(dd))
-        if len(powers) > 20:
-            med = statistics.median(powers)
+                dumps.append(dd)
+        if len(dumps) > 20:
+            # Keep the peak *dump*, not just its power: its code phase and
+            # sample index are the half of the answer tracking needs.
+            powers = [prompt_power(dd) for dd in dumps]
+            peak   = max(dumps, key=prompt_power)
+            med    = statistics.median(powers)
             metric = (max(powers) / med) if med > 0 else 0.0
             if verbose:
                 mark = "  <== DETECTED" if metric >= detect_metric else ""
                 print(f"  doppler {d:+6.0f} Hz : peak/median {metric:6.1f}{mark}")
-            if metric > best[0]:
-                best = (metric, d, max(powers))
+            if metric > best.metric:
+                best = AcquisitionResult(metric, d, prompt_power(peak),
+                                         peak_code_phase(peak, chan.fb),
+                                         peak["sample_index"], False)
         d += doppler_step
-    return best
+    return best._replace(detected=best.metric >= detect_metric)

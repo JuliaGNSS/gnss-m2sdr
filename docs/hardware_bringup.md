@@ -78,9 +78,18 @@ csr  = LiteXCSR('build/gnss_m2sdr_m2_x1_ch4/csr.csv')
 fs   = 4_000_000
 bank = GNSSBank(csr); chan = GNSSChannel(csr, fs, index=0)
 best = acquire(chan, bank, prn=1, fs=fs)   # try PRNs known to be visible
-print('best doppler/power/codephase:', best)
+print(best)   # metric, doppler_hz, power, code_phase, sample_index, detected
+if best.detected:
+    print(f'PRN 1: {best.doppler_hz:+.0f} Hz, code phase {best.code_phase:.2f} chips'
+          f' at sample {best.sample_index} (peak/median {best.metric:.1f})')
 "
 ```
+
+`code_phase` is in chips at the global sample index `sample_index` (the bank's
+free-running sample counter, see `record_format.py`) -- both halves are needed
+to start a tracking channel, and `best.code_phase_at(n, fs)` propagates the
+phase to any other sample index. `detected` is the `detect_metric` threshold
+already applied.
 
 A clear prompt-power peak at a particular Doppler for a visible PRN is the
 hardware-in-the-loop validation: the on-FPGA carrier/code NCOs + correlators
