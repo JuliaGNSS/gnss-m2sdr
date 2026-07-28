@@ -117,12 +117,39 @@ class GNSSSoC(BaseSoC):
             self.gnss_rx.rx_data.eq(rx_stream.data),
             self.gnss_rx.rx_stb.eq(rx_stream.valid & rx_stream.ready),
             self.gnss_rx.mode_1r1t.eq(self.ad9361.phy.control.fields.mode),
+            # Static configuration, not per-sample data: no need to pipeline it.
+            self.gnss.ants_valid.eq(self.gnss_rx.ants_valid),
+        ]
+        # Register the observer -> bank sample handoff.
+        #
+        # The tap's strobe is `rx_stream.valid & rx_stream.ready`, and that
+        # `ready` comes combinationally out of the DMA0 buffering FIFO's level
+        # comparator. Wiring it straight through put the FIFO level register, the
+        # comparator's carry chain and a channel's whole multiply-accumulate on
+        # one 8 ns path: the 4-channel m2 build missed setup by ~1 ns on ~2400
+        # endpoints in the sys_clk domain, worst path running from
+        # `litepciedma0_buffering_syncfifo1`'s level register into a correlator
+        # DSP48's cascade input. One register here splits that path in two.
+        #
+        # Costs nothing functionally: the observer never back-pressures the RX
+        # stream, so a uniform one-cycle delay just shifts when the bank sees each
+        # sample. It stays self-consistent because the bank's free-running sample
+        # counter increments on this same `sample_stb` (bank.py), so samples,
+        # counter and dump tags all move together; only the constant offset
+        # between a word leaving the AD9361 and the bank counting it changes, and
+        # nothing depends on that.
+        #
+        # Deliberately here rather than inside `RXSampleObserver`: registering the
+        # observer's own outputs is functionally identical, but made Vivado 2024.1
+        # hang during implementation on the 4-channel build (reproduced 4/4, while
+        # 2-channel and unpipelined 4-channel builds completed). Same pipeline
+        # stage, expressed at the SoC boundary instead.
+        self.sync += [
             *[self.gnss.sample_i_ants[n].eq(self.gnss_rx.sample_i_ants[n])
               for n in range(self._gnss_num_ants)],
             *[self.gnss.sample_q_ants[n].eq(self.gnss_rx.sample_q_ants[n])
               for n in range(self._gnss_num_ants)],
             self.gnss.sample_stb.eq(self.gnss_rx.sample_stb),
-            self.gnss.ants_valid.eq(self.gnss_rx.ants_valid),
         ]
         require_record_dma(self)
         self.comb += [
