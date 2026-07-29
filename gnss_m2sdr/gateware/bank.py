@@ -213,11 +213,23 @@ class ChannelWithCSR(LiteXModule):
         ).Else(
             apply_at_m1.eq(self._apply_at.storage - 1),
         )
+        # On top of the pre-decrement, the compare itself is REGISTERED: at 20
+        # channels even the bare 64-bit `>=` fans combinationally into every
+        # channel's restart/carrier_set gates and NCO muxes and drags the whole
+        # sys_clk floorplan under (measured -0.5 ns class with thousands of
+        # endpoints; registering it closed the same build to -0.07 ns).
+        # Registering must stay exact under back-to-back strobes -- the raw
+        # stream drains out of the DMA0 FIFO in sys-rate bursts, so
+        # `sample_count` can advance every cycle. The precomputation therefore
+        # folds in this cycle's increment: next cycle the strobe (if any) sees
+        # count' = count + stb and must fire iff count' >= apply_at_m1.
+        reach_r = Signal()
+        self.sync += reach_r.eq((self.sample_count + self.sample_stb) >= apply_at_m1)
         self.comb += [
             # Still exposed for `late` / `applied_at`, but no longer feeding
             # `apply_stb`, so its carry chain is off the critical path.
             first_governed.eq(self.sample_count + 1),
-            apply_stb.eq(armed & self.sample_stb & (self.sample_count >= apply_at_m1)),
+            apply_stb.eq(armed & self.sample_stb & reach_r),
             self._apply_status.status.eq(Cat(armed, late)),
         ]
         self.sync += [
