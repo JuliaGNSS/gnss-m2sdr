@@ -189,28 +189,42 @@ class ChannelWithCSR(LiteXModule):
         arm_bit   = self._apply.storage[0]
         arm_d     = Signal()
         first_governed = Signal(64)     # sample index the commit takes effect for
-        # The 64-bit reach/late comparisons are REGISTERED, not combinational.
-        # `sample_count` only changes on a strobe and strobes are at least two
-        # sys cycles apart (61.44 MSPS ceiling vs 125 MHz sys), so a compare
-        # registered one cycle behind the counter is always settled by the
-        # strobe that consumes it — the commit still lands on exactly the
-        # requested sample. Combinationally, this 25-CARRY4 comparator sat in
-        # front of every channel's restart/NCO muxes and was the design's worst
-        # path: −1.7 ns WNS across ~17k endpoints on the 20-channel build.
-        reach_r = Signal()
-        late_r  = Signal()
+        # `sample_count + 1 >= apply_at` is the same test as
+        # `sample_count >= apply_at - 1`, and the second form keeps the 64-bit
+        # incrementer out of the path that decides `apply_stb`. That matters:
+        # `apply_stb` gates `restart` / `carrier_set` / the frequency-word muxes,
+        # so it lands on the code NCO's chip index and the carrier phase in the
+        # same cycle. Adder-then-comparator put ~23 carry stages in series ahead
+        # of all of that and it was the worst setup path in the whole SoC (the
+        # 4-channel build missed by 167 ps, with the code chip index among the
+        # failing endpoints). Pre-decrementing turns it into a single 64-bit
+        # compare against a value that only changes when the host writes
+        # `apply_at`, i.e. never while it matters.
+        # Re-registered every cycle rather than on `_apply_at.re`, so nothing
+        # depends on whether `storage` updates with `re` or a cycle after it. The
+        # one-cycle lag behind `apply_at` cannot be observed: arming takes a
+        # second, later CSR write (`apply.arm`), by which time this has settled.
+        apply_at_m1 = Signal(64)
+        self.sync += If(self._apply_at.storage == 0,
+            # apply_at == 0 has no predecessor; keep the old semantics for it (a
+            # target already in the past commits on the next strobe with `late`
+            # set) rather than wrapping to 2**64-1 and never firing at all.
+            apply_at_m1.eq(0),
+        ).Else(
+            apply_at_m1.eq(self._apply_at.storage - 1),
+        )
         self.comb += [
+            # Still exposed for `late` / `applied_at`, but no longer feeding
+            # `apply_stb`, so its carry chain is off the critical path.
             first_governed.eq(self.sample_count + 1),
-            apply_stb.eq(armed & self.sample_stb & reach_r),
+            apply_stb.eq(armed & self.sample_stb & (self.sample_count >= apply_at_m1)),
             self._apply_status.status.eq(Cat(armed, late)),
         ]
         self.sync += [
-            reach_r.eq(first_governed >= self._apply_at.storage),
-            late_r.eq(first_governed != self._apply_at.storage),
             arm_d.eq(arm_bit),
             If(apply_stb,
                 armed.eq(0),
-                late.eq(late_r),
+                late.eq(first_governed != self._apply_at.storage),
                 self._applied_at.status.eq(first_governed),
             ).Elif(arm_bit & ~arm_d,
                 armed.eq(1),
