@@ -176,25 +176,63 @@ class TrackingChannel(LiteXModule):
         # integration can overrun accum_bits -- and a wrapped accumulator is
         # indistinguishable from a plausible correlator value once it reaches
         # the host. Clamp instead, and say so, so a bad dump is recognisable.
-        acc_max =  (1 << (accum_bits - 1)) - 1
-        acc_min = -(1 << (accum_bits - 1))
+        acc_max = (1 << (accum_bits - 1)) - 1
+        # acc_min's bit pattern, as a *non-negative* constant -- see sat_mac for
+        # why no negative constant may appear anywhere in this logic.
+        acc_min_bits = 1 << (accum_bits - 1)
         # code.*_r are +/-1 (2 bits signed), so the product is prod_bits+2 wide;
         # +1 more for the accumulate, which must not wrap before it is clamped.
         sum_bits = max(accum_bits, prod_bits + 2) + 1
+        # Bits of `raw` at and above accum_bits' sign position. The sum fits in
+        # accum_bits signed exactly when all of them equal the sign bit, i.e.
+        # when they are all-zero (non-negative) or all-one (negative).
+        hi_bits = sum_bits - accum_bits + 1
+        hi_ones = (1 << hi_bits) - 1
 
         def sat_mac(acc_sig, sign, bb):
-            """acc + sign*bb clamped to accum_bits; returns (value, clamped)."""
+            """acc + sign*bb clamped to accum_bits; returns (value, clamped).
+
+            Nominal GNSS operation stays far from the rail (the sum is
+            noise-dominated and grows as sqrt(N)), but a strong in-band
+            interferer, a badly set AD9361 gain or a high fs x long integration
+            can overrun accum_bits -- and a wrapped accumulator is
+            indistinguishable from a plausible correlator value once it reaches
+            the host. Clamp instead, and say so, so a bad dump is recognisable.
+
+            The range test is written on `raw`'s redundant sign bits rather than
+            as `raw > acc_max` / `raw < acc_min`, because comparing against a
+            *negative* constant does not survive Verilog generation. LiteX's
+            printer renders `raw < -(2**31)` as `raw < -32'h80000000`, and
+            `32'h80000000` is an unsigned literal whose unary minus stays
+            unsigned -- so Verilog evaluates the whole comparison unsigned and it
+            comes out true for every non-negative `raw`. On hardware that clamped
+            each integration to the negative rail the first time its running sum
+            was non-negative, flagged every dump saturated, and left the
+            correlators reading a random walk reflected off -2**31 instead of a
+            correlation. Migen's Python simulator compares exact Python ints, so
+            the whole class of bug is invisible to the simulation suite; see
+            test_generated_verilog.py for the guard that is not.
+
+            Every constant below is therefore non-negative: `hi_ones` and
+            `acc_max` are plain positive literals, and `acc_min` enters as its
+            bit pattern `acc_min_bits` assigned to a signed target, which is a
+            width-preserving bit copy.
+            """
             raw = Signal((sum_bits, True))
             val = Signal((accum_bits, True))
             sat = Signal()
+            hi  = Signal(hi_bits)
             self.comb += [
                 raw.eq(acc_sig + sign * bb),
-                If(raw > acc_max,
-                    val.eq(acc_max), sat.eq(1),
-                ).Elif(raw < acc_min,
-                    val.eq(acc_min), sat.eq(1),
-                ).Else(
+                hi.eq(raw[accum_bits - 1:]),
+                If(hi == 0,                      # fits, non-negative
                     val.eq(raw),
+                ).Elif(hi == hi_ones,            # fits, negative
+                    val.eq(raw),
+                ).Elif(raw[sum_bits - 1],        # overflowed negative
+                    val.eq(acc_min_bits), sat.eq(1),
+                ).Else(                          # overflowed positive
+                    val.eq(acc_max), sat.eq(1),
                 ),
             ]
             return val, sat

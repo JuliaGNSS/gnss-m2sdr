@@ -23,13 +23,31 @@ from litex.gen import *
 
 
 def _sincos_tables(addr_bits, amp_bits):
+    """Two's-complement sin/cos ROM contents, as *unsigned* ``amp_bits`` words.
+
+    The masking is not cosmetic. A `Memory` init list is written out as a
+    `$readmemh` data file, and migen formats each entry with plain `"{:x}"`, so a
+    negative Python int lands in the file as `-7F`. `$readmemh` has no notion of
+    a sign: xsim rejects the token outright ("Illegal hex digit '-'", leaving the
+    entry X) while Vivado synthesis silently *drops the minus* and stores +0x7F.
+    Either way the ROM's whole negative half is wrong -- on hardware the carrier
+    replica comes out full-wave rectified, which is not a complex exponential at
+    all, so carrier wipe-off fails and every correlator reads noise. Both halves
+    of that failure are invisible to migen's Python simulator, which never goes
+    through the init file.
+
+    The read side needs no change: the memory word is unsigned and `cos`/`sin`
+    are `Signal((amp_bits, True))` of the same width, so the assignment is a
+    plain bit copy that reinterprets the two's-complement pattern.
+    """
     n    = 1 << addr_bits
     peak = (1 << (amp_bits - 1)) - 1
+    mask = (1 << amp_bits) - 1
     sin_t, cos_t = [], []
     for i in range(n):
         ang = 2 * math.pi * i / n
-        sin_t.append(int(round(peak * math.sin(ang))))
-        cos_t.append(int(round(peak * math.cos(ang))))
+        sin_t.append(int(round(peak * math.sin(ang))) & mask)
+        cos_t.append(int(round(peak * math.cos(ang))) & mask)
     return sin_t, cos_t
 
 
