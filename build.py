@@ -36,6 +36,16 @@ def main():
                    help="Run Vivado in non-project (batch) mode. Its "
                         "synth_design epilogue differs from project mode's — "
                         "another lever against the post-synthesis deadlock.")
+    p.add_argument("--place-directive", default="ExtraTimingOpt",
+                   help="Vivado place_design -directive. This design's residual "
+                        "violations at high channel counts are route-dominated "
+                        "congestion, so timing-driven placement is the default.")
+    p.add_argument("--phys-opt-directive", default="AggressiveExplore",
+                   help="Vivado post-place phys_opt_design -directive.")
+    p.add_argument("--route-directive", default="AggressiveExplore",
+                   help="Vivado route_design -directive.")
+    p.add_argument("--post-route-phys-opt", default="AggressiveExplore",
+                   help="Vivado post-route phys_opt_design -directive.")
     args = p.parse_args()
 
     soc = GNSSSoC(
@@ -73,6 +83,10 @@ def main():
     builder.build(build_name=build_name, run=args.build,
                   vivado_max_threads=args.vivado_threads,
                   vivado_synth_directive=args.synth_directive,
+                  vivado_place_directive=args.place_directive,
+                  vivado_post_place_phys_opt_directive=args.phys_opt_directive,
+                  vivado_route_directive=args.route_directive,
+                  vivado_post_route_phys_opt_directive=args.post_route_phys_opt,
                   project_mode=not args.no_project_mode)
 
 
