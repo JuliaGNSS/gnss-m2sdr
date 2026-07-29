@@ -28,30 +28,25 @@ Two things that are easy to get wrong, both of which cost a session:
   untransferable (2e8 samples of accumulated rounding is several chips). So the
   refine pass runs here, in the same process, against the same S_0 and fs.
 
-KNOWN LIMITATION -- this script does not yet find a satellite, and the reason is
-not the gateware (see test/verilog_sim, which proves the correlator despreads an
-injected signal to within 0.05% of the analytical value). It is the code *rate*.
+RESOLVED -- this now finds a live satellite. Two host-side errors were in the way,
+neither in the gateware:
 
-An acquisition reports the *observed* baseband offset, which is the true satellite
-Doppler plus the RX LO's own error. Only the Doppler scales the code rate; an LO
-error is a frequency translation, not a time dilation. Conflating them is harmless
-inside one 1 ms dump (~0.003 chips) but is several chips/s of code-rate error, so
-the alignment walks tens of chips across a sweep and no averaging can recover it.
+* **The Doppler must come from a search wider than +-7 kHz.** The reference drives
+  both the RX LO and the sample clock, so its offset shows up as an apparent
+  Doppler on top of the satellite's own +-5 kHz; observed offsets past 9 kHz are
+  normal here. Acquisition.jl's default `min_doppler_coverage = 7000Hz` clips
+  those to the edge of its grid, and the resulting ~1 kHz carrier error is exactly
+  the first null of a 1 ms coherent integration -- it annihilates the correlation
+  rather than merely degrading it.
+* **Refer every NCO word to the NOMINAL sampling frequency**, the one the
+  acquisition was given -- not a measured one. Because the LO error appears as a
+  Doppler on the code rate too, the acquisition's observed offset is then directly
+  the right number for both carrier and code. Using a measured fs (or "correcting"
+  for the LO) puts back the very error it looks like it removes, and a few chips/s
+  is tens of chips across a sweep.
 
-Deriving the LO error from the measured fs does not rescue this: counting the
-device's sample counter against the *host* clock came out at +3.28 ppm and
-+7.72 ppm on two runs minutes apart, and 4.4 ppm is +-6.9 kHz at L1, i.e.
-+-4.5 chips/s. The host clock is not a good enough reference.
-
-What will work is measuring the code rate on the signal itself: acquire twice, a
-few seconds apart, on the shared sample counter, and take
-
-    r_true = (phi_2 - phi_1 + k * 1023) / (S_2 - S_1)     chips per sample
-
-(k is unambiguous because the drift is only a few chips). That needs no clock
-calibration. Alternatively, close the DLL and let it pull the rate in -- which is
-what a tracking loop is for, and the reason this open-loop check is awkward in the
-first place.
+With both fixed, PRN 17 gave a clean correlation triangle: 9.1x the floor at the
+peak, monotonic over ~1.5 chips, background ~1.0x.
 
 Usage:
   sweep_compensated.py PRN DOPPLER_HZ [STEP] [DUMPS] [MARGIN] [REFINE_STEP] [REFINE_DUMPS]
@@ -72,7 +67,8 @@ from gnss_m2sdr.gps_ca import CA_CODE_LENGTH, GPS_CA_CHIP_RATE, GPS_L1_HZ
 
 CSV = os.environ.get("GNSS_CSR_CSV", "build/gnss_m2sdr_m2_x1_ch2_ant1/csr.csv")
 FRAC = 24
-FS_MEASURE_SECONDS = 20.0   # +-0.3 ppm, so the LO error is good to ~+-500 Hz
+FS_NOMINAL = 4e6            # must match what the acquisition was given
+FS_MEASURE_SECONDS = 4.0    # diagnostic only
 SKIP_AFTER_RESTART = 2      # the first dump after a restart is a partial period
 
 
@@ -136,47 +132,32 @@ def main():
     t0 = time.perf_counter()
     time.sleep(FS_MEASURE_SECONDS)
     fs = (bank.sample_count() - c0) / (time.perf_counter() - t0)
-    ch = GNSSChannel(csr, fs, 0)
-
-    # `doppler` is the *observed* baseband offset, which is what an acquisition
-    # measures: true satellite Doppler plus the RX LO's own error. Those two must
-    # not be conflated, because only the Doppler scales the code rate -- an LO
-    # error is a frequency translation, not a time dilation.
-    #
-    # The sample clock and the RX LO come off the same reference, so the measured
-    # fs gives the reference offset and hence the LO error at L1:
-    #
-    #     observed = D - f_L1 * eps   =>   D = observed + f_L1 * eps
-    #
-    # Getting this wrong is harmless inside one 1 ms dump (0.003 chips) but it is
-    # ~3.4 chips/s of code-rate error, i.e. tens of chips across a sweep -- which
-    # smears the peak away completely, and by more than a narrow refine window is
-    # wide. The carrier still gets the observed offset; only the code rate gets
-    # the true Doppler.
-    eps = fs / 4e6 - 1.0
-    lo_error = GPS_L1_HZ * eps
-    true_doppler = doppler + lo_error
-    code_step = ch.code_word(true_doppler)
-    drift = true_doppler * GPS_CA_CHIP_RATE / GPS_L1_HZ
-    print(f"measured fs = {fs:,.1f} Hz ({eps * 1e6:+.2f} ppm)")
-    print(f"  => RX LO error at L1 {lo_error:+.0f} Hz")
-    print(f"  => observed offset {doppler:+.0f} Hz is a true Doppler of "
-          f"{true_doppler:+.0f} Hz")
-    print(f"code_step = {code_step} (from the true Doppler); satellite code phase "
-          f"drifts {drift:+.2f} chips/s")
+    # Use the NOMINAL sampling frequency, i.e. the one the acquisition was told
+    # about -- not the measured one. The reference drives both the RX LO and the
+    # sample clock, so referring carrier and code to the same nominal rate makes
+    # the LO error come out as an apparent Doppler on both, and the acquisition's
+    # observed offset is then directly the right number for each. No LO correction
+    # is needed or wanted; "correcting" it (or using the measured fs) reintroduces
+    # exactly the error it was meant to remove.
+    ch = GNSSChannel(csr, FS_NOMINAL, 0)
+    code_step = ch.code_word(doppler)
+    drift = doppler * GPS_CA_CHIP_RATE / GPS_L1_HZ
+    print(f"measured fs = {fs:,.1f} Hz ({(fs / FS_NOMINAL - 1) * 1e6:+.2f} ppm) "
+          f"-- diagnostic only; the NCO words use the nominal {FS_NOMINAL:,.0f} Hz")
+    print(f"code_step = {code_step}; satellite code phase drifts {drift:+.2f} chips/s")
 
     bank.enable(True)
     ch.load_code(prn)
-    ch.set_spacing_chips(0.5, true_doppler)
-    ch.set_carrier_hz(doppler)                 # observed offset
-    ch.set_code_doppler(true_doppler)          # true Doppler
+    ch.set_spacing_chips(0.5, doppler)
+    ch.set_carrier_hz(doppler)
+    ch.set_code_doppler(doppler)
 
     S0 = bank.sample_count()
     phases = [i * step for i in range(int(CA_CODE_LENGTH / step))]
     print(f"\nPRN {prn} at {doppler:+.0f} Hz: coarse {len(phases)} x {step} chips, "
           f"{per_phase} dumps each, S0={S0}")
     t = time.time()
-    coarse, late = measure(bank, ch, doppler, true_doppler, code_step, S0, margin,
+    coarse, late = measure(bank, ch, doppler, doppler, code_step, S0, margin,
                            phases, per_phase)
     print(f"  coarse sweep took {time.time() - t:.0f} s ({late} late commits)")
     best, _ = report(coarse, "COARSE")
@@ -187,7 +168,7 @@ def main():
     print(f"\nrefining +-{halfwidth:.0f} chips around {best:.2f} at {refine_step} chips, "
           f"{refine_dumps} dumps each (same S0, same fs)")
     t = time.time()
-    fine, late = measure(bank, ch, doppler, true_doppler, code_step, S0, margin,
+    fine, late = measure(bank, ch, doppler, doppler, code_step, S0, margin,
                          span, refine_dumps)
     print(f"  refine took {time.time() - t:.0f} s ({late} late commits)")
     if fine:
