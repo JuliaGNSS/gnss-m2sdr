@@ -189,16 +189,28 @@ class ChannelWithCSR(LiteXModule):
         arm_bit   = self._apply.storage[0]
         arm_d     = Signal()
         first_governed = Signal(64)     # sample index the commit takes effect for
+        # The 64-bit reach/late comparisons are REGISTERED, not combinational.
+        # `sample_count` only changes on a strobe and strobes are at least two
+        # sys cycles apart (61.44 MSPS ceiling vs 125 MHz sys), so a compare
+        # registered one cycle behind the counter is always settled by the
+        # strobe that consumes it — the commit still lands on exactly the
+        # requested sample. Combinationally, this 25-CARRY4 comparator sat in
+        # front of every channel's restart/NCO muxes and was the design's worst
+        # path: −1.7 ns WNS across ~17k endpoints on the 20-channel build.
+        reach_r = Signal()
+        late_r  = Signal()
         self.comb += [
             first_governed.eq(self.sample_count + 1),
-            apply_stb.eq(armed & self.sample_stb & (first_governed >= self._apply_at.storage)),
+            apply_stb.eq(armed & self.sample_stb & reach_r),
             self._apply_status.status.eq(Cat(armed, late)),
         ]
         self.sync += [
+            reach_r.eq(first_governed >= self._apply_at.storage),
+            late_r.eq(first_governed != self._apply_at.storage),
             arm_d.eq(arm_bit),
             If(apply_stb,
                 armed.eq(0),
-                late.eq(first_governed != self._apply_at.storage),
+                late.eq(late_r),
                 self._applied_at.status.eq(first_governed),
             ).Elif(arm_bit & ~arm_d,
                 armed.eq(1),
