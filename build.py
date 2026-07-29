@@ -73,6 +73,16 @@ def main():
     soc.platform.toolchain.pre_synthesis_commands.append(
         "set_param synth.elaboration.rodinMoreOptions "
         "{{rt::set_parameter enableParallelHelperSpawn false}}")
+    # Keep the tiny per-channel memories in LUT fabric. Left to its own
+    # heuristics at high channel counts, Vivado promotes the 1023x1 code RAMs
+    # and 256-entry carrier ROMs to block RAM, whose ~2 ns clock-to-out lands
+    # in series with the correlator DSP cascades — a -1.8 ns path family on
+    # the 20-channel build. As distributed RAM (their designed style, see
+    # code_replica.py) the same paths meet timing.
+    for pat in ("code_ram", "sin_mem", "cos_mem"):
+        soc.platform.add_platform_command(
+            "set_property RAM_STYLE distributed "
+            "[get_cells -hierarchical -quiet -filter {{NAME =~ *%s*}}]" % pat)
     build_name = (f"gnss_m2sdr_{args.variant}_x{args.pcie_lanes}"
                   f"_ch{args.channels}_ant{args.num_ants}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),

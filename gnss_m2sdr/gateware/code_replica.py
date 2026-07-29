@@ -91,7 +91,7 @@ class CodeReplica(LiteXModule):
         init = ca_code_reference(prn)
 
         def make_replica():
-            m  = Memory(1, code_length, init=init)
+            m  = Memory(1, code_length, init=init, name="code_ram")
             rp = m.get_port(async_read=True)
             wp = m.get_port(write_capable=True)
             self.specials += m, rp, wp

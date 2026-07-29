@@ -146,15 +146,14 @@ class TrackingChannel(LiteXModule):
         epoch_r  = Signal()
         cphase_r = Signal(code_frac_bits)
         sidx_r   = Signal(64)
-        # `s1_valid` and `sidx_r` compute the same value in every channel (a
-        # delayed copy of the shared strobe / sample counter), so synthesis
-        # merges the twenty copies into one register — which then drives
-        # clock-enables and dump inputs across the whole die. At 20 channels
-        # that fanout was the worst path family after the apply comparator
-        # (-0.66 ns of pure routing, zero logic levels). Keep them per-channel
-        # so placement can hold each copy next to its loads.
+        # `s1_valid` computes the same value in every channel (a delayed copy
+        # of the shared strobe), so synthesis merges the twenty copies into one
+        # register — which then drives clock-enables across the whole die: at
+        # 20 channels that fanout was a -0.66 ns path family of pure routing.
+        # Keep it per-channel so placement holds each copy next to its loads.
+        # (sidx_r is NOT kept: replicating twenty 64-bit registers costs more
+        # routing than the shared copy it prevents.)
         s1_valid.attr.add("keep")
-        sidx_r.attr.add("keep")
         self.sync += [
             s1_valid.eq(self.sample_stb),
             If(self.sample_stb,
