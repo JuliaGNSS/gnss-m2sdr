@@ -103,7 +103,17 @@ class GNSSSoC(BaseSoC):
             code_frac_bits = self._gnss_frac_bits,
             accum_bits     = self._gnss_accum_bits,
             num_ants       = self._gnss_num_ants,
+            # The channels become SoC-level CSR banks below. Inside the one
+            # `gnss` bank they overflow its 0x800-byte page at 17 channels, and
+            # LiteX does not catch that: it emits a csr.csv whose upper
+            # registers silently overlap the next bank (see GNSSTracking).
+            attach_channels = False,
         )
+        # One CSR bank per channel, named so the emitted register names
+        # (`gnss_ch<i>_<csr>`) are identical to the attach_channels=True
+        # layout — csr.csv-driven hosts cannot tell the difference.
+        for i, chan in enumerate(self.gnss.channels):
+            setattr(self, f"gnss_ch{i}", chan)
         # Non-intrusive observer: de-interleave each accepted RX word into I/Q
         # samples. What a word's two slots carry depends on the AD9361 PHY
         # channel mode -- RX1/RX2 of one instant in 2R2T, two consecutive samples

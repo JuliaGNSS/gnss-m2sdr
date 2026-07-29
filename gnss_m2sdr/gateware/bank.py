@@ -291,9 +291,23 @@ class ChannelWithCSR(LiteXModule):
 
 
 class GNSSTracking(LiteXModule):
-    """Bank of tracking channels + recorder. Observes the RX sample stream."""
+    """Bank of tracking channels + recorder. Observes the RX sample stream.
+
+    ``attach_channels`` decides who owns the channels in the CSR hierarchy.
+    ``True`` (the default, and what every simulation test uses) makes each
+    channel a submodule of this bank, so all per-channel CSRs land in the one
+    ``gnss`` CSR bank. That bank pages at 0x800 bytes = 512 CSR words, which a
+    channel's ~29 words exhaust at 17 channels — and LiteX does **not** fail
+    the build when a bank outgrows its page: it emits a csr.csv whose upper
+    registers silently overlap the next bank (measured: a 20-channel build put
+    ``gnss`` registers on top of ``header``). For real builds the SoC therefore
+    passes ``attach_channels=False`` and attaches every channel itself as its
+    own SoC-level CSR bank named ``gnss_ch<i>`` — the emitted register names
+    (``gnss_ch<i>_<csr>``) are identical either way, so no host software can
+    tell the difference.
+    """
     def __init__(self, n_channels=4, prns=None, code_frac_bits=24, accum_bits=32,
-                 num_ants=1):
+                 num_ants=1, attach_channels=True):
         if prns is None:
             prns = [i + 1 for i in range(n_channels)]
         assert len(prns) == n_channels
@@ -385,7 +399,8 @@ class GNSSTracking(LiteXModule):
         for i in range(n_channels):
             chan = ChannelWithCSR(prn=prns[i], code_frac_bits=code_frac_bits,
                                   accum_bits=accum_bits, num_ants=num_ants)
-            setattr(self.submodules, f"ch{i}", chan)
+            if attach_channels:
+                setattr(self.submodules, f"ch{i}", chan)
             self.channels.append(chan)
             self.comb += [
                 *[chan.sample_i_ants[n].eq(self.sample_i_ants[n]) for n in range(num_ants)],
