@@ -70,6 +70,39 @@ class ChannelWithCSR(LiteXModule):
     sample joins the new integration period; ``integrated_samples`` counts it,
     which keeps the record's ``first_sample = sample_index -
     integrated_samples + 1`` invariant intact.
+
+    **Contract: the scheduled path has exactly one staging slot, and it is not
+    a queue.** ``carrier_freq_next`` / ``code_freq_next`` / ``carrier_phase`` /
+    ``code_phase`` / ``apply_at`` are single registers and ``armed`` is a single
+    bit, so arming again before a pending commit has fired does not enqueue a
+    second commit — it *replaces* the pending one, with whatever is in those
+    registers and at whatever ``apply_at`` now holds. The values the host staged
+    first are then never applied at the sample it picked; if the new ``apply_at``
+    is later, they are simply skipped.
+
+    So a host may have **at most one commit outstanding per channel**:
+
+    * ``apply_status`` bit 0 (``armed``) is 1 exactly while a commit is pending.
+      Wait for it to clear (or for ``applied_at`` to reach the target) before
+      staging the next one. Handover does this — it is a once-per-satellite
+      operation and can afford the round trip.
+    * A **streaming** correction cannot: at a 1 kHz loop rate the next update is
+      produced ~1 ms after the last, while ``apply_at`` is one or two epochs in
+      the future, so every commit would be cancelled by its successor ~1 ms
+      before it was due to fire and *no* NCO word would ever reach the replicas
+      — the channel free-runs on its handover values while the host believes it
+      is steering. Use the **immediate** ``carrier_freq`` / ``code_freq`` CSRs
+      for those (GNSSM2SDR.jl's ``_drain_ncos!``): the correction then lands
+      within one CSR pass instead of at a named sample, which for a rate-only
+      update is the better trade — a known small transport delay beats an update
+      that never arrives.
+
+    This cost a season of "tracks, then walks off and never decodes" on the
+    LiteX-M2SDR (JuliaGNSS/GNSSReceiver.jl#107). Widening the slot into a real
+    queue (a small per-channel FIFO of ``(apply_at, words, selects)``) is
+    possible and would let streaming updates keep the deterministic apply point,
+    but it is not what the shipped gateware does, and at 20 channels the timing
+    budget for it is thin — hence the contract above rather than a queue.
     """
     def __init__(self, prn=1, code_frac_bits=24, accum_bits=32,
                  carrier_phase_bits=32, code_length=CA_CODE_LENGTH, num_ants=1):
@@ -132,11 +165,13 @@ class ChannelWithCSR(LiteXModule):
             CSRField("code_freq",    size=1, description="Commit code_freq_next."),
         ], description="Scheduled-commit control: what the commit does. The selects say which "
                        "staged values it takes, so a carrier-only update cannot drag a stale "
-                       "code word in with it. Keep all bits stable while armed.")
+                       "code word in with it. Keep all bits stable while armed. There is ONE "
+                       "staging slot: arming while a commit is still pending REPLACES it "
+                       "(the earlier values never reach the replicas) — see ChannelWithCSR.")
         self._apply_status = CSRStatus(2,
-            description="bit0: a commit is pending. bit1: the last commit fired after its target "
-                        "sample (host too late, so the feedback delay was longer than planned); "
-                        "cleared when the next commit is armed.")
+            description="bit0: a commit is pending (arming now would replace it). bit1: the last "
+                        "commit fired after its target sample (host too late, so the feedback "
+                        "delay was longer than planned); cleared when the next commit is armed.")
         self._applied_at = CSRStatus(64,
             description="Sample index actually governed by the last commit (== apply_at unless late).")
 

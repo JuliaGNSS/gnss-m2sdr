@@ -87,6 +87,14 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
       freq/phase + code freq/phase) commit atomically on a host-chosen sample
       index (`apply_at`), giving `NCOUpdate.apply_at_epoch` a hardware meaning
       and a fixed feedback delay instead of PCIe jitter.
+      **One staging slot per channel, and it is not a queue**: arming while a
+      commit is still pending replaces it, so the host may have at most one
+      commit outstanding (poll `apply_status.arm`) and must drive *streaming*
+      NCO corrections through the immediate `carrier_freq` / `code_freq` CSRs
+      instead — at a 1 kHz loop rate every scheduled commit would otherwise be
+      cancelled by its successor before it fired, and the channel would
+      free-run on its handover words. See `ChannelWithCSR` in
+      `gnss_m2sdr/gateware/bank.py` for the full contract.
 - [x] SoC integration via litex_m2sdr#152 hook (soc.py, pcie_dmas=2, RX observer)
 - [x] Host software: pure-Python CSR access (ioctl) + sliding-correlator acquisition
 - [x] Periodic **epoch-strobe records** (`gnss_epoch_period` CSR): a timebase marker
