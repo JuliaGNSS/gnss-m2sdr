@@ -153,6 +153,10 @@ class FakeChannelCSR:
             integrated_samples = m - m_prev,
             sample_index       = sample_index,
             dump_code_phase    = int((phase % 1.0) * (1 << FRAC_BITS)),
+            # The replica's integer chip on that sample. The gateware reports it
+            # rather than letting the host infer code_length - 1, which is only
+            # right for a dump that ends exactly on a wrap (record_format.py).
+            dump_code_chip     = int(phase),
         )
         return self._cached
 

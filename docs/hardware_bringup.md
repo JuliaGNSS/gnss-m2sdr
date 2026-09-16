@@ -10,9 +10,9 @@ Paths below assume the litex_m2sdr checkout at `~/litex_m2sdr` and this repo at
 
 ## 0. Artifacts (built on the Vivado host)
 
-- `build/gnss_m2sdr_m2_x1_ch4/gateware/gnss_m2sdr_m2_x1_ch4.bin`  (flash image)
-- `build/gnss_m2sdr_m2_x1_ch4/csr.csv`                           (CSR map for the host)
-- `build/gnss_m2sdr_m2_x1_ch4/software/include/generated/{csr,soc,mem}.h`
+- `build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/gateware/gnss_m2sdr_m2_x1_ch4_ant1_code1023.bin`  (flash image)
+- `build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/csr.csv`                           (CSR map for the host)
+- `build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/software/include/generated/{csr,soc,mem}.h`
   (regenerate the M2SDR driver + tools so their base-peripheral CSR offsets
   match this gateware)
 
@@ -22,7 +22,7 @@ Copy them + this repo to orin2 (see `scripts/deploy_orin.sh`).
 
 ```bash
 cd ~/litex_m2sdr/litex_m2sdr/software
-cp ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4/software/include/generated/{csr,soc,mem}.h kernel/
+cp ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/software/include/generated/{csr,soc,mem}.h kernel/
 # user tools include the same headers
 cd kernel && make clean all && sudo ./init.sh        # rebuild + load litepcie driver
 cd ../user  && make clean all                         # rebuild m2sdr_util, m2sdr_rf, ...
@@ -32,7 +32,7 @@ cd ../user  && make clean all                         # rebuild m2sdr_util, m2sd
 
 ```bash
 cd ~/litex_m2sdr/litex_m2sdr/software
-./flash.py ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4/gateware/gnss_m2sdr_m2_x1_ch4.bin
+./flash.py ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/gateware/gnss_m2sdr_m2_x1_ch4_ant1_code1023.bin
 # flash.py runs: m2sdr_util flash_write ... 0x00800000 ; flash_reload
 sudo rmmod litepcie 2>/dev/null; sudo ./kernel/init.sh   # rescan/reload after reflash
 ./user/m2sdr_util info                                   # expect the new SoC identifier
@@ -74,7 +74,7 @@ cd ~/gnss-m2sdr
 PYTHONPATH=. python3 -c "
 from software.m2sdr_csr import LiteXCSR
 from software.gnss_tracking import GNSSChannel, GNSSBank, acquire
-csr  = LiteXCSR('build/gnss_m2sdr_m2_x1_ch4/csr.csv')
+csr  = LiteXCSR('build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/csr.csv')
 fs   = 4_000_000
 bank = GNSSBank(csr); chan = GNSSChannel(csr, fs, index=0)
 best = acquire(chan, bank, prn=1, fs=fs)   # try PRNs known to be visible

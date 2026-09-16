@@ -326,7 +326,7 @@ class TestCodePhasePreload(unittest.TestCase):
         CODE_LENGTH = 8
         CHIP, CHIP_FRAC = 5, 1 << (FRAC - 2)     # 5.25 chips
         STEP = 1 << (FRAC - 1)                   # 0.5 chip / sample
-        dut = CodeReplica(prn=1, frac_bits=FRAC, code_length=CODE_LENGTH)
+        dut = CodeReplica(prn=1, frac_bits=FRAC, max_code_length=CODE_LENGTH)
         got = {"phase": None, "epoch_after": None}
 
         def bench():

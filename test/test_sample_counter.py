@@ -48,7 +48,8 @@ class TestChannelUsesExternalCounter(unittest.TestCase):
         # hours of streaming) and check the dump reproduces it.
         code_length = 8
         origin      = 1_000_000
-        dut = TrackingChannel(prn=1, code_frac_bits=FRAC, code_length=code_length)
+        dut = TrackingChannel(prn=1, code_frac_bits=FRAC,
+                              max_code_length=code_length)
         n_samples = epoch_sample(code_length) + 4
         got = {}
 

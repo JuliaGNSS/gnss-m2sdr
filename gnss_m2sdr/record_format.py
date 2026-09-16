@@ -17,11 +17,49 @@ One record = 16 x 64-bit words = 128 bytes, little-endian on the wire:
   word  6 : antenna 1  q_prompt [63:32] | i_prompt [31:0]  (signed)
   word  7 : antenna 1  q_early  [63:32] | i_early  [31:0]  (signed)
   word  8 : antenna 1  q_late   [63:32] | i_late   [31:0]  (signed)
-  word  9 : reserved [63:8] | num_ants [7:0]
-  words 10-15 : reserved (zero)
+  word  9 : reserved [63:24] | num_taps [23:16] | version [15:8] | num_ants [7:0]
+  word 10 : code_length [63:32] | code_phase_chip [31:0]
+  word 11 : reserved [63:32] | code_step [31:0]
+  words 12-15 : reserved (zero)
 
 `seq` is a per-channel record counter (wraps at 256) for host-side loss
 detection; `flags` bit 0 = overflow (a dump was dropped before this one).
+
+Versioning
+----------
+`version` (word 9, bits [15:8]) is RECORD_FORMAT_VERSION: the wire contract the
+gateware was built to. Version 1 is the GPS-L1-C/A-only layout, which reads
+zero there because it left the byte reserved; version 2 adds the three signal
+fields below and `num_taps`, all in words that version 1 left reserved, so a
+version-1 host keeps parsing a version-2 record correctly and simply does not
+see them. The magic is therefore *not* bumped -- it is the framing anchor
+(`find_record_offset`), and a host that cannot even frame the stream cannot read
+the version byte that would tell it why. Bump the magic only for a layout change
+that moves or resizes an existing field; bump the version for anything else, and
+have the host refuse a version it does not know rather than guess.
+
+Signal configuration per record
+-------------------------------
+A channel's primary code length and code rate are runtime-programmable
+(gateware/code_replica.py), so a record has to say which ones produced it:
+
+  * `code_phase_chip` -- the replica's *integer* chip index on the last sample of
+    the integration, alongside the fractional phase in `code_phase`. Together
+    they are the complete code phase; see `code_phase_chips()`. A dump that ends
+    on a code wrap reads `code_length - 1` here, but the host must not assume
+    that: it is exactly the "1022" assumption that breaks for every non-1023
+    code (and for the sub-period dumps of GNSSReceiver.jl#133).
+  * `code_length` -- primary-code chips the channel was configured for.
+  * `code_step` -- the code NCO's phase increment per input sample, in
+    `code_frac_bits` fixed-point chips (`gnss_capabilities` reports the scale).
+    `code_step / 2**code_frac_bits * fs` is the chip rate this record was
+    integrated at, which is what the host needs to propagate `code_phase_chips`
+    to another sample index after a scheduled rate change.
+
+`num_taps` is how many leading correlator taps this record carries, as
+GNSSReceiver's hardware contract requires: 3 (late, prompt, early) for this
+gateware, with the field present so a five-tap build (gnss-m2sdr#30) can say 5
+on the same wire without another version bump.
 
 Antennas
 --------
@@ -68,7 +106,8 @@ i.e. word 4, then word 2, then word 3 -- the reverse of the wire order. Passing
 discriminator `(2-d)/2 * (E-L)/(E+L)` and drives the code phase away from lock;
 the symptom is "tracking never converges" rather than an obvious error.
 
-`code_phase` (low half of word 5) is **not** part of that contract -- it is additional
+`code_phase` (low half of word 5, with its integer chip index in word 10) is
+**not** part of that contract -- it is additional
 device-side metadata that Tracking.jl does not currently consume. As of
 Tracking.jl v4.1.1 (with #207 merged) `CorrelatorOutput` has exactly the three
 fields above and no `code_phase` keyword constructor, even though #207's
@@ -94,7 +133,10 @@ Epoch strobes
 marks a **timebase record**, not a correlator dump: the recorder emits one every
 `epoch_period` input samples (`gnss_epoch_period` CSR, 0 = off), carrying only
 `sample_index` on the same free-running counter as the dumps -- every other
-payload field is zero, including both antenna blocks and `num_ants`. The host's epoch rule ("close epoch e once something with
+payload field is zero, including both antenna blocks, `num_ants`, `num_taps` and
+the three signal fields. `version` is the one exception: it describes the wire,
+not the payload, so a host that has only ever seen strobes (nothing locked, which
+is exactly when strobes matter) can still read the format it is parsing. The host's epoch rule ("close epoch e once something with
 `sample_index >= (e+1)*delta` arrives", GNSSReceiver.jl#107) then has a clock
 that does not depend on a satellite being locked: without it a receiver with
 nothing acquired, or one that has just lost lock on every channel, stalls the
@@ -141,11 +183,52 @@ RECORD_WORDS = 16
 RECORD_BYTES = RECORD_WORDS * 8
 RECORDS_PER_DMA_BUFFER = DMA_BUFFER_SIZE // RECORD_BYTES
 
-# "GNSS" as it reads in a little-endian hexdump; bump on a layout change.
+# "GNSS" as it reads in a little-endian hexdump. This anchors the *framing*, so
+# it changes only when a field moves or changes size; a compatible extension
+# bumps RECORD_FORMAT_VERSION instead (see the Versioning section above).
 RECORD_MAGIC  = 0x53534E47
 MAGIC_WORD    = 5
 MAGIC_SHIFT   = 32
 MAGIC_OFFSET  = MAGIC_WORD * 8 + MAGIC_SHIFT // 8   # byte offset within a record
+
+# Wire-format revision reported in every record (word 9, bits [15:8]).
+#   1 : GPS L1 C/A only; words 9[15:8] upward reserved (reads 0).
+#   2 : + version / num_taps, code_phase_chip, code_length, code_step.
+RECORD_FORMAT_VERSION = 2
+
+# CSR-layout revision reported by the gnss_version CSR. Bumped together with
+# any change to the register set the host driver addresses by name.
+CSR_LAYOUT_VERSION = 2
+
+# Correlator taps this gateware produces per record, latest first on the host
+# (late, prompt, early). GNSSReceiver's hardware contract wants it per record so
+# one stream can carry several layouts; a five-tap build (gnss-m2sdr#30) reports
+# 5 in the same field.
+NUM_TAPS = 3
+
+# Replica modulations the gateware can synthesise, as the bitmask reported by
+# the gnss_modulations CSR. They name GNSSReceiver's
+# `HardwareCorrelatorCapabilities.modulations` symbols, so the adapter maps a
+# set bit straight onto one: bit 0 -> :LOC. The BOC/CBOC/TMBOC bits are
+# *allocated*, not implemented -- gnss-m2sdr#30 sets them when the replicas
+# exist. A capability that is only allocated must read back 0, because an
+# over-declared capability is a channel that arms and never locks.
+MOD_LOC   = 1 << 0                       # plain +/-1 BPSK code (:LOC)
+MOD_BOC11 = 1 << 1                       # reserved: :BOCcos / BOC(1,1)
+MOD_CBOC  = 1 << 2                       # reserved: :CBOC
+MOD_TMBOC = 1 << 3                       # reserved: :TMBOC
+MODULATIONS = MOD_LOC
+
+# Longest secondary (overlay) code the gateware wipes off itself. 1 means
+# "primary code only", which is what GNSSReceiver's contract asks for today
+# (`requested_secondary_code_mode` is always :primary_only); overlay removal is
+# GNSSReceiver.jl#132.
+MAX_SECONDARY_CODE_LENGTH = 1
+
+# Furthest an E/P/L tap can sit from the prompt replica, in chips: the taps
+# address chip index +/- 1, so a tap offset of a whole chip is the hard limit.
+# GNSSReceiver calls this `max_tap_offset_chips`.
+MAX_TAP_OFFSET_CHIPS = 1.0
 
 # Antenna n's E/P/L block starts at ANT_PROMPT_WORD[n] (prompt, early, late).
 # Antenna 0 keeps the words it had in the single-antenna layout, so antenna 1
@@ -153,7 +236,16 @@ MAGIC_OFFSET  = MAGIC_WORD * 8 + MAGIC_SHIFT // 8   # byte offset within a recor
 N_ANTS_MAX      = 2                  # AD9361 is 2T2R -> 2 coherent RX per board
 ANT_PROMPT_WORD = (2, 6)
 ANT_BLOCK_WORDS = 3
-NANTS_WORD      = 9                  # num_ants in bits [7:0]
+
+# Word 9: num_ants [7:0] | version [15:8] | num_taps [23:16].
+NANTS_WORD      = 9
+VERSION_SHIFT   = 8
+NUM_TAPS_SHIFT  = 16
+# Word 10: code_phase_chip [31:0] | code_length [63:32].
+CODE_WORD       = 10
+CODE_LENGTH_SHIFT = 32
+# Word 11: code_step [31:0] | reserved.
+CODE_STEP_WORD  = 11
 
 assert len(ANT_PROMPT_WORD) == N_ANTS_MAX
 assert DMA_BUFFER_SIZE % RECORD_BYTES == 0, "record must divide the DMA buffer"
@@ -173,13 +265,18 @@ ACC_SIGNALS = ("ie", "qe", "ip", "qp", "il", "ql")
 
 def pack_record(sample_index, integrated_samples, channel, prn, seq, flags,
                 i_early, q_early, i_prompt, q_prompt, i_late, q_late, code_phase,
-                ants=(), num_ants=None):
+                ants=(), num_ants=None, code_phase_chip=0, code_length=0,
+                code_step=0, num_taps=NUM_TAPS, version=RECORD_FORMAT_VERSION):
     """Build the 16 little-endian 64-bit words for one record (for tests).
 
     The flat accumulator arguments are antenna 0; `ants` holds the additional
     antennas (dicts keyed by ACC_KEYS), so a single-antenna caller is unchanged.
     `num_ants` defaults to how many blocks were given; pass 0 for a record that
     carries no correlator payload at all, which is what an epoch strobe is.
+
+    `code_phase_chip` / `code_length` / `code_step` are the version-2 signal
+    fields; leaving them at 0 and passing `version=1` produces the version-1
+    layout byte for byte, which is what the compatibility tests compare against.
     """
     def u32(x): return x & 0xFFFFFFFF
     blocks = [dict(i_early=i_early, q_early=q_early, i_prompt=i_prompt,
@@ -194,7 +291,11 @@ def pack_record(sample_index, integrated_samples, channel, prn, seq, flags,
     words[1] = ((integrated_samples & 0xFFFFFFFF) << 32) | ((channel & 0xFF) << 24) | \
                ((prn & 0xFF) << 16) | ((flags & 0xFF) << 8) | (seq & 0xFF)
     words[MAGIC_WORD] = (RECORD_MAGIC << MAGIC_SHIFT) | u32(code_phase)
-    words[NANTS_WORD] = num_ants & 0xFF
+    words[NANTS_WORD] = ((num_ants & 0xFF)
+                         | ((version & 0xFF) << VERSION_SHIFT)
+                         | ((num_taps & 0xFF) << NUM_TAPS_SHIFT))
+    words[CODE_WORD]      = (u32(code_length) << CODE_LENGTH_SHIFT) | u32(code_phase_chip)
+    words[CODE_STEP_WORD] = u32(code_step)
     for n, b in enumerate(blocks[:num_ants]):
         base = ANT_PROMPT_WORD[n]
         words[base + 0] = (u32(b["q_prompt"]) << 32) | u32(b["i_prompt"])
@@ -231,7 +332,9 @@ def unpack_record(words):
     w5     = words[MAGIC_WORD]
     # Clamped, so a record from a future/garbled build cannot make this index
     # past the reserved blocks; every record carries at least antenna 0.
-    num_ants = min(max(words[NANTS_WORD] & 0xFF, 1), N_ANTS_MAX)
+    w9     = words[NANTS_WORD]
+    w10    = words[CODE_WORD]
+    num_ants = min(max(w9 & 0xFF, 1), N_ANTS_MAX)
     ants = [unpack_ant_block(words, n) for n in range(num_ants)]
     return dict(
         sample_index       = w0,
@@ -243,9 +346,43 @@ def unpack_record(words):
         code_phase = w5 & 0xFFFFFFFF,
         magic      = (w5 >> MAGIC_SHIFT) & 0xFFFFFFFF,
         num_ants   = num_ants,
+        # Version-2 fields. A version-1 record reads 0 in all of them, which is
+        # why `version` has to be checked before `code_length` is believed.
+        version         = (w9 >> VERSION_SHIFT) & 0xFF,
+        num_taps        = (w9 >> NUM_TAPS_SHIFT) & 0xFF,
+        code_phase_chip = w10 & 0xFFFFFFFF,
+        code_length     = (w10 >> CODE_LENGTH_SHIFT) & 0xFFFFFFFF,
+        code_step       = words[CODE_STEP_WORD] & 0xFFFFFFFF,
         ants       = ants,
         **ants[0],
     )
+
+
+def code_phase_chips(rec, frac_bits):
+    """Complete code phase of a dump, in chips, as a float.
+
+    The replica's phase on the *last* sample of the integration: the integer
+    chip index the record reports plus the fractional chip phase, with no
+    assumption about where in the code the dump landed. `frac_bits` is the
+    gateware's code_frac_bits (`gnss_capabilities`).
+
+    A version-1 record carries no chip index, so this would silently read 0
+    there; it raises instead, because "chip 0" is a plausible-looking answer.
+    """
+    if rec.get("version", 0) < 2:
+        raise ValueError(
+            "record format version %r carries no code_phase_chip; the chip index "
+            "cannot be reconstructed (assuming code_length-1 is only valid for a "
+            "dump that ends exactly on a code wrap)" % rec.get("version", 0))
+    return rec["code_phase_chip"] + rec["code_phase"] / float(1 << frac_bits)
+
+
+def code_chip_rate(rec, frac_bits, sampling_freq):
+    """Chip rate (Hz) the dump was integrated at, from its `code_step`."""
+    if rec.get("version", 0) < 2:
+        raise ValueError("record format version %r carries no code_step"
+                         % rec.get("version", 0))
+    return rec["code_step"] / float(1 << frac_bits) * sampling_freq
 
 
 def is_epoch_strobe(rec):

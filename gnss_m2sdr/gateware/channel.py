@@ -4,7 +4,7 @@
 # Single GNSS tracking channel: carrier wipe-off + E/P/L correlation + I&D.
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""One GPS L1 C/A tracking channel, over `num_ants` coherent antennas.
+"""One BPSK tracking channel, over `num_ants` coherent antennas.
 
 Per enabled input sample (I, Q) of every antenna:
   1. Carrier NCO -> cos/sin replica; complex mix (multiply by conjugate) to
@@ -30,7 +30,8 @@ antennas here would destroy the spatial information (and one NCOUpdate per
 channel, not per antenna, is what #107 specifies). Antenna 0's ports keep their
 scalar names, so single-antenna wiring is unchanged.
 
-On each code epoch (one 1023-chip period) the accumulators are latched to the
+On each code epoch (one primary-code period -- `code_length` chips, runtime
+programmable) the accumulators are latched to the
 dump registers, the integrated-sample count and the sample-counter value are
 captured, and the accumulators reset. The dump maps onto Tracking.jl's
 CorrelatorOutput(EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing),
@@ -38,7 +39,24 @@ integrated_samples, sample_index) -- note that Tracking.jl orders its
 accumulators latest-first, so E and L go in reversed relative to the names used
 here; see record_format.py for why getting that backwards inverts the DLL. The
 dumped `code_phase` is extra device-side metadata: Tracking.jl's CorrelatorOutput
-has no code_phase field or keyword, so the host carries it out of band.
+has no code_phase field or keyword, so the host carries it out of band. It is
+reported *completely* -- `dump_code_chip` (integer chip index) next to
+`dump_code_phase` (fractional chip) -- so the host never has to reconstruct the
+chip from "the dump fires on the wrap, so it must be code_length - 1". That
+reconstruction is what hard-codes 1022 into a host, and it stops being true the
+moment a dump is shorter than a primary period (GNSSReceiver.jl#133).
+
+Two conditions make a dump meaningless rather than merely bad, and both raise
+`inhibit`, which suppresses the dump strobe entirely instead of emitting a
+record the host would have to second-guess:
+
+  * the code RAM is mid-load (`code_loading` from the bank) -- the replica is
+    then part one satellite and part another;
+  * `code_step` asks for >= 1 chip per input sample (`rate_unsupported`), which
+    this NCO cannot represent: its accumulator carries at most one chip
+    boundary per sample. The step word is one bit wider than the fraction
+    precisely so that an unrepresentable rate arrives as a detectable value
+    rather than as a silently truncated one.
 
 The timestamp is NOT generated here: `sample_count` is an input, driven by the
 one free-running counter shared by every channel (and by the raw stream) in
@@ -65,9 +83,10 @@ from gnss_m2sdr.record_format import ACC_SIGNALS, N_ANTS_MAX
 class TrackingChannel(LiteXModule):
     def __init__(self, prn=1, sample_bits=16, carrier_phase_bits=32,
                  carrier_lut_addr_bits=8, carrier_amp_bits=8,
-                 code_frac_bits=24, accum_bits=32, code_length=CA_CODE_LENGTH,
-                 num_ants=1):
+                 code_frac_bits=24, accum_bits=32,
+                 max_code_length=CA_CODE_LENGTH, num_ants=1, code_init=None):
         assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
+        self.max_code_length = max_code_length
 
         # Sample inputs, one I/Q pair per antenna. All antennas are presented on
         # the same sample_stb: they sample simultaneously off the shared LO, so
@@ -86,12 +105,24 @@ class TrackingChannel(LiteXModule):
         self.carrier_fw    = Signal(carrier_phase_bits)  # carrier phase increment / sample
         self.carrier_set   = Signal()                    # load carrier_phase_in
         self.carrier_phase_in = Signal(carrier_phase_bits)
-        self.code_step     = Signal(code_frac_bits)      # code phase increment / sample
+        # Code phase increment per sample, in code_frac_bits fixed-point chips.
+        # One bit wider than the fraction: >= 1.0 chips/sample is outside what
+        # the NCO can represent, and it has to be *representable on the wire* to
+        # be rejected rather than truncated into a plausible-looking rate.
+        self.code_step     = Signal(code_frac_bits + 1)
+        self.code_length   = Signal(bits_for(max_code_length),
+                                    reset=min(CA_CODE_LENGTH, max_code_length))
         self.spacing       = Signal(code_frac_bits)      # E/L half spacing (chips)
         self.restart       = Signal()                    # rebase code phase + integration
+        # Suppress dumps: the code RAM is being rewritten, or the programmed
+        # code rate is unrepresentable. Driven by the bank.
+        self.code_loading  = Signal()
         # Code phase loaded by `restart` (0/0 = start of the code).
-        self.code_phase_chip = Signal(max=code_length)
+        self.code_phase_chip = Signal(max=max_code_length)
         self.code_phase_frac = Signal(code_frac_bits)
+
+        # High while `code_step` asks for >= 1 chip per input sample.
+        self.rate_unsupported = Signal()
 
         # Dump outputs (valid for one cycle when dump_stb high, then held).
         # acc[n] holds antenna n's six accumulators; antenna 0's are also
@@ -105,6 +136,11 @@ class TrackingChannel(LiteXModule):
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.dump_code_phase    = Signal(code_frac_bits)
+        # Complete code phase + the configuration that produced the dump, so a
+        # record describes itself (see record_format.py).
+        self.dump_code_chip     = Signal(max=max_code_length)
+        self.dump_code_length   = Signal(bits_for(max_code_length))
+        self.dump_code_step     = Signal(code_frac_bits + 1)
 
         # Sticky "an accumulator hit the rail since the last restart" status,
         # for the bank's saturation CSR. Unlike dump_saturated this survives
@@ -115,13 +151,23 @@ class TrackingChannel(LiteXModule):
 
         # Sub-modules.
         self.carrier = carrier = CarrierNCO(carrier_phase_bits, carrier_lut_addr_bits, carrier_amp_bits)
-        self.code    = code    = CodeReplica(prn=prn, frac_bits=code_frac_bits, code_length=code_length)
+        self.code    = code    = CodeReplica(prn=prn, frac_bits=code_frac_bits,
+                                             max_code_length=max_code_length,
+                                             code_init=code_init)
+        # An out-of-range step still drives the NCO with its low bits (the
+        # replica keeps running at *some* rate rather than freezing), but every
+        # dump it would produce is inhibited, so nothing truncated reaches the
+        # host.
+        self.comb += self.rate_unsupported.eq(self.code_step[code_frac_bits])
+        inhibit = Signal()
+        self.comb += inhibit.eq(self.code_loading | self.rate_unsupported)
         self.comb += [
             carrier.freq_word.eq(self.carrier_fw),
             carrier.stb.eq(self.sample_stb),
             carrier.set_phase.eq(self.carrier_set),
             carrier.phase_in.eq(self.carrier_phase_in),
-            code.code_step.eq(self.code_step),
+            code.code_step.eq(self.code_step[:code_frac_bits]),
+            code.code_length.eq(self.code_length),
             code.spacing.eq(self.spacing),
             code.stb.eq(self.sample_stb),
             code.restart.eq(self.restart),
@@ -145,6 +191,7 @@ class TrackingChannel(LiteXModule):
         early_r  = Signal((2, True)); prompt_r = Signal((2, True)); late_r = Signal((2, True))
         epoch_r  = Signal()
         cphase_r = Signal(code_frac_bits)
+        cchip_r  = Signal(max=max_code_length)
         sidx_r   = Signal(64)
         self.sync += [
             s1_valid.eq(self.sample_stb),
@@ -157,6 +204,7 @@ class TrackingChannel(LiteXModule):
                   for n in range(num_ants)],
                 early_r.eq(code.early), prompt_r.eq(code.prompt), late_r.eq(code.late),
                 epoch_r.eq(code.epoch), cphase_r.eq(code.code_frac),
+                cchip_r.eq(code.chip_index),
                 # Global index of *this* sample, carried alongside it into
                 # stage 2 so the dump timestamps the sample it integrated.
                 sidx_r.eq(self.sample_count),
@@ -238,11 +286,16 @@ class TrackingChannel(LiteXModule):
                 If(any_sat, sat_r.eq(1), self.saturated.eq(1)),
                 # Dump on the sample that completes a code period.
                 If(epoch_r,
-                    self.dump_stb.eq(1),
+                    # Inhibited: the integration still restarts on the epoch, it
+                    # just does not become a record.
+                    self.dump_stb.eq(~inhibit),
                     *store(self.acc),
                     self.integrated_samples.eq(nsamp + 1),
                     self.sample_index.eq(sidx_r),
                     self.dump_code_phase.eq(cphase_r),
+                    self.dump_code_chip.eq(cchip_r),
+                    self.dump_code_length.eq(self.code_length),
+                    self.dump_code_step.eq(self.code_step),
                     self.dump_saturated.eq(sat_r | any_sat),
                     # Reset accumulators for the next integration.
                     *clear(),

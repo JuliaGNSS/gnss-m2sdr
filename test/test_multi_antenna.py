@@ -27,7 +27,8 @@ from gnss_m2sdr.gateware.rx_observer import RXSampleObserver
 from gnss_m2sdr.gateware.record import CorrelatorRecorder
 from gnss_m2sdr.record_format import (
     ANT_PROMPT_WORD, DMA_BUFFER_SIZE, MAGIC_OFFSET, MAGIC_WORD, N_ANTS_MAX,
-    NANTS_WORD, RECORD_BYTES, RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
+    NANTS_WORD, RECORD_BYTES, RECORD_FORMAT_VERSION, RECORD_MAGIC,
+    RECORD_WORDS, STROBE_CHANNEL, VERSION_SHIFT,
     has_magic_at, is_epoch_strobe, pack_record, unpack_record,
 )
 from test.test_channel_lock import (
@@ -461,11 +462,15 @@ class TestEpochStrobeWithTwoAntennas(unittest.TestCase):
             rec = unpack_record(w)
             self.assertTrue(is_epoch_strobe(rec), "marker lost at the 16-word stride")
             self.assertEqual(rec["channel"], STROBE_CHANNEL)
-            # Both antenna blocks and the num_ants word are zero on the wire.
+            # Both antenna blocks are zero on the wire, and so are num_ants
+            # and num_taps; only the format version is carried (it describes the
+            # wire, not the payload -- see record_format.py).
             for base in ANT_PROMPT_WORD:
                 self.assertEqual(w[base:base + 3], [0, 0, 0],
                                  "strobe record carries an antenna payload")
-            self.assertEqual(w[NANTS_WORD], 0)
+            self.assertEqual(w[NANTS_WORD],
+                             RECORD_FORMAT_VERSION << VERSION_SHIFT)
+            self.assertEqual(rec["num_taps"], 0)
             # The host still gets something safe to unpack.
             self.assertEqual(rec["num_ants"], 1)
             self.assertEqual(set(rec["ants"][0].values()), {0})

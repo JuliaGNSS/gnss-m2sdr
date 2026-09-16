@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HOST="${ORIN_HOST:-orin@orin2}"
-BUILD="${1:-gnss_m2sdr_m2_x1_ch4}"
+BUILD="${1:-gnss_m2sdr_m2_x1_ch4_ant1_code1023}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 GW="$REPO/build/$BUILD/gateware/$BUILD.bin"
 CSV="$REPO/build/$BUILD/csr.csv"
