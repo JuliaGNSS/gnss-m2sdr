@@ -22,6 +22,8 @@ until the code-period epoch dumps them.
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.bank import GNSSTracking
@@ -63,7 +65,7 @@ def run_channel_to_dump(n_drive, sign=+1):
     def bench():
         yield dut.carrier_fw.eq(0)          # cos = +127, sin = 0
         yield dut.carrier_phase_in.eq(0)
-        yield dut.spacing.eq(1 << (FRAC - 1))
+        yield from set_el_offsets(dut, 1 << (FRAC - 1))
         yield dut.code_step.eq(0)           # freeze the code phase
         yield dut.carrier_set.eq(1)
         yield dut.restart.eq(1)
@@ -129,7 +131,7 @@ class TestAccumulatorSaturation(unittest.TestCase):
         def bench():
             yield dut.carrier_fw.eq(0)
             yield dut.carrier_phase_in.eq(0)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield from set_el_offsets(dut, 1 << (FRAC - 1))
             yield dut.code_step.eq(0)
             yield dut.carrier_set.eq(1)
             yield dut.restart.eq(1)
@@ -165,7 +167,7 @@ class TestBankSaturationCSR(unittest.TestCase):
             yield chan._carrier_freq.storage.eq(0)
             yield chan._carrier_phase.storage.eq(0)
             yield chan._code_freq.storage.eq(0)      # freeze the code phase
-            yield chan._spacing.storage.eq(1 << (FRAC - 1))
+            yield from set_el_offsets_csr(chan, 1 << (FRAC - 1), FRAC)
             yield dut._control.storage.eq(1)          # enable the bank
             yield dut.source.ready.eq(1)
             yield

@@ -20,6 +20,7 @@ import os
 import importlib.util
 
 from gnss_m2sdr.gps_ca import CA_CODE_LENGTH
+from gnss_m2sdr.record_format import TAPS_VEPL
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -87,7 +88,8 @@ BaseSoC = _m2sdr.BaseSoC
 class GNSSSoC(BaseSoC):
     def __init__(self, gnss_channels=4, gnss_prns=None, gnss_frac_bits=24,
                  gnss_accum_bits=32, gnss_num_ants=1,
-                 gnss_max_code_length=CA_CODE_LENGTH, **kwargs):
+                 gnss_max_code_length=CA_CODE_LENGTH,
+                 gnss_num_taps=TAPS_VEPL, gnss_max_subchips=12, **kwargs):
         self._gnss_channels  = gnss_channels
         self._gnss_prns      = gnss_prns
         self._gnss_frac_bits = gnss_frac_bits
@@ -97,6 +99,14 @@ class GNSSSoC(BaseSoC):
         # cannot be changed at runtime (see docs/signal_configuration.md for the
         # resource/channel-count table).
         self._gnss_max_code_length = gnss_max_code_length
+        # Correlator taps and sub-chip table depth. The shipped bitstream turns
+        # both on -- five taps and a 12-entry table cover every L1 modulation
+        # GNSSSignals exposes -- while the RTL modules default to the lean
+        # 3-tap/BPSK configuration, so a build that wants the old gateware asks
+        # for it (`--taps 3 --max-subchips 1`) rather than getting it by
+        # accident. See docs/signal_configuration.md.
+        self._gnss_num_taps     = gnss_num_taps
+        self._gnss_max_subchips = gnss_max_subchips
         kwargs.setdefault("with_pcie", True)
         kwargs["pcie_dmas"] = 2  # DMA0 = RFIC I/Q, DMA1 = correlator records
         super().__init__(**kwargs)
@@ -111,6 +121,8 @@ class GNSSSoC(BaseSoC):
             accum_bits     = self._gnss_accum_bits,
             num_ants       = self._gnss_num_ants,
             max_code_length = self._gnss_max_code_length,
+            num_taps        = self._gnss_num_taps,
+            max_subchips    = self._gnss_max_subchips,
         )
         # Non-intrusive observer: de-interleave each accepted RX word into I/Q
         # samples. What a word's two slots carry depends on the AD9361 PHY

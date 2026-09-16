@@ -32,6 +32,8 @@ chip or leftover accumulation breaks the equality.
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.bank import GNSSTracking
@@ -91,7 +93,7 @@ def read_dump(chan):
 def configure(chan):
     """Code/carrier words for a code-only, replica-aligned signal."""
     yield chan._code_freq.storage.eq(CODE_STEP)
-    yield chan._spacing.storage.eq(SPACING)
+    yield from set_el_offsets_csr(chan, SPACING, FRAC)
     yield chan._carrier_freq.storage.eq(0)     # constant replica: cos=127, sin=0
     yield chan._carrier_phase.storage.eq(0)
 

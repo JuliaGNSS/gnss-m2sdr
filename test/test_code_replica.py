@@ -25,7 +25,8 @@ class TestCodeReplica(unittest.TestCase):
 
         def bench():
             yield dut.code_step.eq(step)
-            yield dut.spacing.eq(sp)
+            yield dut.tap_offset[0].eq(sp)          # early: +spacing
+            yield dut.tap_offset[2].eq(-sp)         # late:  -spacing
             yield dut.restart.eq(1)
             yield
             yield dut.restart.eq(0)

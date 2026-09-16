@@ -20,7 +20,9 @@ from gnss_m2sdr.gps_ca import (
 )
 from gnss_m2sdr.record_format import (
     CSR_LAYOUT_VERSION, MAX_TAP_OFFSET_CHIPS, RECORD_FORMAT_VERSION,
+    TAPS_EPL, TAPS_VEPL, tap_short_names,
 )
+from gnss_m2sdr.subcarrier import ReplicaShape, signal_replica_shape
 
 
 class GNSSChannel:
@@ -35,7 +37,8 @@ class GNSSChannel:
     """
     def __init__(self, csr, fs, index=0, carrier_phase_bits=32, code_frac_bits=24,
                  code_length=CA_CODE_LENGTH, chip_rate=GPS_CA_CHIP_RATE,
-                 carrier_freq=GPS_L1_HZ):
+                 carrier_freq=GPS_L1_HZ, num_taps=TAPS_EPL, max_subchips=1,
+                 replica_bits=2):
         self.csr = csr
         self.fs  = float(fs)
         self.i   = index
@@ -45,7 +48,27 @@ class GNSSChannel:
         self.code_length  = int(code_length)
         self.chip_rate    = float(chip_rate)
         self.carrier_freq = float(carrier_freq)
+        # What the *build* can do. GNSSBank fills these from gnss_capabilities /
+        # gnss_signal_caps; the defaults are the lean three-tap BPSK build, so a
+        # channel constructed by hand against an old bitstream behaves as before.
+        self.num_taps     = int(num_taps)
+        self.max_subchips = int(max_subchips)
+        self._replica_bits = int(replica_bits)
         self._num_ants = None    # discovered from the CSR set on first use
+
+    # ---- build limits --------------------------------------------------------
+    def replica_bits(self):
+        """Signed width of one subcarrier-table entry in this build."""
+        return self._replica_bits
+
+    def _sub_adr_bits(self):
+        return max(1, (self.max_subchips - 1).bit_length())
+
+    def _subchips_bits(self):
+        return max(1, self.max_subchips.bit_length())
+
+    def _has_five_taps(self):
+        return self.num_taps >= TAPS_VEPL
 
     # ---- configuration -------------------------------------------------------
     def carrier_word(self, hz):
@@ -100,9 +123,9 @@ class GNSSChannel:
         return self.csr.read(self.p + "code_length_active")
 
     def code_status(self):
-        """(loading, rate_unsupported) of this channel's replica right now."""
+        """(loading, rate_unsupported, replica_unsupported) right now."""
         v = self.csr.read(self.p + "code_status")
-        return bool(v & 0b01), bool(v & 0b10)
+        return bool(v & 0b001), bool(v & 0b010), bool(v & 0b100)
 
     def sample_shift(self, spacing_chips, code_doppler_hz=0.0):
         """Tracking.jl's E/L shift in whole input samples.
@@ -117,13 +140,13 @@ class GNSSChannel:
         return max(1, int(round(spacing_chips * (1 << self.fb) / step)))
 
     def spacing_word(self, spacing_chips, code_doppler_hz=0.0):
-        """E/L half-spacing CSR word: `sample_shift` whole NCO samples.
+        """E/L half-spacing, in chips: `sample_shift` whole NCO samples.
 
         `sample_shift * code_step` puts the Early tap exactly that many samples
         ahead of the prompt (and Late that many behind) with no rounding drift
         between the two fixed-point words -- programming the raw preferred shift
         instead leaves the accumulators at a spacing `dll_disc` does not assume
-        (~2.3 % DLL loop-gain error at fs = 4 MHz, 0.5 chips). The E/L taps only
+        (~2.3 % DLL loop-gain error at fs = 4 MHz, 0.5 chips). The taps only
         reach chip index +/- 1, so the result must stay below one chip.
         """
         step = self.code_word(code_doppler_hz)
@@ -131,17 +154,68 @@ class GNSSChannel:
         if word >= (1 << self.fb):
             raise ValueError(
                 f"E/L spacing {word / (1 << self.fb):.3f} chips >= 1 chip: the "
-                f"E/L taps only reach chip index +/-1 (preferred {spacing_chips} "
+                f"taps only reach chip index +/-1 (preferred {spacing_chips} "
                 f"chips at fs={self.fs:.0f} Hz)")
         return word
 
+    def tap_offset_word(self, sample_shift, code_doppler_hz=0.0):
+        """Tap-offset CSR word for a tap `sample_shift` input samples early.
+
+        The register is `code_frac_bits + 1` bits of two's complement, so a late
+        tap (negative shift) is the wrapped value. Whole samples times the code
+        step is the grid Tracking quantises its preferred shifts onto, and the
+        five-tap discriminators read the VE/VL distance straight off the
+        correlator they are handed, so this is the only representation that
+        cannot mis-scale the loop.
+        """
+        step = self.code_word(code_doppler_hz)
+        word = int(sample_shift) * step
+        if abs(word) >= (1 << self.fb):
+            raise ValueError(
+                f"tap offset {word / (1 << self.fb):.3f} chips is a whole chip or "
+                f"more: the taps reach chip index +/-1 only "
+                f"(max_tap_offset_chips = {MAX_TAP_OFFSET_CHIPS})")
+        return word & ((1 << (self.fb + 1)) - 1)
+
+    def set_tap_offsets(self, sample_shifts, code_doppler_hz=0.0):
+        """Program every tap from GNSSReceiver's `tap_sample_shifts`.
+
+        `sample_shifts` is the contract's array: whole input samples, **latest
+        first**, prompt at zero -- `[-s, 0, s]` for three taps, `[-s2, -s1, 0,
+        s1, s2]` for five. The gateware's tap registers run earliest first, so
+        the list is reversed here; the prompt entry must be 0 and has no
+        register (the contract fixes it, and a register would only be a way to
+        get it wrong).
+        """
+        shifts = list(sample_shifts)
+        names  = tap_short_names(len(shifts))
+        prompt = len(shifts) // 2
+        if shifts[prompt] != 0:
+            raise ValueError(
+                f"tap shifts {shifts} must carry the prompt (0) at index "
+                f"{prompt}; they are ordered latest first")
+        for name, shift in zip(names, reversed(shifts)):
+            if name == "p":
+                continue
+            self.csr.write(self.p + "tap_offset_" + name,
+                           self.tap_offset_word(shift, code_doppler_hz))
+
     def set_spacing_chips(self, d, code_doppler_hz=0.0):
-        self.csr.write(self.p + "spacing", self.spacing_word(d, code_doppler_hz))
+        """Symmetric E/L convenience: place Early/Late `d` chips either side.
+
+        A shortcut for the common three-tap case, kept on the host where a
+        convenience belongs -- the gateware has one register per tap and no
+        notion of "the spacing".
+        """
+        word  = self.spacing_word(d, code_doppler_hz)
+        mask  = (1 << (self.fb + 1)) - 1
+        self.csr.write(self.p + "tap_offset_e", word)
+        self.csr.write(self.p + "tap_offset_l", (-word) & mask)
 
     def set_prn(self, prn):
         self.csr.write(self.p + "prn", prn)
 
-    def load_code(self, code, prn=None):
+    def load_code(self, code, prn=None, select=None):
         """Load a primary code into the channel code RAM.
 
         `code` is the chips as 0/1 (GNSSSignals' -1/+1 maps 1 -> 1, -1 -> 0), or
@@ -152,9 +226,19 @@ class GNSSChannel:
         """
         if isinstance(code, int):
             prn, code = code, ca_code_reference(code)
+        code = list(code)
+        if select is None:
+            select = [0] * len(code)
+        elif len(select) != len(code):
+            raise ValueError(
+                f"{len(select)} subcarrier-select bits for {len(code)} chips: the "
+                f"select bit is stored beside its chip, so there is exactly one "
+                f"per chip")
         self.csr.write(self.p + "code_load", 0b100)          # reset_addr -> arm
-        for chip in code:
-            self.csr.write(self.p + "code_load", 0b010 | (chip & 1))  # we | dat
+        for chip, sub in zip(code, select):
+            # bit0 = dat, bit1 = we, bit3 = subcarrier-table select.
+            self.csr.write(self.p + "code_load",
+                           0b010 | (chip & 1) | ((sub & 1) << 3))
         self.set_code_length(len(code))
         if prn is not None:
             self.set_prn(prn)
@@ -162,6 +246,60 @@ class GNSSChannel:
     def load_ca_code(self, prn):
         """Load GPS L1 C/A PRN `prn` (1023 chips)."""
         self.load_code(ca_code_reference(prn), prn=prn)
+
+    # ---- sub-chip replica shape ---------------------------------------------
+    def load_replica_shape(self, shape, num_taps=None):
+        """Write the subcarrier table and stage the replica shape.
+
+        `shape` is a `gnss_m2sdr.subcarrier.ReplicaShape` (or a GNSSSignals
+        signal name, e.g. "GalileoE1B"). The table write raises the channel's
+        `loading` bit, so the next `restart()` is what commits the shape *and*
+        lets records flow again -- an amplitude that changed under an
+        integration would be one record of two different replicas.
+
+        This programs the replica GNSSSignals models for that signal, at the
+        amplitudes its own table uses, so the host's default
+        `replica_code_amplitude` is already right. It never substitutes a
+        sign-only stand-in for CBOC: ask for "GalileoE1B_BOC11" if that is what
+        you want, and tell the receiver so, because it is a different signal
+        with ~0.45 dB less correlation.
+        """
+        if isinstance(shape, str):
+            shape = signal_replica_shape(shape)
+        for sel, lut in ((0, shape.lut_a), (1, shape.lut_b)):
+            if lut is None:
+                continue
+            for adr, val in enumerate(lut):
+                self.write_subcarrier(adr, val, lut=sel)
+        if num_taps is None:
+            num_taps = TAPS_EPL if shape.kind == "LOC" else TAPS_VEPL
+        self.set_replica(subchips=shape.subchips, num_taps=num_taps)
+        return shape
+
+    def write_subcarrier(self, adr, value, lut=0):
+        """One entry of the subcarrier table (signed amplitude)."""
+        bits = self.replica_bits()
+        if not -(1 << (bits - 1)) <= value < (1 << (bits - 1)):
+            raise ValueError(
+                f"subcarrier amplitude {value} does not fit the gateware's "
+                f"{bits}-bit signed table entry")
+        dat = value & ((1 << bits) - 1)
+        self.csr.write(self.p + "subcarrier_load",
+                       dat | (adr << bits) | (lut << (bits + self._sub_adr_bits()))
+                       | (1 << (bits + self._sub_adr_bits() + 1)))
+
+    def set_replica(self, subchips=1, num_taps=TAPS_EPL):
+        """Stage the replica shape; the next restart commits it."""
+        if num_taps not in (TAPS_EPL, TAPS_VEPL):
+            raise ValueError(f"num_taps must be 3 or 5, got {num_taps}")
+        if num_taps == TAPS_VEPL and not self._has_five_taps():
+            raise ValueError(
+                "this gateware build produces three taps; a five-tap layout "
+                "cannot be configured on it (rebuild with --taps 5)")
+        word = int(subchips)
+        if self._has_five_taps() and num_taps == TAPS_VEPL:
+            word |= 1 << self._subchips_bits()
+        self.csr.write(self.p + "replica", word)
 
     def restart(self):
         # Edge-triggered: 0 -> 1 pulses restart + carrier_set (both bits).
@@ -226,15 +364,34 @@ class GNSSChannel:
         return self.csr.read(self.p + "applied_at")
 
     def configure(self, prn, carrier_hz, code_doppler_hz=0.0, spacing=0.5,
-                  code=None):
-        """Arm this channel: load the code, set the NCOs, then restart.
+                  code=None, select=None, shape=None, tap_sample_shifts=None):
+        """Arm this channel: load the replica, set the NCOs, then restart.
 
         `restart()` last is not cosmetic -- it is the commit. The code load, the
-        staged `code_length` and the code phase all land on it together, and the
-        channel emits no records until it happens.
+        subcarrier table, the staged `code_length`, the replica shape and the
+        code phase all land on it together, and the channel emits no records
+        until it happens.
+
+        `shape` is a `gnss_m2sdr.subcarrier.ReplicaShape` (or a GNSSSignals
+        signal name) for a BOC-family channel; leaving it out is plain BPSK, as
+        before. `tap_sample_shifts` is GNSSReceiver's array -- whole input
+        samples, latest first, prompt at zero -- and takes precedence over the
+        symmetric `spacing` shortcut.
         """
-        self.load_code(prn if code is None else code, prn=prn)
-        self.set_spacing_chips(spacing, code_doppler_hz)
+        if isinstance(shape, str):
+            shape = signal_replica_shape(shape)
+        if shape is not None and select is None:
+            select = shape.select
+        self.load_code(prn if code is None else code, prn=prn, select=select)
+        if shape is not None:
+            self.load_replica_shape(
+                shape,
+                num_taps=(len(tap_sample_shifts) if tap_sample_shifts
+                          else (TAPS_EPL if shape.kind == "LOC" else TAPS_VEPL)))
+        if tap_sample_shifts:
+            self.set_tap_offsets(tap_sample_shifts, code_doppler_hz)
+        else:
+            self.set_spacing_chips(spacing, code_doppler_hz)
         self.set_carrier_hz(carrier_hz)
         self.set_code_doppler(code_doppler_hz)
         self.restart()
@@ -259,12 +416,21 @@ class GNSSChannel:
         # One E/P/L set per antenna; the replicas are shared, so there is a
         # single integrated_samples / sample_index / code_phase for all of them.
         # Antenna 0 is also spliced in flat, exactly as in the DMA record.
+        # Taps the latched dump actually reports; the VE/VL registers of a
+        # three-tap dump hold whatever the accumulators happened to contain, so
+        # they are left out rather than reported as correlator values.
+        ntaps = (r(self.p + "dump_num_taps")
+                 if f"{self.p}dump_num_taps" in self.csr.regs else TAPS_EPL)
         ants = []
         for a in range(self.num_ants()):
             s = "" if a == 0 else f"_ant{a}"
-            ants.append(dict(ip=rs("ip" + s), qp=rs("qp" + s),
-                             ie=rs("ie" + s), qe=rs("qe" + s),
-                             il=rs("il" + s), ql=rs("ql" + s)))
+            block = dict(ip=rs("ip" + s), qp=rs("qp" + s),
+                         ie=rs("ie" + s), qe=rs("qe" + s),
+                         il=rs("il" + s), ql=rs("ql" + s))
+            if ntaps >= TAPS_VEPL:
+                block.update(ive=rs("ive" + s), qve=rs("qve" + s),
+                             ivl=rs("ivl" + s), qvl=rs("qvl" + s))
+            ants.append(block)
         return dict(
             count = r(self.p + "dump_count"),
             ants = ants,
@@ -272,6 +438,7 @@ class GNSSChannel:
             sample_index = r(self.p + "sample_index"),
             code_phase   = r(self.p + "dump_code_phase"),
             code_chip    = r(self.p + "dump_code_chip"),
+            num_taps     = ntaps,
             **ants[0],
         )
 
@@ -366,6 +533,22 @@ class AcquisitionResult(NamedTuple):
 class GNSSBank:
     def __init__(self, csr):
         self.csr = csr
+
+    def channel(self, index, fs, **kwargs):
+        """A `GNSSChannel` already told what this build can do.
+
+        The tap count, sub-chip depth and table width come off the capability
+        CSRs rather than from defaults, so the channel refuses a five-tap layout
+        on a three-tap build (and sizes the subcarrier write port correctly)
+        instead of writing a register that is not there.
+        """
+        caps = self.capabilities()
+        kwargs.setdefault("carrier_phase_bits", caps["carrier_phase_bits"])
+        kwargs.setdefault("code_frac_bits", caps["code_frac_bits"])
+        kwargs.setdefault("num_taps", caps["num_taps"])
+        kwargs.setdefault("max_subchips", max(1, caps["max_subchips"]))
+        kwargs.setdefault("replica_bits", max(2, caps["replica_bits"]))
+        return GNSSChannel(self.csr, fs, index=index, **kwargs)
 
     def enable(self, on=True):
         self.csr.write("gnss_control", 1 if on else 0)
@@ -485,6 +668,10 @@ class GNSSBank:
             modulations        = field(sig, 0, 8),
             max_secondary_code_length = field(sig, 8, 8),
             reports_code_phase = bool(field(sig, 16, 1)),
+            tap_layouts        = [n for i, n in enumerate((TAPS_EPL, TAPS_VEPL))
+                                  if field(sig, 17, 4) & (1 << i)],
+            max_subchips       = field(sig, 21, 8),
+            replica_bits       = field(sig, 29, 8),
             max_tap_offset_chips = MAX_TAP_OFFSET_CHIPS,
         )
         if fs is not None:

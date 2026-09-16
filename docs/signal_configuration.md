@@ -20,13 +20,18 @@ the host-side contract it serves is GNSSReceiver's
 | Chipping rate | `gnss_chN_code_freq` (+ `code_freq_next`) | immediately, or at `apply_at` |
 | Carrier frequency / phase | `gnss_chN_carrier_freq` / `carrier_phase` | immediately, or at `apply_at` |
 | Code phase | `gnss_chN_code_phase` | loaded by `restart` |
-| E/L spacing | `gnss_chN_spacing` | immediately |
+| Tap offsets (VE/E/L/VL) | `gnss_chN_tap_offset_*` | immediately |
+| Sub-chip modulation | `gnss_chN_subcarrier_load` + `replica.subchips` | staged, committed by `restart` |
+| Reported tap layout (3 or 5) | `gnss_chN_replica.taps` | staged, committed by `restart` |
 | **Longest code a channel can hold** | code-RAM depth | **rebuild** (`--max-code-length`) |
-| **Correlator taps** | 3 (E/P/L) | rebuild (5 taps is gnss-m2sdr#30) |
+| **Widest correlator layout** | 3 or 5 taps | rebuild (`--taps`) |
+| **Sub-chip table depth** | `max_subchips` | rebuild (`--max-subchips`) |
 | **Antennas, channels, accumulator width** | build parameters | rebuild |
 
 Everything in the first block is per channel, so one bank can track GPS L1 C/A
-on one channel and Galileo E1 on the next. Everything in bold is reported
+on one channel and Galileo E1 on the next — on three taps and five taps
+respectively, in the same record stream (see
+[sub-chip modulation](subchip_modulation.md)). Everything in bold is reported
 through `gnss_capabilities`, because a host that assumes it is a host that arms
 a channel the gateware cannot serve.
 
@@ -44,18 +49,23 @@ BPSK primary codes, and what each costs:
 | 5115 | `GalileoE6B`, `GalileoE6C` | 15 345 | 61 380 |
 | 10230 | `GPSL5I/Q`, `GalileoE5*`, `BeiDouB2a*`, `GPSL2CM` | 30 690 | 122 760 |
 
-"Code bits per channel" is exact: the E, P and L taps each own a copy of the
-code, so it is `3 × max_code_length`. The copies are what let all three taps
-read a different chip in the same cycle from a plain one-write/one-async-read
-RAM.
+"Code bits per channel" is exact for a `--max-subchips 1` build: there are three
+copies of the code RAM, so it is `3 × max_code_length` bits. The copies are one
+per *address* (`idx − 1`, `idx`, `idx + 1`), which is what lets every tap read a
+different chip in the same cycle from a plain one-write/one-async-read RAM —
+and, because no tap offset reaches further than a chip, it is three copies
+whether the bank has three taps or five. A build with a subcarrier makes each
+word two bits wide (the chip plus the TMBOC table-select bit), so the table
+above doubles; see [sub-chip modulation](subchip_modulation.md) §6.
 
 **The read is asynchronous, so this is LUTRAM, not block RAM.** Block RAM on
 7-series reads synchronously; using it would need a pipeline stage between the
 chip-index arithmetic and the tap mux that the channel does not have today. At
-10230 chips a 4-channel bank is therefore ≈123 kbit of distributed RAM — a real
-but not alarming fraction of an XC7A200T's SLICEM capacity, and the first thing
-to revisit if the channel count grows. A 5-tap bank (gnss-m2sdr#30) multiplies
-the same number by 5/3 unless the taps move to a shared sliding window.
+10230 chips a 4-channel bank is therefore ≈123 kbit of distributed RAM without a
+subcarrier and ≈246 kbit with one — a real but not alarming fraction of an
+XC7A200T's SLICEM capacity, and the first thing to revisit if the channel count
+grows. A five-tap bank costs neither more nor less: the taps share a
+three-address window rather than owning a copy each.
 
 Synthesis and timing numbers are deliberately **not** quoted here: this
 repository's CI is board-free and has no Vivado, so any figure would be an
@@ -65,8 +75,9 @@ estimate dressed as a measurement. Reproduce them with
 python build.py --channels 4 --max-code-length 10230 --build
 ```
 
-and record the utilisation report against the build name, which now carries the
-code length (`gnss_m2sdr_m2_x1_ch4_ant1_code10230`).
+and record the utilisation report against the build name, which carries the code
+length, the tap count and the sub-chip depth
+(`gnss_m2sdr_m2_x1_ch4_ant1_code10230_tap5_sub12`).
 
 A shorter build is not a lesser one: `--max-code-length 1023` is the right
 choice for an L1 C/A-only deployment, and the capability CSR then says 1023, so
@@ -109,16 +120,19 @@ A channel is re-assigned by writing a new code into its RAM. That takes
 thousands of CSR writes, during which the replica is part one satellite and part
 another. So:
 
-1. `code_load.reset_addr` opens the window and sets
-   `code_status.loading`. **From this point the channel emits no records.**
-2. The host streams the chips, and stages `code_length` and `code_phase`.
+1. `code_load.reset_addr` — or any `subcarrier_load` write — opens the window
+   and sets `code_status.loading`. **From this point the channel emits no
+   records.**
+2. The host streams the chips, writes the subcarrier table, and stages
+   `code_length`, `code_phase` and `replica`.
 3. `restart` — immediate, or scheduled on a sample through `apply_at` — closes
-   the window, commits `code_length`, loads the code phase, clears the
-   accumulators and the sticky health bits, and lets records flow again.
+   the window, commits `code_length` and the replica shape, loads the code
+   phase, clears the accumulators and the sticky health bits, and lets records
+   flow again.
 
-The result is that no record ever describes a half-written code or a code read
-at the wrong length, and the first record after the restart is the new
-satellite's. `code_length_active` reads back what is actually in force, so the
+The result is that no record ever describes a half-written code, a code read at
+the wrong length, or a replica whose shape changed under the integration, and
+the first record after the restart is the new satellite's. `code_length_active` reads back what is actually in force, so the
 host can confirm the commit landed without waiting for a dump.
 
 The wrap comparison is `chip_index >= code_length - 1` rather than `==` as a
@@ -134,7 +148,7 @@ step added, all in words version 1 left reserved:
 | Field | Word | Meaning |
 |---|---|---|
 | `version` | 9 [15:8] | `RECORD_FORMAT_VERSION`, currently 2 |
-| `num_taps` | 9 [23:16] | Leading correlator taps in this record (3) |
+| `num_taps` | 9 [23:16] | Correlator taps in this record (3, or 5 with words 12–15) |
 | `code_phase_chip` | 10 [31:0] | Integer chip index on the last integrated sample |
 | `code_length` | 10 [63:32] | Primary-code chips the channel was configured for |
 | `code_step` | 11 [31:0] | Code NCO step the integration ran at |
@@ -148,10 +162,11 @@ once dumps get shorter than a primary period
 version-1 record rather than reporting a confident chip 0.
 
 `num_taps` is there because GNSSReceiver's contract requires it per record: one
-stream can carry both a 3-tap and a 5-tap layout, and a record whose tap count is
-not the tracked correlator's is dropped rather than reshaped. This gateware
-always says 3; gnss-m2sdr#30 will say 5 on the same wire without another version
-bump.
+stream carries both a 3-tap and a 5-tap layout, and a record whose tap count is
+not the tracked correlator's is dropped rather than reshaped. It is now set per
+*channel*, and a five-tap record fills the four tail words version 2 reserved —
+on the same wire, with no version bump, exactly as this field was allocated for.
+See [sub-chip modulation](subchip_modulation.md) §3.
 
 **The magic does not change.** `RECORD_MAGIC` is the framing anchor
 (`find_record_offset`): a host that cannot frame the stream cannot read the
@@ -167,7 +182,7 @@ Three read-only CSRs, all build-time constants:
 
 | Field | Bits | Value |
 |---|---|---|
-| `csr` | [7:0] | `CSR_LAYOUT_VERSION` (2) |
+| `csr` | [7:0] | `CSR_LAYOUT_VERSION` (3) |
 | `record` | [15:8] | `RECORD_FORMAT_VERSION` (2) |
 
 `gnss_capabilities`
@@ -176,7 +191,7 @@ Three read-only CSRs, all build-time constants:
 |---|---|---|
 | `n_channels` | [7:0] | Tracking channels in the bank |
 | `num_ants_max` | [15:8] | Antenna blocks a dump can carry |
-| `num_taps` | [23:16] | Correlator taps per record |
+| `num_taps` | [23:16] | Widest correlator layout this build produces |
 | `code_frac_bits` | [31:24] | Fixed-point scale of `code_freq` / `code_phase.frac` |
 | `carrier_phase_bits` | [39:32] | Fixed-point scale of `carrier_freq` / `carrier_phase` |
 | `accum_bits` | [47:40] | Accumulator width (sums saturate here) |
@@ -186,9 +201,12 @@ Three read-only CSRs, all build-time constants:
 
 | Field | Bits | Meaning |
 |---|---|---|
-| `modulations` | [7:0] | Bit 0 = `:LOC` (plain ±1 BPSK). BOC/CBOC/TMBOC bits are allocated and read **0** |
+| `modulations` | [7:0] | bit0 `:LOC`, bit1 `:BOCcos`, bit2 `:CBOC`, bit3 `:TMBOC`, bit4 `:BOCsin` — derived from `max_subchips` |
 | `max_secondary_code_length` | [15:8] | 1 = primary code only |
 | `reports_code_phase` | [16] | 1 = records carry a complete code phase |
+| `tap_layouts` | [20:17] | bit *i* ⇒ 2*i*+3 taps (bit0 = 3, bit1 = 5) |
+| `max_subchips` | [28:21] | Sub-chip table depth (1 = no subcarrier) |
+| `replica_bits` | [36:29] | Signed width of a subcarrier table entry |
 
 `GNSSBank.capabilities(fs)` reads all three and returns them as a dict, with
 `code_frequency_limits` derived from `code_frac_bits` and `fs` and
@@ -197,8 +215,10 @@ the gateware's layout revision is newer than the driver's — an unknown layout
 read as if it were this one is an over-declared capability, which GNSSReceiver's
 contract calls out as the failure mode that is hardest to attribute.
 
-The modulation bits stay clear until the replicas exist. Declaring `:CBOC`
-because the field has a bit for it would arm Galileo E1 channels that never lock.
+The modulation bits are derived from `max_subchips`, never from what the field
+has a bit for: a `--max-subchips 1` build declares `:LOC` alone, as it always
+did. See [sub-chip modulation](subchip_modulation.md) §5 for why `:BOCsin` took
+a new bit instead of the one version 2 reserved for `:BOCcos`.
 
 ## 7. Audit at higher rates
 
@@ -221,8 +241,11 @@ and even that is under half a megabyte per second per channel. The serializer
 needs 16 `sys_clk` cycles per record, so the round-robin is nowhere near
 saturated either.
 
-**Accumulator width.** The worst case is `N × |sample|max × 127`; with 16-bit
-samples and `accum_bits = 32` that rails at N ≈ 515 samples. That bound is
+**Accumulator width.** The worst case is
+`N × |sample|max × 127 × max|replica|`; with 16-bit samples, a ±1 replica and
+`accum_bits = 32` that rails at N ≈ 515 samples (an amplitude-bearing CBOC
+replica moves it in by its peak — see
+[sub-chip modulation](subchip_modulation.md) §6). That bound is
 pathological (full-scale input, perfectly correlated with the replica); a normal
 integration is noise-dominated and grows as `√N`, so at fs = 30.72 MHz and a 1 ms
 period (N = 30720) a well-set AGC leaves more than two orders of magnitude of
@@ -246,9 +269,9 @@ still needs an epoch clock).
 
 ## 8. Not covered here
 
-Secondary-code wipe-off (GNSSReceiver.jl#132), BOC/TMBOC/CBOC replicas and
-five-tap correlation (gnss-m2sdr#30), primary codes longer than the code RAM and
-dumps shorter than a primary period (GNSSReceiver.jl#133), and multi-band routing
-(GNSSReceiver.jl#134). Until they land, the capability CSRs declare
-conservatively — an under-declared capability is refused, an over-declared one is
-a channel that arms and never locks.
+Secondary-code wipe-off (GNSSReceiver.jl#132), primary codes longer than the code
+RAM and dumps shorter than a primary period (GNSSReceiver.jl#133), and multi-band
+routing (GNSSReceiver.jl#134). BOC/TMBOC/CBOC replicas and five-tap correlation
+have their own page: [sub-chip modulation](subchip_modulation.md). Until the rest
+land, the capability CSRs declare conservatively — an under-declared capability is
+refused, an over-declared one is a channel that arms and never locks.

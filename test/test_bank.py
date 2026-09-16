@@ -42,7 +42,8 @@ class TestBank(unittest.TestCase):
                 yield chan._carrier_freq.storage.eq(carrier_fw)
                 yield chan._carrier_phase.storage.eq(0)
                 yield chan._code_freq.storage.eq(code_step)
-                yield chan._spacing.storage.eq(spacing)
+                yield chan._tap_offset_e.storage.eq(spacing)
+                yield chan._tap_offset_l.storage.eq(-spacing & ((1 << (FRAC + 1)) - 1))
             yield dut._control.storage.eq(1)      # enable bank
             yield dut.source.ready.eq(1)
             yield

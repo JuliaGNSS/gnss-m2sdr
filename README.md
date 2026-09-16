@@ -34,13 +34,14 @@ handover and downstream vector tracking.
 > `gnss_m2sdr/record_format.py`). Swapping E and L inverts the sign of the DLL
 > discriminator and the loop never converges.
 
-> **E/L spacing.** Tracking.jl quantises the preferred Early/Late chip shift to a
-> whole number of input samples (`get_correlator_sample_shifts`) and `dll_disc`
-> normalises with that quantised spacing. The host therefore programs the spacing
-> CSR as `sample_shift * code_step`, not as the raw preferred chip shift
-> (`GNSSChannel.spacing_word`) — at fs = 4 MHz and 0.5 chips the raw value is a
-> ~2.3 % DLL loop-gain error. The Julia glue must quantise the same way and hand
-> the correlator the same integer sample shift it programmed.
+> **Tap offsets.** Tracking.jl quantises its preferred code shifts to whole
+> numbers of input samples (`get_correlator_sample_shifts`) and its
+> discriminators recover the spacing from the correlator they are handed. The
+> host therefore programs each tap as `sample_shift * code_step`, not as the raw
+> preferred chip shift (`GNSSChannel.set_tap_offsets`) — at fs = 4 MHz and 0.5
+> chips the raw value is a ~2.3 % DLL loop-gain error. There is one register per
+> tap and no "spacing": a five-tap layout is not describable by one number, which
+> is why the contract hands over the whole `tap_sample_shifts` array.
 
 > **Antennas.** Beamforming in GNSSReceiver.jl is *post-correlation* on the CPU
 > (`EigenBeamformer`, adapting from the per-antenna prompt covariance), so the
@@ -75,14 +76,15 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
       and GNSSSignals.jl `gen_code` (all 32 PRNs, exact).
 - [x] Carrier NCO + sin/cos LUT (SinCosLUT.jl amplitude convention) — matches ideal
       within quantization; frequency and phase-set verified.
-- [x] Code NCO + E/P/L replica with **runtime-configurable spacing** — prompt
-      reproduces the code, epoch period exact, E leads / L trails by the spacing.
-- [x] E/P/L correlators + integrate-and-dump (`TrackingChannel`).
+- [x] Code NCO + multi-tap replica with **independently placed taps** — prompt
+      reproduces the code, epoch period exact, each tap lands exactly on the
+      whole-sample offset it was programmed with.
+- [x] Correlators + integrate-and-dump (`TrackingChannel`), 3 or 5 taps.
 - [x] Full single-channel Migen simulation: locks on a synthetic L1 C/A signal
       (prompt peaks, E/L balanced, DLL discriminator sign correct, wrong-PRN rejects).
 - [x] Correlator-dump record builder + FIFO + DMA1 (record.py, record_format.py)
-- [x] Multi-channel bank + CSR control (bank.py: carrier/code freq words, spacing,
-      runtime PRN code load, per-channel dump readback)
+- [x] Multi-channel bank + CSR control (bank.py: carrier/code freq words, per-tap
+      offsets, runtime PRN code load, per-channel dump readback)
 - [x] Deterministic apply point: NCO updates and acquisition handover (carrier
       freq/phase + code freq/phase) commit atomically on a host-chosen sample
       index (`apply_at`), giving `NCOUpdate.apply_at_epoch` a hardware meaning
@@ -102,8 +104,18 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
       format version and a tap count; `gnss_version` / `gnss_capabilities` /
       `gnss_signal_caps` let the host discover the build instead of assuming it.
 - [x] **Multi-antenna (N≤2, the AD9361's 2T2R limit)**: `num_ants` per channel —
-      one carrier/code NCO and one E/P/L replica set shared, `num_ants × 6`
-      accumulators, one E/P/L block per antenna in the record (`--num-ants 2`).
+      one carrier/code NCO and one replica set shared, `num_ants × 2 × num_taps`
+      accumulators, one block per antenna in the record (`--num-ants 2`).
+- [x] **Sub-chip modulation and five-tap correlation**
+      (`docs/subchip_modulation.md`): per-channel BOC(1,1) (sine and cosine),
+      Galileo E1 CBOC — amplitude-bearing, at GNSSSignals' own (19, 6) integer
+      table, so `replica_code_amplitude` needs no override — and GPS L1C TMBOC,
+      all checked sample for sample against a GNSSSignals.jl golden reference.
+      Very Early / Very Late taps at independent whole-sample offsets, reported
+      in the four record words version 2 reserved, with `num_taps` **per
+      channel** so one bank runs GPS L1 C/A on three taps next to Galileo E1 on
+      five. `GalileoE1B_BOC11` and friends stay separate signals, never a silent
+      substitution for CBOC.
 - [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS
       satellite (PRN 24, peak/median >> 100) from the antenna.**
 

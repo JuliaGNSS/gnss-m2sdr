@@ -20,7 +20,10 @@ One record = 16 x 64-bit words = 128 bytes, little-endian on the wire:
   word  9 : reserved [63:24] | num_taps [23:16] | version [15:8] | num_ants [7:0]
   word 10 : code_length [63:32] | code_phase_chip [31:0]
   word 11 : reserved [63:32] | code_step [31:0]
-  words 12-15 : reserved (zero)
+  word 12 : antenna 0  q_very_early [63:32] | i_very_early [31:0]  (5-tap only)
+  word 13 : antenna 0  q_very_late  [63:32] | i_very_late  [31:0]  (5-tap only)
+  word 14 : antenna 1  q_very_early [63:32] | i_very_early [31:0]  (5-tap only)
+  word 15 : antenna 1  q_very_late  [63:32] | i_very_late  [31:0]  (5-tap only)
 
 `seq` is a per-channel record counter (wraps at 256) for host-side loss
 detection; `flags` bit 0 = overflow (a dump was dropped before this one).
@@ -56,10 +59,25 @@ A channel's primary code length and code rate are runtime-programmable
     integrated at, which is what the host needs to propagate `code_phase_chips`
     to another sample index after a scheduled rate change.
 
-`num_taps` is how many leading correlator taps this record carries, as
-GNSSReceiver's hardware contract requires: 3 (late, prompt, early) for this
-gateware, with the field present so a five-tap build (gnss-m2sdr#30) can say 5
-on the same wire without another version bump.
+Taps
+----
+`num_taps` is how many correlator taps this record carries, as GNSSReceiver's
+hardware contract requires it per record: 3 (late, prompt, early) or 5 (very
+late, late, prompt, early, very early). It is **per channel, not per build** --
+one bank can run GPS L1 C/A on three taps and Galileo E1 on five at the same
+time, and the field is what tells the two apart in one stream.
+
+  * `num_taps == 3` -- words 2..4 (and 6..8) carry prompt/early/late as they
+    always have, and words 12..15 read zero.
+  * `num_taps == 5` -- the same words carry the same three taps, and words
+    12..15 add very-early and very-late for antenna 0 and antenna 1.
+
+The version is **not** bumped for this. Word 9's `num_taps` was allocated in
+version 2 for exactly this purpose, and a version-2 host already has to check it:
+the contract drops a record whose tap count is not the tracked correlator's
+rather than reshaping it, so a three-tap host never reads words 12..15 and a
+three-tap record still reads zero there. The magic, the stride and every
+existing field stay put.
 
 Antennas
 --------
@@ -105,6 +123,14 @@ i.e. word 4, then word 2, then word 3 -- the reverse of the wire order. Passing
 `SVector(early, prompt, late)` swaps E and L, which inverts the sign of the DLL
 discriminator `(2-d)/2 * (E-L)/(E+L)` and drives the code phase away from lock;
 the symptom is "tracking never converges" rather than an obvious error.
+
+A five-tap record is the same rule with two more slots:
+
+    SVector(very_late, late, prompt, early, very_early)
+
+i.e. word 13, word 4, word 2, word 3, word 12 for antenna 0. `tap_accumulators()`
+below returns exactly that order for a record of either width, so a host does not
+have to rebuild the mapping (and cannot rebuild it early-first by accident).
 
 `code_phase` (low half of word 5, with its integer chip index in word 10) is
 **not** part of that contract -- it is additional
@@ -198,26 +224,118 @@ RECORD_FORMAT_VERSION = 2
 
 # CSR-layout revision reported by the gnss_version CSR. Bumped together with
 # any change to the register set the host driver addresses by name.
-CSR_LAYOUT_VERSION = 2
+#   1 : GPS L1 C/A bring-up register set.
+#   2 : + code_length / code_load / capability + signal-capability registers.
+#   3 : + per-tap offsets (replacing the single symmetric `spacing`), the
+#       per-channel replica shape (`replica`) and the subcarrier table write
+#       port. A driver written for v2 must refuse v3 rather than address the
+#       old names: `spacing` is gone, and a channel left at its reset offsets
+#       would correlate at 0.5 chips whatever the host meant to program.
+CSR_LAYOUT_VERSION = 3
 
-# Correlator taps this gateware produces per record, latest first on the host
-# (late, prompt, early). GNSSReceiver's hardware contract wants it per record so
-# one stream can carry several layouts; a five-tap build (gnss-m2sdr#30) reports
-# 5 in the same field.
-NUM_TAPS = 3
+# Correlator tap layouts. GNSSReceiver's hardware contract wants the count per
+# record, so one stream can carry both: a GPS L1 C/A channel dumps 3 (late,
+# prompt, early) next to a Galileo E1 channel dumping 5 (very late, late,
+# prompt, early, very early). `NUM_TAPS` is the layout a channel resets to, not
+# a property of the build -- see `tap_layouts_mask` for what a build can do.
+TAPS_EPL  = 3
+TAPS_VEPL = 5
+TAP_LAYOUTS = (TAPS_EPL, TAPS_VEPL)
+NUM_TAPS = TAPS_EPL
+
+# Tap names, earliest replica first -- the order the gateware's accumulators and
+# the per-tap CSRs are in. The wire and the host both want them latest first;
+# `tap_accumulators()` does that reversal once, here, rather than in every
+# caller.
+TAP_NAMES = ("very_early", "early", "prompt", "late", "very_late")
+TAP_SHORT = ("ve",         "e",     "p",      "l",    "vl")
+# Which of those a layout has: 3 taps is the middle three, 5 taps is all of them.
+_TAP_SLICE = {TAPS_EPL: slice(1, 4), TAPS_VEPL: slice(0, 5)}
+
+
+def tap_names(num_taps=NUM_TAPS):
+    """Tap names of a layout, earliest first."""
+    try:
+        return TAP_NAMES[_TAP_SLICE[num_taps]]
+    except KeyError:
+        raise ValueError(
+            f"num_taps must be one of {TAP_LAYOUTS}, got {num_taps!r}") from None
+
+
+def tap_short_names(num_taps=NUM_TAPS):
+    """Gateware short tap names of a layout, earliest first."""
+    tap_names(num_taps)          # validates
+    return TAP_SHORT[_TAP_SLICE[num_taps]]
+
+
+def acc_keys(num_taps=NUM_TAPS):
+    """Host-side accumulator field names of a layout (i_early, q_early, ...)."""
+    return tuple(f"{iq}_{t}" for t in tap_names(num_taps) for iq in ("i", "q"))
+
+
+def acc_signals(num_taps=NUM_TAPS):
+    """Gateware accumulator signal names of a layout (ie, qe, ip, ...)."""
+    return tuple(f"{iq}{t}" for t in tap_short_names(num_taps) for iq in ("i", "q"))
+
+
+def tap_layouts_mask(num_taps):
+    """Capability bitmask of the layouts a build with `num_taps` taps can emit.
+
+    Bit i means 2*i + 3 taps. A five-tap build serves three-tap channels too --
+    the extra accumulators are simply not reported -- so it declares both, which
+    is what lets one bank mix GPS L1 C/A with Galileo E1.
+    """
+    tap_names(num_taps)          # validates
+    return sum(1 << i for i, n in enumerate(TAP_LAYOUTS) if n <= num_taps)
 
 # Replica modulations the gateware can synthesise, as the bitmask reported by
-# the gnss_modulations CSR. They name GNSSReceiver's
-# `HardwareCorrelatorCapabilities.modulations` symbols, so the adapter maps a
-# set bit straight onto one: bit 0 -> :LOC. The BOC/CBOC/TMBOC bits are
-# *allocated*, not implemented -- gnss-m2sdr#30 sets them when the replicas
-# exist. A capability that is only allocated must read back 0, because an
-# over-declared capability is a channel that arms and never locks.
-MOD_LOC   = 1 << 0                       # plain +/-1 BPSK code (:LOC)
-MOD_BOC11 = 1 << 1                       # reserved: :BOCcos / BOC(1,1)
-MOD_CBOC  = 1 << 2                       # reserved: :CBOC
-MOD_TMBOC = 1 << 3                       # reserved: :TMBOC
-MODULATIONS = MOD_LOC
+# the gnss_signal_caps.modulations CSR. They name GNSSReceiver's
+# `HardwareCorrelatorCapabilities.modulations` symbols -- which are
+# `nameof(typeof(get_modulation(signal)))` on the GNSSSignals type -- so the
+# adapter maps a set bit straight onto one.
+#
+# Bits 0..3 were allocated (reading 0) by record format v2. Bit 1 was reserved
+# under the name `:BOCcos`; that name is kept, and `:BOCsin` gets a *new* bit
+# rather than taking over bit 1, because every L1 BOC signal GNSSSignals exposes
+# is sine-phased (`GalileoE1B_BOC11`, `GPSL1C_D`, `BeiDouB1C_D/P` all report
+# `BOCsin(1,1)`). Redefining bit 1 would have made a host that knows the v2
+# mapping declare :BOCcos for a build that synthesises :BOCsin -- an
+# over-declared capability, which is the failure this file exists to avoid. An
+# older host simply does not see bit 4 and refuses the signal instead.
+MOD_LOC    = 1 << 0                      # plain +/-1 BPSK code (:LOC)
+MOD_BOCCOS = 1 << 1                      # :BOCcos -- cosine-phased BOC(m,1)
+MOD_CBOC   = 1 << 2                      # :CBOC   -- amplitude-bearing composite
+MOD_TMBOC  = 1 << 3                      # :TMBOC  -- time-multiplexed BOC
+MOD_BOCSIN = 1 << 4                      # :BOCsin -- sine-phased BOC(m,1)
+
+# Sub-chips per chip each modulation family needs at its lowest order, i.e. the
+# `max_subchips` a build must have before it may declare that family. The host
+# still has to check the *specific* order it wants against the reported
+# `max_subchips`: BOCsin(1,1) needs 2 sub-chips and BOCsin(6,1) needs 12, and
+# one bit cannot say both.
+MODULATION_MIN_SUBCHIPS = (
+    (MOD_LOC,     1),
+    (MOD_BOCSIN,  2),    # BOCsin(1,1)
+    (MOD_BOCCOS,  4),    # BOCcos(1,1), on the quarter-sub-chip grid
+    (MOD_CBOC,   12),    # CBOC(6,1,1/11)  -- Galileo E1B/E1C
+    (MOD_TMBOC,  12),    # TMBOC(6,1,4/33) -- GPS L1C-P
+)
+
+
+def modulations_mask(max_subchips):
+    """Modulations a build with `max_subchips` sub-chips per chip can synthesise.
+
+    Declared from what the subcarrier LUT can actually hold, never from what the
+    field has a bit for: a build with `max_subchips = 1` has no sub-chip grid at
+    all and declares :LOC alone, exactly as record format v2 did.
+    """
+    return sum(bit for bit, need in MODULATION_MIN_SUBCHIPS if max_subchips >= need)
+
+
+# The LOC-only build's mask, i.e. what record format v2's gateware declared. The
+# bank derives its own from `max_subchips`; this is here for a caller that wants
+# to name the baseline.
+MODULATIONS = modulations_mask(1)
 
 # Longest secondary (overlay) code the gateware wipes off itself. 1 means
 # "primary code only", which is what GNSSReceiver's contract asks for today
@@ -236,6 +354,11 @@ MAX_TAP_OFFSET_CHIPS = 1.0
 N_ANTS_MAX      = 2                  # AD9361 is 2T2R -> 2 coherent RX per board
 ANT_PROMPT_WORD = (2, 6)
 ANT_BLOCK_WORDS = 3
+# ... and its very-early/very-late pair, in the tail words version 2 reserved.
+# Two antennas x two extra taps is exactly the four words that were left, which
+# is why a five-tap record still fits the 128-byte stride the DMA framing needs.
+ANT_VERY_WORD   = (12, 14)
+ANT_VERY_WORDS  = 2
 
 # Word 9: num_ants [7:0] | version [15:8] | num_taps [23:16].
 NANTS_WORD      = 9
@@ -248,6 +371,8 @@ CODE_LENGTH_SHIFT = 32
 CODE_STEP_WORD  = 11
 
 assert len(ANT_PROMPT_WORD) == N_ANTS_MAX
+assert len(ANT_VERY_WORD) == N_ANTS_MAX
+assert max(ANT_VERY_WORD) + ANT_VERY_WORDS <= RECORD_WORDS, "record is full"
 assert DMA_BUFFER_SIZE % RECORD_BYTES == 0, "record must divide the DMA buffer"
 
 FLAG_OVERFLOW      = 1 << 0
@@ -257,30 +382,42 @@ FLAG_EPOCH_STROBE  = 1 << 1
 # with a real channel: the round-robin serializer only reaches n_channels.
 STROBE_CHANNEL = 0xFF
 
-ACC_KEYS = ("i_early", "q_early", "i_prompt", "q_prompt", "i_late", "q_late")
+ACC_KEYS = acc_keys(TAPS_EPL)
 # The gateware's short names for the same six accumulators, in the same order
 # (TrackingChannel.acc[n] / ChannelDumpPort.acc[n] are keyed by these).
-ACC_SIGNALS = ("ie", "qe", "ip", "qp", "il", "ql")
+ACC_SIGNALS = acc_signals(TAPS_EPL)
+# The five-tap versions, for a build that has the very-early/very-late taps.
+ACC_KEYS_VEPL    = acc_keys(TAPS_VEPL)
+ACC_SIGNALS_VEPL = acc_signals(TAPS_VEPL)
 
 
 def pack_record(sample_index, integrated_samples, channel, prn, seq, flags,
                 i_early, q_early, i_prompt, q_prompt, i_late, q_late, code_phase,
                 ants=(), num_ants=None, code_phase_chip=0, code_length=0,
-                code_step=0, num_taps=NUM_TAPS, version=RECORD_FORMAT_VERSION):
+                code_step=0, num_taps=NUM_TAPS, version=RECORD_FORMAT_VERSION,
+                i_very_early=0, q_very_early=0, i_very_late=0, q_very_late=0):
     """Build the 16 little-endian 64-bit words for one record (for tests).
 
     The flat accumulator arguments are antenna 0; `ants` holds the additional
-    antennas (dicts keyed by ACC_KEYS), so a single-antenna caller is unchanged.
+    antennas (dicts keyed by ACC_KEYS, plus the very-early/very-late keys for a
+    five-tap record), so a single-antenna caller is unchanged.
     `num_ants` defaults to how many blocks were given; pass 0 for a record that
     carries no correlator payload at all, which is what an epoch strobe is.
 
     `code_phase_chip` / `code_length` / `code_step` are the version-2 signal
     fields; leaving them at 0 and passing `version=1` produces the version-1
     layout byte for byte, which is what the compatibility tests compare against.
+
+    `num_taps` selects the tap layout: 3 leaves the very-early/very-late words
+    zero whatever was passed for them, because a three-tap record must read zero
+    there (a host that trusted a stale value would hand `dll_disc` two
+    accumulators that never saw a replica).
     """
     def u32(x): return x & 0xFFFFFFFF
     blocks = [dict(i_early=i_early, q_early=q_early, i_prompt=i_prompt,
-                   q_prompt=q_prompt, i_late=i_late, q_late=q_late)] + list(ants)
+                   q_prompt=q_prompt, i_late=i_late, q_late=q_late,
+                   i_very_early=i_very_early, q_very_early=q_very_early,
+                   i_very_late=i_very_late, q_very_late=q_very_late)] + list(ants)
     assert len(blocks) <= N_ANTS_MAX, f"at most {N_ANTS_MAX} antennas"
     if num_ants is None:
         num_ants = len(blocks)
@@ -301,6 +438,10 @@ def pack_record(sample_index, integrated_samples, channel, prn, seq, flags,
         words[base + 0] = (u32(b["q_prompt"]) << 32) | u32(b["i_prompt"])
         words[base + 1] = (u32(b["q_early"])  << 32) | u32(b["i_early"])
         words[base + 2] = (u32(b["q_late"])   << 32) | u32(b["i_late"])
+        if num_taps >= TAPS_VEPL:
+            very = ANT_VERY_WORD[n]
+            words[very + 0] = (u32(b.get("q_very_early", 0)) << 32) | u32(b.get("i_very_early", 0))
+            words[very + 1] = (u32(b.get("q_very_late", 0))  << 32) | u32(b.get("i_very_late", 0))
     return words
 
 
@@ -309,15 +450,32 @@ def _s32(x):
     return x - (1 << 32) if x & 0x80000000 else x
 
 
-def unpack_ant_block(words, n):
-    """Antenna n's six accumulators, as a dict keyed by ACC_KEYS."""
+def unpack_ant_block(words, n, num_taps=NUM_TAPS):
+    """Antenna n's accumulators, as a dict keyed by ACC_KEYS.
+
+    A five-tap record additionally carries the very-early/very-late pair from
+    the tail words. They are reported as `None` -- not 0 -- for a three-tap
+    record, because a zero accumulator is a value a correlator can legitimately
+    produce and "this record has no such tap" is not.
+    """
     base = ANT_PROMPT_WORD[n]
     wp, we, wl = words[base:base + ANT_BLOCK_WORDS]
-    return dict(
+    block = dict(
         i_prompt = _s32(wp), q_prompt = _s32(wp >> 32),
         i_early  = _s32(we), q_early  = _s32(we >> 32),
         i_late   = _s32(wl), q_late   = _s32(wl >> 32),
     )
+    if num_taps >= TAPS_VEPL:
+        very = ANT_VERY_WORD[n]
+        wve, wvl = words[very:very + ANT_VERY_WORDS]
+        block.update(
+            i_very_early = _s32(wve), q_very_early = _s32(wve >> 32),
+            i_very_late  = _s32(wvl), q_very_late  = _s32(wvl >> 32),
+        )
+    else:
+        block.update(i_very_early=None, q_very_early=None,
+                     i_very_late=None,  q_very_late=None)
+    return block
 
 
 def unpack_record(words):
@@ -335,7 +493,8 @@ def unpack_record(words):
     w9     = words[NANTS_WORD]
     w10    = words[CODE_WORD]
     num_ants = min(max(w9 & 0xFF, 1), N_ANTS_MAX)
-    ants = [unpack_ant_block(words, n) for n in range(num_ants)]
+    num_taps = (w9 >> NUM_TAPS_SHIFT) & 0xFF
+    ants = [unpack_ant_block(words, n, num_taps) for n in range(num_ants)]
     return dict(
         sample_index       = w0,
         integrated_samples = (w1 >> 32) & 0xFFFFFFFF,
@@ -349,13 +508,35 @@ def unpack_record(words):
         # Version-2 fields. A version-1 record reads 0 in all of them, which is
         # why `version` has to be checked before `code_length` is believed.
         version         = (w9 >> VERSION_SHIFT) & 0xFF,
-        num_taps        = (w9 >> NUM_TAPS_SHIFT) & 0xFF,
+        num_taps        = num_taps,
         code_phase_chip = w10 & 0xFFFFFFFF,
         code_length     = (w10 >> CODE_LENGTH_SHIFT) & 0xFFFFFFFF,
         code_step       = words[CODE_STEP_WORD] & 0xFFFFFFFF,
         ants       = ants,
         **ants[0],
     )
+
+
+def tap_accumulators(rec, antenna=0):
+    """Antenna `antenna`'s accumulators as (I, Q) pairs, **latest first**.
+
+    The order Tracking.jl's correlators want: `[late, prompt, early]` for a
+    three-tap record and `[very late, late, prompt, early, very early]` for a
+    five-tap one. Reading the wire order into `SVector(early, prompt, late)`
+    instead inverts the DLL discriminator, so this reversal is done once, here.
+
+    Raises on a record whose `num_taps` is not a layout this format defines: a
+    record that says 4 taps is a record whose words cannot be attributed, and
+    padding or truncating it hands the loop filters accumulators that never saw
+    a replica.
+    """
+    n = rec["num_taps"]
+    if n not in TAP_LAYOUTS:
+        raise ValueError(
+            f"record reports num_taps={n!r}, not one of {TAP_LAYOUTS}; its "
+            f"accumulators cannot be attributed to taps")
+    block = rec["ants"][antenna]
+    return [(block[f"i_{t}"], block[f"q_{t}"]) for t in reversed(tap_names(n))]
 
 
 def code_phase_chips(rec, frac_bits):
