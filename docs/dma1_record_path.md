@@ -40,11 +40,19 @@ The padding costs 128 kB/s per channel at 1 kHz dumps — free at these rates. I
 buys a record whose size does not depend on gateware build options: words 2–4
 and 6–8 are one E/P/L block per antenna (`num_ants` in word 9 says how many are
 valid, the rest read zero), so a single-antenna build and a two-antenna one are
-parsed identically. Words 10–15 are reserved (zero) and are where a further
-extension can go without moving any existing field; bump `RECORD_MAGIC` if a
-layout ever changes incompatibly. The epoch strobe (#7) needed no extra words:
+parsed identically. The epoch strobe (#7) needed no extra words:
 it is a normal record with `channel = 0xFF`, `flags` bit 1 set and a zero
 payload — including zero antenna blocks and a zero `num_ants`.
+
+That reserve is what the runtime signal configuration (#29) then spent, without
+moving a single existing field: word 9 gained a format `version` and a
+`num_taps`, word 10 carries the integer `code_phase_chip` and the `code_length`,
+and word 11 the `code_step`. `RECORD_MAGIC` is deliberately unchanged — it is the
+framing anchor a host needs *before* it can read anything, including the version
+byte that would explain a mismatch, so it changes only when a field moves or
+changes size. Compatible growth bumps `RECORD_FORMAT_VERSION` instead, and a
+version-1 host keeps parsing a version-2 record correctly. Words 12–15 remain
+reserved (zero) for the next one; see `docs/signal_configuration.md`.
 
 ## Latency (not fixed here — a driver/transport limit)
 

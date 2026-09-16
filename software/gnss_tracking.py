@@ -18,32 +18,91 @@ except ImportError:                      # when imported as software.gnss_tracki
 from gnss_m2sdr.gps_ca import (
     ca_code_reference, CA_CODE_LENGTH, GPS_L1_HZ, GPS_CA_CHIP_RATE,
 )
+from gnss_m2sdr.record_format import (
+    CSR_LAYOUT_VERSION, MAX_TAP_OFFSET_CHIPS, RECORD_FORMAT_VERSION,
+)
 
 
 class GNSSChannel:
-    def __init__(self, csr, fs, index=0, carrier_phase_bits=32, code_frac_bits=24):
+    """Host side of one hardware tracking channel.
+
+    The signal a channel replicates is *configuration*, not a constant of this
+    driver: `code_length` chips at `chip_rate` chips/s, whose Doppler scales
+    with the carrier at `carrier_freq`. The defaults are GPS L1 C/A, so an
+    existing caller sees no change; a Galileo E1B channel is the same class with
+    `code_length=4092`, and a GPS L5 channel with `code_length=10230,
+    chip_rate=10.23e6, carrier_freq=1176.45e6`.
+    """
+    def __init__(self, csr, fs, index=0, carrier_phase_bits=32, code_frac_bits=24,
+                 code_length=CA_CODE_LENGTH, chip_rate=GPS_CA_CHIP_RATE,
+                 carrier_freq=GPS_L1_HZ):
         self.csr = csr
         self.fs  = float(fs)
         self.i   = index
         self.pb  = carrier_phase_bits
         self.fb  = code_frac_bits
         self.p   = f"gnss_ch{index}_"
+        self.code_length  = int(code_length)
+        self.chip_rate    = float(chip_rate)
+        self.carrier_freq = float(carrier_freq)
         self._num_ants = None    # discovered from the CSR set on first use
 
     # ---- configuration -------------------------------------------------------
     def carrier_word(self, hz):
         return round(hz / self.fs * (1 << self.pb)) & ((1 << self.pb) - 1)
 
-    def code_word(self, doppler_hz=0.0):
-        # Code rate scales with carrier Doppler: fc = chip_rate*(1 + fd/L1).
-        fc = GPS_CA_CHIP_RATE * (1.0 + doppler_hz / GPS_L1_HZ)
-        return round(fc / self.fs * (1 << self.fb)) & ((1 << self.fb) - 1)
+    def code_word(self, doppler_hz=0.0, chip_rate=None):
+        """Code NCO step word for this channel's chip rate and a carrier Doppler.
+
+        The code NCO crosses at most one chip boundary per input sample, so a
+        chip rate of `fs` or more has no representation at all: the step word
+        would need bit `code_frac_bits`, and masking it off -- which is what this
+        did while the rate was a constant that could never reach it -- turns
+        10.23 Mcps at fs = 4.092 MHz into 0.5 chips/sample, a channel that
+        correlates a plausible-looking nothing. Raise instead. The gateware
+        makes the same refusal on its side (the CSR is one bit wider than the
+        fraction, and an out-of-range word sets `rate_error` and stops the
+        channel's dumps), so neither end can truncate silently.
+        """
+        rate = self.chip_rate if chip_rate is None else float(chip_rate)
+        # Code rate scales with carrier Doppler: fc = chip_rate*(1 + fd/f_carrier).
+        fc   = rate * (1.0 + doppler_hz / self.carrier_freq)
+        word = round(fc / self.fs * (1 << self.fb))
+        if not 0 < word < (1 << self.fb):
+            raise ValueError(
+                f"code rate {fc:.6g} chips/s is not representable at "
+                f"fs = {self.fs:.6g} Hz: {fc / self.fs:.6g} chips/sample, and the "
+                f"code NCO supports 2**-{self.fb} .. just under 1 chip/sample "
+                f"(i.e. 0 < f_chip < fs). Sample faster, or track a slower code.")
+        return word
 
     def set_carrier_hz(self, hz):
         self.csr.write(self.p + "carrier_freq", self.carrier_word(hz))
 
     def set_code_doppler(self, doppler_hz):
         self.csr.write(self.p + "code_freq", self.code_word(doppler_hz))
+
+    def set_code_length(self, chips=None):
+        """Stage the primary-code length; the next restart commits it.
+
+        Staged rather than applied, so the length, the code and the code phase
+        of a re-assignment all take effect on the same sample. Read
+        `code_length_active` afterwards to confirm the commit.
+        """
+        if chips is not None:
+            self.code_length = int(chips)
+        if self.code_length < 1:
+            raise ValueError(f"code length {self.code_length} must be >= 1")
+        self.csr.write(self.p + "code_length", self.code_length)
+
+    def code_length_active(self):
+        """Primary-code length actually in force (as of the last restart)."""
+        return self.csr.read(self.p + "code_length_active")
+
+    def code_status(self):
+        """(loading, rate_unsupported) of this channel's replica right now."""
+        v = self.csr.read(self.p + "code_status")
+        return bool(v & 0b01), bool(v & 0b10)
 
     def sample_shift(self, spacing_chips, code_doppler_hz=0.0):
         """Tracking.jl's E/L shift in whole input samples.
@@ -82,13 +141,27 @@ class GNSSChannel:
     def set_prn(self, prn):
         self.csr.write(self.p + "prn", prn)
 
-    def load_code(self, prn):
-        """Load PRN's 1023 chips into the channel code RAM (reset addr, then write)."""
-        code = ca_code_reference(prn)
-        self.csr.write(self.p + "code_load", 0b100)          # reset_addr
+    def load_code(self, code, prn=None):
+        """Load a primary code into the channel code RAM.
+
+        `code` is the chips as 0/1 (GNSSSignals' -1/+1 maps 1 -> 1, -1 -> 0), or
+        a PRN number, which is taken as GPS L1 C/A for backwards compatibility.
+        The load also stages `code_length` from the sequence, so the code and its
+        length can never disagree; both are committed by the next `restart()`,
+        and the channel produces no records in between (`code_status().loading`).
+        """
+        if isinstance(code, int):
+            prn, code = code, ca_code_reference(code)
+        self.csr.write(self.p + "code_load", 0b100)          # reset_addr -> arm
         for chip in code:
             self.csr.write(self.p + "code_load", 0b010 | (chip & 1))  # we | dat
-        self.set_prn(prn)
+        self.set_code_length(len(code))
+        if prn is not None:
+            self.set_prn(prn)
+
+    def load_ca_code(self, prn):
+        """Load GPS L1 C/A PRN `prn` (1023 chips)."""
+        self.load_code(ca_code_reference(prn), prn=prn)
 
     def restart(self):
         # Edge-triggered: 0 -> 1 pulses restart + carrier_set (both bits).
@@ -100,13 +173,14 @@ class GNSSChannel:
     def carrier_phase_word(self, cycles):
         return round((cycles % 1.0) * (1 << self.pb)) & ((1 << self.pb) - 1)
 
-    def code_phase_word(self, chips):
+    def code_phase_word(self, chips, code_length=None):
         """Code phase (chips, fractional) -> the chip|frac word of code_phase."""
-        phase = chips % CA_CODE_LENGTH
+        n     = self.code_length if code_length is None else int(code_length)
+        phase = chips % n
         chip  = int(phase)
         frac  = round((phase - chip) * (1 << self.fb))
         if frac == (1 << self.fb):                     # rounding carried a chip
-            chip, frac = (chip + 1) % CA_CODE_LENGTH, 0
+            chip, frac = (chip + 1) % n, 0
         return (chip << self.fb) | frac
 
     def schedule(self, sample_index, carrier_hz=None, code_doppler_hz=None,
@@ -151,8 +225,15 @@ class GNSSChannel:
         """Global sample index the last scheduled commit actually took effect for."""
         return self.csr.read(self.p + "applied_at")
 
-    def configure(self, prn, carrier_hz, code_doppler_hz=0.0, spacing=0.5):
-        self.load_code(prn)
+    def configure(self, prn, carrier_hz, code_doppler_hz=0.0, spacing=0.5,
+                  code=None):
+        """Arm this channel: load the code, set the NCOs, then restart.
+
+        `restart()` last is not cosmetic -- it is the commit. The code load, the
+        staged `code_length` and the code phase all land on it together, and the
+        channel emits no records until it happens.
+        """
+        self.load_code(prn if code is None else code, prn=prn)
         self.set_spacing_chips(spacing, code_doppler_hz)
         self.set_carrier_hz(carrier_hz)
         self.set_code_doppler(code_doppler_hz)
@@ -190,6 +271,7 @@ class GNSSChannel:
             n  = r(self.p + "integrated_samples"),
             sample_index = r(self.p + "sample_index"),
             code_phase   = r(self.p + "dump_code_phase"),
+            code_chip    = r(self.p + "dump_code_chip"),
             **ants[0],
         )
 
@@ -209,18 +291,30 @@ def prompt_power(d):
     return d["ip"] ** 2 + d["qp"] ** 2
 
 
-def peak_code_phase(dump, frac_bits, code_length=CA_CODE_LENGTH):
+def peak_code_phase(dump, frac_bits, code_length=None):
     """Code phase (chips) of the incoming signal at `dump["sample_index"]`.
 
-    A dump fires on the sample whose advance wraps the last chip, so on that
-    sample the replica sits at chip `code_length - 1` plus the fractional phase
-    reported in `dump_code_phase` -- and on the peak dump the replica is (to
-    within the correlator's resolution) aligned with the signal, so that is the
-    signal's code phase too. There is no separate code-phase readback: the phase
-    is implicit in *which* dump peaked, and `sample_index` is what pins it to
-    the bank's global sample axis.
+    The replica's own phase on the last sample of the integration, read straight
+    off the dump: `code_chip` (integer chips) plus `code_phase` (the fraction).
+    On the peak dump the replica is -- to within the correlator's resolution --
+    aligned with the signal, so that is the signal's code phase too, and
+    `sample_index` is what pins it to the bank's global sample axis.
+
+    The gateware used to report only the fraction, and the chip was *inferred*:
+    a dump fires on the wrap, so the chip "must be" `code_length - 1`, i.e. 1022.
+    That is wrong for every non-1023 code and for any dump shorter than a
+    primary period, so the chip is now reported. `code_length` is accepted only
+    for the fallback below, and is not needed otherwise.
     """
-    return (code_length - 1) + dump["code_phase"] / float(1 << frac_bits)
+    if "code_chip" in dump:
+        chip = dump["code_chip"]
+    elif code_length is not None:
+        chip = code_length - 1       # pre-v2 gateware: the old inference
+    else:
+        raise KeyError(
+            "dump carries no code_chip and no code_length was given: the integer "
+            "chip index cannot be inferred (see record_format.py)")
+    return chip + dump["code_phase"] / float(1 << frac_bits)
 
 
 class AcquisitionResult(NamedTuple):
@@ -236,6 +330,12 @@ class AcquisitionResult(NamedTuple):
                    phase without it is meaningless, since the phase advances by
                    the code rate every sample.
     detected     : metric reached the detection threshold.
+    code_length  : primary-code chips the channel was configured for, and the
+                   modulus the propagated phase wraps on.
+    chip_rate    : nominal chipping rate (Hz) and
+    carrier_freq : nominal carrier (Hz) -- together they turn the acquired
+                   Doppler into a code rate. They travel with the result because
+                   a code phase whose rate has to be guessed is not a handover.
     """
     metric:       float
     doppler_hz:   float
@@ -243,16 +343,24 @@ class AcquisitionResult(NamedTuple):
     code_phase:   Optional[float]
     sample_index: Optional[int]
     detected:     bool
+    code_length:  int   = CA_CODE_LENGTH
+    chip_rate:    float = GPS_CA_CHIP_RATE
+    carrier_freq: float = GPS_L1_HZ
 
-    def code_phase_at(self, sample_index, fs, code_length=CA_CODE_LENGTH):
+    def code_phase_at(self, sample_index, fs, code_length=None, chip_rate=None,
+                      carrier_freq=None):
         """Propagate the acquired code phase to another global sample index.
 
         The handover arithmetic: the code runs on at the acquired Doppler, so a
-        channel started at `sample_index` must begin at this phase.
+        channel started at `sample_index` must begin at this phase. The signal's
+        own length and rates are used unless overridden.
         """
-        fc = GPS_CA_CHIP_RATE * (1.0 + self.doppler_hz / GPS_L1_HZ)
+        n    = self.code_length  if code_length  is None else code_length
+        rate = self.chip_rate    if chip_rate    is None else chip_rate
+        f0   = self.carrier_freq if carrier_freq is None else carrier_freq
+        fc   = rate * (1.0 + self.doppler_hz / f0)
         return (self.code_phase
-                + (sample_index - self.sample_index) * fc / fs) % code_length
+                + (sample_index - self.sample_index) * fc / fs) % n
 
 
 class GNSSBank:
@@ -322,6 +430,71 @@ class GNSSBank:
         """Record timestamp -> Tracking.jl's 1-based per-chunk sample_index."""
         return record_sample_index - chunk_origin + 1
 
+    def rate_error(self):
+        """Sticky per-channel mask: that channel was programmed a code rate the
+        NCO cannot represent (>= 1 chip/input sample), so its dumps were
+        suppressed rather than produced at a truncated rate. Cleared by that
+        channel's restart."""
+        return self.csr.read("gnss_rate_error")
+
+    def version(self):
+        """(csr_layout, record_format) revisions this gateware implements."""
+        v = self.csr.read("gnss_version")
+        return v & 0xFF, (v >> 8) & 0xFF
+
+    def capabilities(self, fs=None):
+        """What this gateware can do, read from its own CSRs.
+
+        This is the discovery step an adapter builds GNSSReceiver's
+        `HardwareCorrelatorCapabilities` from: nothing here is a constant of the
+        driver, so a rebuilt bitstream with deeper code memory or more channels
+        is described correctly without touching the host. `fs` fills in the code
+        rate limits, which only exist relative to the sample rate.
+
+        Raises if the gateware's CSR layout is newer than this driver: an
+        unknown layout read as if it were this one is an over-declared
+        capability, i.e. a channel that arms and never locks.
+        """
+        csr_version, record_version = self.version()
+        if csr_version > CSR_LAYOUT_VERSION:
+            raise RuntimeError(
+                f"gateware CSR layout v{csr_version} is newer than this driver "
+                f"(v{CSR_LAYOUT_VERSION}); update the host rather than guessing "
+                f"the register set")
+        if record_version > RECORD_FORMAT_VERSION:
+            raise RuntimeError(
+                f"gateware streams record format v{record_version}, newer than "
+                f"this driver's v{RECORD_FORMAT_VERSION}")
+        caps = self.csr.read("gnss_capabilities")
+        sig  = self.csr.read("gnss_signal_caps")
+
+        def field(value, shift, width):
+            return (value >> shift) & ((1 << width) - 1)
+
+        code_frac_bits = field(caps, 24, 8)
+        out = dict(
+            csr_version        = csr_version,
+            record_version     = record_version,
+            n_channels         = field(caps, 0, 8),
+            num_ants_max       = field(caps, 8, 8),
+            num_taps           = field(caps, 16, 8),
+            code_frac_bits     = code_frac_bits,
+            carrier_phase_bits = field(caps, 32, 8),
+            accum_bits         = field(caps, 40, 8),
+            max_code_length    = field(caps, 48, 16),
+            modulations        = field(sig, 0, 8),
+            max_secondary_code_length = field(sig, 8, 8),
+            reports_code_phase = bool(field(sig, 16, 1)),
+            max_tap_offset_chips = MAX_TAP_OFFSET_CHIPS,
+        )
+        if fs is not None:
+            # The code NCO steps 1..2**code_frac_bits - 1 in 2**-code_frac_bits
+            # chips per input sample, so the representable chip rates are a
+            # property of fs, not of the gateware alone.
+            scale = float(fs) / (1 << code_frac_bits)
+            out["code_frequency_limits"] = (scale, scale * ((1 << code_frac_bits) - 1))
+        return out
+
 
 def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
             slide_chips=800.0, dwell=1.4, detect_metric=8.0, verbose=True):
@@ -353,9 +526,11 @@ def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
     import statistics
     chan.load_code(prn)
     chan.set_spacing_chips(0.5)
+    signal = dict(code_length=chan.code_length, chip_rate=chan.chip_rate,
+                  carrier_freq=chan.carrier_freq)
     bank.enable(True)
     off = round(slide_chips / fs * (1 << chan.fb))
-    best = AcquisitionResult(0.0, 0.0, 0.0, None, None, False)
+    best = AcquisitionResult(0.0, 0.0, 0.0, None, None, False, **signal)
     d = -doppler_range
     while d <= doppler_range:
         chan.set_carrier_hz(d)
@@ -380,6 +555,6 @@ def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
             if metric > best.metric:
                 best = AcquisitionResult(metric, d, prompt_power(peak),
                                          peak_code_phase(peak, chan.fb),
-                                         peak["sample_index"], False)
+                                         peak["sample_index"], False, **signal)
         d += doppler_step
     return best._replace(detected=best.metric >= detect_metric)

@@ -123,8 +123,10 @@ class TestEpochStrobeRecorder(unittest.TestCase):
                         i_early=0, q_early=0, i_prompt=0, q_prompt=0,
                         i_late=0, q_late=0, code_phase=0,
                         # A marker has no correlator payload at all, so it
-                        # reports zero antenna blocks (see record_format.py).
-                        num_ants=0))
+                        # reports zero antenna blocks and zero taps (see
+                        # record_format.py); only `version` describes the wire
+                        # rather than the payload, so it is carried.
+                        num_ants=0, num_taps=0))
 
     def test_period_zero_emits_nothing(self):
         dut = CorrelatorRecorder(n_channels=1)

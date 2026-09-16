@@ -19,6 +19,8 @@ path (LITEX_M2SDR_DIR) rather than imported as a package.
 import os
 import importlib.util
 
+from gnss_m2sdr.gps_ca import CA_CODE_LENGTH
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Where to look for the litex_m2sdr checkout when LITEX_M2SDR_DIR is unset.
@@ -84,12 +86,17 @@ BaseSoC = _m2sdr.BaseSoC
 
 class GNSSSoC(BaseSoC):
     def __init__(self, gnss_channels=4, gnss_prns=None, gnss_frac_bits=24,
-                 gnss_accum_bits=32, gnss_num_ants=1, **kwargs):
+                 gnss_accum_bits=32, gnss_num_ants=1,
+                 gnss_max_code_length=CA_CODE_LENGTH, **kwargs):
         self._gnss_channels  = gnss_channels
         self._gnss_prns      = gnss_prns
         self._gnss_frac_bits = gnss_frac_bits
         self._gnss_accum_bits = gnss_accum_bits
         self._gnss_num_ants  = gnss_num_ants
+        # Code-RAM depth per tap per channel: the one signal capability that
+        # cannot be changed at runtime (see docs/signal_configuration.md for the
+        # resource/channel-count table).
+        self._gnss_max_code_length = gnss_max_code_length
         kwargs.setdefault("with_pcie", True)
         kwargs["pcie_dmas"] = 2  # DMA0 = RFIC I/Q, DMA1 = correlator records
         super().__init__(**kwargs)
@@ -103,6 +110,7 @@ class GNSSSoC(BaseSoC):
             code_frac_bits = self._gnss_frac_bits,
             accum_bits     = self._gnss_accum_bits,
             num_ants       = self._gnss_num_ants,
+            max_code_length = self._gnss_max_code_length,
         )
         # Non-intrusive observer: de-interleave each accepted RX word into I/Q
         # samples. What a word's two slots carry depends on the AD9361 PHY

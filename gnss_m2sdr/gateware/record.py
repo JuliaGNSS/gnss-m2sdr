@@ -27,6 +27,14 @@ was built with, so the host does not have to know the build option to find a
 record; the words of an absent antenna read zero and the record's num_ants field
 says how many are valid.
 
+Each record also carries the signal configuration it came from -- the complete
+code phase (chip index + fraction), the primary-code length and the code NCO
+step -- plus the format version and the tap count, because a channel's code and
+rate are runtime-programmable and the host may have reprogrammed them since. A
+record that does not say which code produced it forces the host to guess from
+its own most recent write, which is wrong for exactly the records that matter:
+the ones straddling a scheduled handover.
+
 A lost dump is reported on two separate paths, because they answer different
 questions:
 
@@ -65,8 +73,9 @@ from litex.soc.interconnect import stream
 from litepcie.common import dma_layout
 
 from gnss_m2sdr.record_format import (
-    ACC_SIGNALS, ANT_PROMPT_WORD, MAGIC_SHIFT, MAGIC_WORD, NANTS_WORD,
-    N_ANTS_MAX, RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
+    ACC_SIGNALS, ANT_PROMPT_WORD, CODE_STEP_WORD, CODE_WORD, MAGIC_SHIFT,
+    MAGIC_WORD, NANTS_WORD, N_ANTS_MAX, NUM_TAPS, RECORD_FORMAT_VERSION,
+    RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
     FLAG_EPOCH_STROBE, FLAG_OVERFLOW,
 )
 
@@ -77,7 +86,8 @@ class ChannelDumpPort:
     acc[n] is antenna n's six accumulators; antenna 0's are also exposed under
     the original scalar names (ie/qe/ip/qp/il/ql).
     """
-    def __init__(self, accum_bits, code_frac_bits, num_ants=1):
+    def __init__(self, accum_bits, code_frac_bits, num_ants=1,
+                 max_code_length=None):
         self.stb                = Signal()
         self.acc = [{k: Signal((accum_bits, True)) for k in ACC_SIGNALS}
                     for _ in range(num_ants)]
@@ -86,15 +96,25 @@ class ChannelDumpPort:
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.code_phase         = Signal(code_frac_bits)
+        # The signal configuration behind the dump: integer chip index (the other
+        # half of the code phase), primary-code length and the code NCO step the
+        # integration ran at. All three are zero-extended into 32-bit wire fields.
+        len_bits = 32 if max_code_length is None else bits_for(max_code_length)
+        self.code_chip          = Signal(len_bits)
+        self.code_length        = Signal(len_bits)
+        self.code_step          = Signal(code_frac_bits + 1)
         self.prn                = Signal(8)
 
 
 class CorrelatorRecorder(LiteXModule):
     def __init__(self, n_channels, accum_bits=32, code_frac_bits=24, fifo_depth=64,
-                 drop_count_bits=16, num_ants=1):
+                 drop_count_bits=16, num_ants=1, max_code_length=None,
+                 num_taps=NUM_TAPS):
         assert code_frac_bits <= 32, "code_phase shares word 5 with the magic"
+        assert code_frac_bits + 1 <= 32, "code_step is a 32-bit record field"
         assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
-        self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits, num_ants)
+        self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits, num_ants,
+                                       max_code_length=max_code_length)
                        for _ in range(n_channels)]
         self.source = stream.Endpoint(dma_layout(64))
 
@@ -196,7 +216,9 @@ class CorrelatorRecorder(LiteXModule):
                 # cphase is held zero-extended to the 32-bit wire field so the
                 # magic can share word 5 at a fixed offset.
                 sidx=Signal(64), nsamp=Signal(32), cphase=Signal(32),
+                cchip=Signal(32), clen=Signal(32), cstep=Signal(32),
                 prn=Signal(8), seq=Signal(8), flags=Signal(8), nants=Signal(8),
+                ntaps=C(num_taps, 8), version=C(RECORD_FORMAT_VERSION, 8),
                 # One 32-bit wire field per accumulator per antenna.
                 acc=[{k: Signal(32) for k in ACC_SIGNALS} for _ in range(num_ants)],
             )
@@ -205,6 +227,9 @@ class CorrelatorRecorder(LiteXModule):
                 h["sidx"].eq(p.sample_index),
                 h["nsamp"].eq(p.integrated_samples),
                 h["cphase"].eq(p.code_phase),
+                h["cchip"].eq(p.code_chip),
+                h["clen"].eq(p.code_length),
+                h["cstep"].eq(p.code_step),
                 h["prn"].eq(p.prn),
                 h["seq"].eq(seqs[i]),
                 h["flags"].eq(Mux(flag_next[i], FLAG_OVERFLOW, 0)),
@@ -242,7 +267,12 @@ class CorrelatorRecorder(LiteXModule):
         # to 1 rather than indexing a block that carries nothing.
         sh = dict(
             sidx=Signal(64), nsamp=C(0, 32), cphase=C(0, 32), prn=C(0, 8),
-            seq=Signal(8), flags=Signal(8), nants=C(0, 8),
+            cchip=C(0, 32), clen=C(0, 32), cstep=C(0, 32),
+            seq=Signal(8), flags=Signal(8), nants=C(0, 8), ntaps=C(0, 8),
+            # `version` describes the wire, not the payload, so a marker carries
+            # it: a host that has seen nothing but strobes still knows what it is
+            # parsing.
+            version=C(RECORD_FORMAT_VERSION, 8),
             acc=[{k: C(0, 32) for k in ACC_SIGNALS} for _ in range(num_ants)],
         )
         hold.append(sh)
@@ -266,7 +296,9 @@ class CorrelatorRecorder(LiteXModule):
             words[0] = h["sidx"]
             words[1] = Cat(h["seq"], h["flags"], h["prn"], C(chan_id, 8), h["nsamp"])  # low..high
             words[MAGIC_WORD] = Cat(h["cphase"], C(RECORD_MAGIC, 64 - MAGIC_SHIFT))
-            words[NANTS_WORD] = Cat(h["nants"], C(0, 56))
+            words[NANTS_WORD] = Cat(h["nants"], h["version"], h["ntaps"], C(0, 40))
+            words[CODE_WORD]      = Cat(h["cchip"], h["clen"])
+            words[CODE_STEP_WORD] = Cat(h["cstep"], C(0, 32))
             for n, a in enumerate(h["acc"]):
                 ant_word = ANT_PROMPT_WORD[n]
                 words[ant_word + 0] = Cat(a["ip"], a["qp"])

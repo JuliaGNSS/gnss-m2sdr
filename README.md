@@ -92,6 +92,15 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
 - [x] Periodic **epoch-strobe records** (`gnss_epoch_period` CSR): a timebase marker
       on the shared sample counter, so the host closes epochs even with no channel
       locked (GNSSReceiver.jl#107).
+- [x] **Runtime signal configuration** (`docs/signal_configuration.md`): per-channel
+      primary-code length (330 … `--max-code-length`, default 1023) and chipping
+      rate, committed atomically with the code load and the code phase by the
+      arming `restart`; an unrepresentable rate (≥ 1 chip/input sample) is
+      reported (`gnss_rate_error`) and stops that channel's records instead of
+      being truncated into a plausible one. Records carry the **complete** code
+      phase (chip *and* fraction), the code length and the code step, plus a
+      format version and a tap count; `gnss_version` / `gnss_capabilities` /
+      `gnss_signal_caps` let the host discover the build instead of assuming it.
 - [x] **Multi-antenna (N≤2, the AD9361's 2T2R limit)**: `num_ants` per channel —
       one carrier/code NCO and one E/P/L replica set shared, `num_ants × 6`
       accumulators, one E/P/L block per antenna in the record (`--num-ants 2`).
@@ -114,6 +123,7 @@ export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
 
 ```
 gnss_m2sdr/gateware/   Migen/LiteX gateware (ca_code.py, ...)
+docs/                  record path, hardware bring-up, signal configuration
 test/                  Migen simulations + software-reference tests
 test/data/             committed golden vectors (e.g. GNSSSignals.jl C/A codes)
 julia/                 GNSSSignals.jl project used to regenerate golden vectors
