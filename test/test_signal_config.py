@@ -46,8 +46,9 @@ from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
 from gnss_m2sdr.gateware.channel import TrackingChannel
 from gnss_m2sdr.gateware.code_replica import CodeReplica
 from gnss_m2sdr.record_format import (
-    CSR_LAYOUT_VERSION, MAX_SECONDARY_CODE_LENGTH, MODULATIONS, MOD_LOC,
+    CSR_LAYOUT_VERSION, MAX_SECONDARY_CODE_LENGTH, MOD_LOC,
     NUM_TAPS, RECORD_FORMAT_VERSION, RECORD_WORDS, code_chip_rate,
+    modulations_mask, tap_layouts_mask,
     code_phase_chips, pack_record, unpack_record,
 )
 from software.gnss_tracking import (
@@ -180,7 +181,8 @@ def run_channel(code, samples, code_step, spacing, carrier_fw, max_code_length,
     def bench():
         yield dut.code_step.eq(code_step)
         yield dut.code_length.eq(len(code) if code_length is None else code_length)
-        yield dut.spacing.eq(spacing)
+        yield dut.tap_offset[0].eq(spacing)
+        yield dut.tap_offset[2].eq(-spacing)
         yield dut.carrier_fw.eq(carrier_fw)
         yield dut.carrier_phase_in.eq(0)
         yield dut.carrier_set.eq(1)
@@ -227,7 +229,8 @@ class TestRuntimeCodeLength(unittest.TestCase):
         def bench():
             yield dut.code_step.eq(step)
             yield dut.code_length.eq(code_length)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield dut.tap_offset[0].eq(1 << (FRAC - 1))
+            yield dut.tap_offset[2].eq(-(1 << (FRAC - 1)))
             yield dut.restart.eq(1)
             yield
             yield dut.restart.eq(0)
@@ -270,7 +273,8 @@ class TestRuntimeCodeLength(unittest.TestCase):
         def bench():
             yield dut.code_step.eq(step)
             yield dut.code_length.eq(length)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield dut.tap_offset[0].eq(1 << (FRAC - 1))
+            yield dut.tap_offset[2].eq(-(1 << (FRAC - 1)))
             yield dut.restart.eq(1)
             yield
             yield dut.restart.eq(0)
@@ -299,7 +303,8 @@ class TestRuntimeCodeLength(unittest.TestCase):
         def bench():
             yield dut.code_step.eq(step)
             yield dut.code_length.eq(length)
-            yield dut.spacing.eq(0)
+            yield dut.tap_offset[0].eq(0)
+            yield dut.tap_offset[2].eq(0)
             yield dut.restart_chip.eq(40)          # far past chip 15
             yield dut.restart.eq(1)
             yield
@@ -397,7 +402,8 @@ class TestAgainstSoftwareReference(unittest.TestCase):
         def bench():
             yield dut.code_step.eq(code_step)
             yield dut.code_length.eq(length)
-            yield dut.spacing.eq(code_step)
+            yield dut.tap_offset[0].eq(code_step)
+            yield dut.tap_offset[2].eq(-code_step)
             yield dut.carrier_fw.eq(self.DOPPLER_FW)
             yield dut.code_phase_chip.eq(chip)
             yield dut.code_phase_frac.eq(frac)
@@ -446,7 +452,8 @@ class TestAtomicArming(unittest.TestCase):
 
         def bench():
             yield dut.ch0._code_freq.storage.eq(step)
-            yield dut.ch0._spacing.storage.eq(step)
+            yield dut.ch0._tap_offset_e.storage.eq(step)
+            yield dut.ch0._tap_offset_l.storage.eq(-step & ((1 << (FRAC + 1)) - 1))
             yield dut.ch0._carrier_freq.storage.eq(0)   # cos = 127, sin = 0
             yield dut._control.storage.eq(1)            # enable bank
             yield from pulse_control(dut.ch0, CTL_RESTART | CTL_CARRIER_SET)
@@ -520,7 +527,8 @@ class TestCodeRateLimits(unittest.TestCase):
 
         def bench():
             yield dut.ch0._code_freq.storage.eq(bad)
-            yield dut.ch0._spacing.storage.eq(good)
+            yield dut.ch0._tap_offset_e.storage.eq(good)
+            yield dut.ch0._tap_offset_l.storage.eq(-good & ((1 << (FRAC + 1)) - 1))
             yield dut.ch0._carrier_freq.storage.eq(0)
             yield dut._control.storage.eq(1)
             yield from pulse_control(dut.ch0, CTL_RESTART)
@@ -643,7 +651,8 @@ class TestRecordDescribesItsSignal(unittest.TestCase):
         def bench():
             yield dut.source.ready.eq(1)
             yield dut.ch0._code_freq.storage.eq(step)
-            yield dut.ch0._spacing.storage.eq(step)
+            yield dut.ch0._tap_offset_e.storage.eq(step)
+            yield dut.ch0._tap_offset_l.storage.eq(-step & ((1 << (FRAC + 1)) - 1))
             yield dut.ch0._carrier_freq.storage.eq(0)
             yield dut._control.storage.eq(1)
             yield from csr_write(dut.ch0._code_length, length)
@@ -706,10 +715,12 @@ class TestCapabilityCSRs(unittest.TestCase):
         self.assertEqual(field(caps, 48, 16), 4092)     # max_code_length
 
         sig = got["sig"]
-        self.assertEqual(field(sig, 0, 8), MODULATIONS)
+        self.assertEqual(field(sig, 0, 8), modulations_mask(1))
         self.assertEqual(field(sig, 0, 8) & MOD_LOC, MOD_LOC)
         self.assertEqual(field(sig, 8, 8), MAX_SECONDARY_CODE_LENGTH)
         self.assertEqual(field(sig, 16, 1), 1)          # reports_code_phase
+        self.assertEqual(field(sig, 17, 4), tap_layouts_mask(NUM_TAPS))
+        self.assertEqual(field(sig, 21, 8), 1)          # max_subchips
 
     def test_the_csr_names_the_adapter_addresses_exist(self):
         # GNSSM2SDR.jl#8 addresses these by name out of csr.csv. A rename is a
@@ -723,7 +734,8 @@ class TestCapabilityCSRs(unittest.TestCase):
                      "sample_count",
                      "ch0_code_freq", "ch0_code_freq_next", "ch0_code_length",
                      "ch0_code_length_active", "ch0_code_status",
-                     "ch0_code_load", "ch0_code_phase", "ch0_spacing",
+                     "ch0_code_load", "ch0_code_phase",
+                     "ch0_tap_offset_e", "ch0_tap_offset_l", "ch0_replica",
                      "ch0_dump_code_phase", "ch0_dump_code_chip",
                      "ch1_code_length"):
             self.assertIn(name, names)
@@ -735,8 +747,9 @@ class TestCapabilityCSRs(unittest.TestCase):
 
     def test_declared_modulations_stay_honest(self):
         # An over-declared capability is a channel that arms and never locks, so
-        # the BOC/CBOC/TMBOC bits must stay clear until #30 implements them.
-        self.assertEqual(MODULATIONS, MOD_LOC)
+        # a build with no sub-chip table declares :LOC and nothing else, however
+        # many bits the field has.
+        self.assertEqual(modulations_mask(1), MOD_LOC)
 
     def test_host_reads_the_capabilities_back(self):
         csr = _NullCSR()
@@ -744,7 +757,9 @@ class TestCapabilityCSRs(unittest.TestCase):
             "gnss_version": CSR_LAYOUT_VERSION | (RECORD_FORMAT_VERSION << 8),
             "gnss_capabilities": (4 | (2 << 8) | (3 << 16) | (24 << 24)
                                   | (32 << 32) | (32 << 40) | (10230 << 48)),
-            "gnss_signal_caps": MOD_LOC | (1 << 8) | (1 << 16),
+            "gnss_signal_caps": (MOD_LOC | (1 << 8) | (1 << 16)
+                                 | (tap_layouts_mask(3) << 17) | (1 << 21)
+                                 | (2 << 29)),
         }
         caps = GNSSBank(csr).capabilities(fs=30.72e6)
         self.assertEqual(caps["n_channels"], 4)
@@ -755,6 +770,8 @@ class TestCapabilityCSRs(unittest.TestCase):
         self.assertEqual(caps["max_secondary_code_length"], 1)
         self.assertTrue(caps["reports_code_phase"])
         self.assertEqual(caps["max_tap_offset_chips"], 1.0)
+        self.assertEqual(caps["tap_layouts"], [3])
+        self.assertEqual(caps["max_subchips"], 1)
         lo, hi = caps["code_frequency_limits"]
         self.assertAlmostEqual(lo, 30.72e6 / (1 << 24))
         self.assertLess(hi, 30.72e6)

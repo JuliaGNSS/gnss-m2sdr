@@ -11,6 +11,7 @@ import argparse
 from litex.soc.integration.builder import Builder
 
 from gnss_m2sdr.gps_ca import CA_CODE_LENGTH
+from gnss_m2sdr.record_format import TAPS_EPL, TAPS_VEPL
 from gnss_m2sdr.soc import GNSSSoC
 
 
@@ -22,12 +23,24 @@ def main():
                    help="Coherent RX antennas per channel (2 needs the AD9361 in 2R2T).")
     p.add_argument("--max-code-length", default=CA_CODE_LENGTH, type=int,
                    help="Longest primary code a channel can hold, in chips. This sizes "
-                        "the code RAM (3 taps x this many bits per channel) and is the "
-                        "one signal capability a runtime write cannot change; the "
-                        "gateware reports it as max_primary_code_length. 1023 = GPS L1 "
+                        "the code RAM (3 copies x this many words per channel, "
+                        "independent of the tap count) and is the one signal "
+                        "capability a runtime write cannot change; the gateware "
+                        "reports it as max_primary_code_length. 1023 = GPS L1 "
                         "C/A only, 4092 covers Galileo E1 and GPS L1C, 10230 covers "
                         "every BPSK primary code in scope. See "
                         "docs/signal_configuration.md.")
+    p.add_argument("--taps", default=TAPS_VEPL, type=int, choices=[TAPS_EPL, TAPS_VEPL],
+                   help="Widest correlator layout the bank produces. 5 adds the "
+                        "Very Early / Very Late taps Tracking uses for the BOC-family "
+                        "signals; each channel still chooses 3 or 5 at runtime, so a "
+                        "5-tap build runs GPS L1 C/A on 3 taps at the same time.")
+    p.add_argument("--max-subchips", default=12, type=int,
+                   help="Sub-chip subcarrier table depth. 1 = plain BPSK only "
+                        "(:LOC); 2 reaches BOC(1,1); 4 reaches BOCcos(1,1); 12 "
+                        "covers CBOC(6,1) and TMBOC(6,1), i.e. every L1 modulation "
+                        "GNSSSignals exposes. The gateware declares its modulations "
+                        "from this number, so it cannot over-declare.")
     p.add_argument("--variant",  default="m2",         help="Board variant.", choices=["m2", "baseboard"])
     p.add_argument("--pcie-lanes", default=1, type=int, choices=[1, 2, 4])
     p.add_argument("--output-dir", default="build",     help="Build output directory.")
@@ -37,13 +50,16 @@ def main():
         gnss_channels = args.channels,
         gnss_num_ants = args.num_ants,
         gnss_max_code_length = args.max_code_length,
+        gnss_num_taps        = args.taps,
+        gnss_max_subchips    = args.max_subchips,
         variant       = args.variant,
         with_pcie     = True,
         pcie_lanes    = args.pcie_lanes,
     )
     build_name = (f"gnss_m2sdr_{args.variant}_x{args.pcie_lanes}"
                   f"_ch{args.channels}_ant{args.num_ants}"
-                  f"_code{args.max_code_length}")
+                  f"_code{args.max_code_length}"
+                  f"_tap{args.taps}_sub{args.max_subchips}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),
                       csr_csv=os.path.join(args.output_dir, build_name, "csr.csv"))
     builder.build(build_name=build_name, run=args.build)

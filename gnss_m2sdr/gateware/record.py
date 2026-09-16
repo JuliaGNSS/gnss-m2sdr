@@ -25,7 +25,11 @@ stream's first/last, so framing has to live in the payload.
 The per-antenna E/P/L blocks are always reserved, whatever `num_ants` the bank
 was built with, so the host does not have to know the build option to find a
 record; the words of an absent antenna read zero and the record's num_ants field
-says how many are valid.
+says how many are valid. The very-early/very-late pair lives in the four tail
+words and follows the same rule against the record's `num_taps`: a three-tap
+channel's record reads zero there, and `num_taps` -- not the build -- is what
+says which. That is what lets one stream carry a GPS L1 C/A channel on three
+taps next to a Galileo E1 channel on five.
 
 Each record also carries the signal configuration it came from -- the complete
 code phase (chip index + fraction), the primary-code length and the code NCO
@@ -73,26 +77,30 @@ from litex.soc.interconnect import stream
 from litepcie.common import dma_layout
 
 from gnss_m2sdr.record_format import (
-    ACC_SIGNALS, ANT_PROMPT_WORD, CODE_STEP_WORD, CODE_WORD, MAGIC_SHIFT,
+    ANT_PROMPT_WORD, ANT_VERY_WORD, CODE_STEP_WORD, CODE_WORD, MAGIC_SHIFT,
     MAGIC_WORD, NANTS_WORD, N_ANTS_MAX, NUM_TAPS, RECORD_FORMAT_VERSION,
-    RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL,
-    FLAG_EPOCH_STROBE, FLAG_OVERFLOW,
+    RECORD_MAGIC, RECORD_WORDS, STROBE_CHANNEL, TAPS_EPL, TAPS_VEPL,
+    FLAG_EPOCH_STROBE, FLAG_OVERFLOW, acc_signals,
 )
 
 
 class ChannelDumpPort:
     """Signals a TrackingChannel drives into the recorder (one per channel).
 
-    acc[n] is antenna n's six accumulators; antenna 0's are also exposed under
-    the original scalar names (ie/qe/ip/qp/il/ql).
+    acc[n] is antenna n's accumulators (two per tap); antenna 0's are also
+    exposed under the original scalar names (ie/qe/ip/qp/il/ql, plus
+    ive/qve/ivl/qvl on a five-tap build).
     """
     def __init__(self, accum_bits, code_frac_bits, num_ants=1,
-                 max_code_length=None):
+                 max_code_length=None, num_taps=NUM_TAPS):
         self.stb                = Signal()
-        self.acc = [{k: Signal((accum_bits, True)) for k in ACC_SIGNALS}
+        self.acc_signals        = acc_signals(num_taps)
+        self.acc = [{k: Signal((accum_bits, True)) for k in self.acc_signals}
                     for _ in range(num_ants)]
         for k, sig in self.acc[0].items():
             setattr(self, k, sig)
+        # Taps this dump reports (3 or 5) -- per channel, not per build.
+        self.num_taps           = Signal(8, reset=TAPS_EPL)
         self.integrated_samples = Signal(32)
         self.sample_index       = Signal(64)
         self.code_phase         = Signal(code_frac_bits)
@@ -113,8 +121,13 @@ class CorrelatorRecorder(LiteXModule):
         assert code_frac_bits <= 32, "code_phase shares word 5 with the magic"
         assert code_frac_bits + 1 <= 32, "code_step is a 32-bit record field"
         assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
+        assert num_taps in (TAPS_EPL, TAPS_VEPL), (
+            f"num_taps must be one of {(TAPS_EPL, TAPS_VEPL)}, got {num_taps}")
+        self.num_taps = num_taps
+        acc_names   = acc_signals(num_taps)
         self.ports  = [ChannelDumpPort(accum_bits, code_frac_bits, num_ants,
-                                       max_code_length=max_code_length)
+                                       max_code_length=max_code_length,
+                                       num_taps=num_taps)
                        for _ in range(n_channels)]
         self.source = stream.Endpoint(dma_layout(64))
 
@@ -218,9 +231,9 @@ class CorrelatorRecorder(LiteXModule):
                 sidx=Signal(64), nsamp=Signal(32), cphase=Signal(32),
                 cchip=Signal(32), clen=Signal(32), cstep=Signal(32),
                 prn=Signal(8), seq=Signal(8), flags=Signal(8), nants=Signal(8),
-                ntaps=C(num_taps, 8), version=C(RECORD_FORMAT_VERSION, 8),
+                ntaps=Signal(8), version=C(RECORD_FORMAT_VERSION, 8),
                 # One 32-bit wire field per accumulator per antenna.
-                acc=[{k: Signal(32) for k in ACC_SIGNALS} for _ in range(num_ants)],
+                acc=[{k: Signal(32) for k in acc_names} for _ in range(num_ants)],
             )
             hold.append(h)
             self.sync += slot_status(i, p.stb, [
@@ -234,8 +247,9 @@ class CorrelatorRecorder(LiteXModule):
                 h["seq"].eq(seqs[i]),
                 h["flags"].eq(Mux(flag_next[i], FLAG_OVERFLOW, 0)),
                 h["nants"].eq(self.num_ants),
+                h["ntaps"].eq(p.num_taps),
                 *[h["acc"][n][k].eq(s32(p.acc[n][k]))
-                  for n in range(num_ants) for k in ACC_SIGNALS],
+                  for n in range(num_ants) for k in acc_names],
             ])
 
         # Epoch strobe: one marker every `epoch_period` *input samples*, so the
@@ -273,7 +287,7 @@ class CorrelatorRecorder(LiteXModule):
             # it: a host that has seen nothing but strobes still knows what it is
             # parsing.
             version=C(RECORD_FORMAT_VERSION, 8),
-            acc=[{k: C(0, 32) for k in ACC_SIGNALS} for _ in range(num_ants)],
+            acc=[{k: C(0, 32) for k in acc_names} for _ in range(num_ants)],
         )
         hold.append(sh)
         self.sync += slot_status(STROBE_SLOT, strobe, [
@@ -304,6 +318,15 @@ class CorrelatorRecorder(LiteXModule):
                 words[ant_word + 0] = Cat(a["ip"], a["qp"])
                 words[ant_word + 1] = Cat(a["ie"], a["qe"])
                 words[ant_word + 2] = Cat(a["il"], a["ql"])
+                if num_taps >= TAPS_VEPL:
+                    # Gated on the record's own tap count, not the build's: a
+                    # three-tap channel on a five-tap build must read zero here,
+                    # or a host would hand its loop filters two accumulators it
+                    # never agreed to.
+                    wide = h["ntaps"] == TAPS_VEPL
+                    very = ANT_VERY_WORD[n]
+                    words[very + 0] = Mux(wide, Cat(a["ive"], a["qve"]), 0)
+                    words[very + 1] = Mux(wide, Cat(a["ivl"], a["qvl"]), 0)
             return words
         cases = {}
         for i, h in enumerate(hold):

@@ -55,7 +55,8 @@ def replica_taps(code_step, spacing, n, prn=5, stb_gap=0):
 
     def bench():
         yield dut.code_step.eq(code_step)
-        yield dut.spacing.eq(spacing)
+        yield dut.tap_offset[0].eq(spacing)
+        yield dut.tap_offset[2].eq(-spacing)
         yield dut.restart.eq(1)
         yield
         yield dut.restart.eq(0)
@@ -74,12 +75,21 @@ def replica_taps(code_step, spacing, n, prn=5, stb_gap=0):
 
 
 class TestSpacingQuantisation(unittest.TestCase):
+    def test_late_tap_is_the_negated_early_offset(self):
+        # One register per tap, so the symmetric case is the host writing the
+        # two-s complement of the same word -- not the gateware assuming it.
+        ch, csr = channel()
+        ch.set_spacing_chips(0.5)
+        mask = (1 << (FRAC + 1)) - 1
+        self.assertEqual(csr.written["gnss_ch0_tap_offset_l"],
+                         (-csr.written["gnss_ch0_tap_offset_e"]) & mask)
+
     def test_half_chip_snaps_to_two_samples(self):
         # 0.5 chips at fs = 4 MHz is 1.955 samples; Tracking.jl rounds that to 2
         # samples = 0.5115 chips, and dll_disc normalises with (2 - 1.023)/2.
         ch, csr = channel()
         ch.set_spacing_chips(0.5)
-        word = csr.written["gnss_ch0_spacing"]
+        word = csr.written["gnss_ch0_tap_offset_e"]
         self.assertEqual(word, 2 * ch.code_word(0.0))
         self.assertEqual(ch.sample_shift(0.5), 2)
         # The old behaviour (raw preferred shift) is a different, wrong word.
@@ -93,7 +103,7 @@ class TestSpacingQuantisation(unittest.TestCase):
         for fs in (4e6, 2.046e6, 5e6, 3.3e6, 8.184e6):
             ch, csr = channel(fs)
             ch.set_spacing_chips(0.5)
-            word  = csr.written["gnss_ch0_spacing"]
+            word  = csr.written["gnss_ch0_tap_offset_e"]
             shift = ch.sample_shift(0.5)
             fpga_el   = 2 * word / (1 << FRAC)                    # chips
             julia_el  = 2 * shift * GPS_CA_CHIP_RATE / fs         # chips
@@ -108,7 +118,7 @@ class TestSpacingQuantisation(unittest.TestCase):
                          (5e6, 0.5), (3.3e6, 0.5), (8.184e6, 0.75)):
             ch, csr = channel(fs)
             ch.set_spacing_chips(pref)
-            word = csr.written["gnss_ch0_spacing"]
+            word = csr.written["gnss_ch0_tap_offset_e"]
             self.assertEqual(word % ch.code_word(0.0), 0,
                              msg=f"fs={fs} pref={pref}")
 
@@ -117,7 +127,7 @@ class TestSpacingQuantisation(unittest.TestCase):
         ch, csr = channel(fs=2.046e6)       # 2 samples/chip
         ch.set_spacing_chips(0.1)           # 0.2 samples -> rounds to 0
         self.assertEqual(ch.sample_shift(0.1), 1)
-        self.assertEqual(csr.written["gnss_ch0_spacing"], ch.code_word(0.0))
+        self.assertEqual(csr.written["gnss_ch0_tap_offset_e"], ch.code_word(0.0))
 
     def test_spacing_of_one_chip_or_more_rejected(self):
         # The E/L taps only reach idx +/- 1, so spacing must stay below a chip.
@@ -125,12 +135,13 @@ class TestSpacingQuantisation(unittest.TestCase):
         for pref in (0.9, 1.0, 2.0):
             with self.assertRaises(ValueError):
                 ch.set_spacing_chips(pref)
-        self.assertNotIn("gnss_ch0_spacing", csr.written)
+        self.assertNotIn("gnss_ch0_tap_offset_e", csr.written)
+        self.assertNotIn("gnss_ch0_tap_offset_l", csr.written)
 
     def test_configure_quantises_with_the_programmed_doppler(self):
         ch, csr = channel()
         ch.configure(prn=1, carrier_hz=1200.0, code_doppler_hz=1200.0, spacing=0.5)
-        self.assertEqual(csr.written["gnss_ch0_spacing"],
+        self.assertEqual(csr.written["gnss_ch0_tap_offset_e"],
                          2 * ch.code_word(1200.0))
 
 
@@ -142,7 +153,7 @@ class TestReplicaTapAlignment(unittest.TestCase):
         ch.set_spacing_chips(0.5)
         step  = ch.code_word(0.0)
         shift = ch.sample_shift(0.5)
-        rec   = replica_taps(step, csr.written["gnss_ch0_spacing"], n,
+        rec   = replica_taps(step, csr.written["gnss_ch0_tap_offset_e"], n,
                              stb_gap=stb_gap)
         for i in range(shift, n - shift):
             self.assertEqual(rec["e"][i], rec["p"][i + shift], f"early[{i}]")

@@ -19,6 +19,8 @@ import math
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.channel import TrackingChannel
@@ -77,7 +79,7 @@ def run_channel_2ant(prn, ants, spacing_chips=0.5, stb_gap=0):
     def bench():
         yield dut.carrier_fw.eq(carrier_fw)
         yield dut.code_step.eq(code_step)
-        yield dut.spacing.eq(spacing)
+        yield from set_el_offsets(dut, spacing)
         yield dut.carrier_phase_in.eq(0)
         yield dut.carrier_set.eq(1)
         yield dut.restart.eq(1)
@@ -115,7 +117,7 @@ def run_bank_2ant(ants, n_channels=1, prns=(5,), stb_gap=0):
             yield chan._carrier_freq.storage.eq(carrier_fw)
             yield chan._carrier_phase.storage.eq(0)
             yield chan._code_freq.storage.eq(code_step)
-            yield chan._spacing.storage.eq(1 << (FRAC - 1))
+            yield from set_el_offsets_csr(chan, 1 << (FRAC - 1), FRAC)
         yield dut._control.storage.eq(1)          # enable bank
         yield dut.source.ready.eq(1)
         yield
@@ -228,7 +230,15 @@ class TestRecordLayout(unittest.TestCase):
         self.assertEqual(rec["channel"], 0xFF)
         self.assertEqual(rec["num_ants"], 1)   # clamped up from the zero word
         self.assertEqual(len(rec["ants"]), 1)
-        self.assertEqual(set(rec["ants"][0].values()), {0})
+        # Every reported accumulator is zero; the very-early/very-late pair is
+        # `None`, i.e. "this record does not carry that tap" -- a distinction
+        # `0` cannot make, since 0 is a correlator value.
+        self.assertEqual(rec["num_taps"], 0)
+        self.assertEqual({k: v for k, v in rec["ants"][0].items() if v is not None},
+                         {k: 0 for k in ("i_early", "q_early", "i_prompt",
+                                         "q_prompt", "i_late", "q_late")})
+        self.assertIsNone(rec["ants"][0]["i_very_early"])
+        self.assertIsNone(rec["ants"][0]["q_very_late"])
 
     def test_record_bytes_still_frame(self):
         import struct
@@ -318,7 +328,7 @@ class TestPerAntennaSaturation(unittest.TestCase):
         def bench():
             yield dut.carrier_fw.eq(0)              # cos = +127, sin = 0
             yield dut.carrier_phase_in.eq(0)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield from set_el_offsets(dut, 1 << (FRAC - 1))
             yield dut.code_step.eq(0)               # freeze the code phase
             yield dut.carrier_set.eq(1)
             yield dut.restart.eq(1)
@@ -405,7 +415,7 @@ class TestBankMultiAntenna(unittest.TestCase):
             carrier_fw = round(F_IF / FS * (1 << PHASE_BITS)) & ((1 << PHASE_BITS) - 1)
             yield chan._carrier_freq.storage.eq(carrier_fw)
             yield chan._code_freq.storage.eq(round(CHIP_RATE / FS * (1 << FRAC)))
-            yield chan._spacing.storage.eq(1 << (FRAC - 1))
+            yield from set_el_offsets_csr(chan, 1 << (FRAC - 1), FRAC)
             yield dut._control.storage.eq(1)
             yield dut.source.ready.eq(1)
             yield
@@ -473,7 +483,15 @@ class TestEpochStrobeWithTwoAntennas(unittest.TestCase):
             self.assertEqual(rec["num_taps"], 0)
             # The host still gets something safe to unpack.
             self.assertEqual(rec["num_ants"], 1)
-            self.assertEqual(set(rec["ants"][0].values()), {0})
+            # Every reported accumulator is zero; the very-early/very-late pair is
+        # `None`, i.e. "this record does not carry that tap" -- a distinction
+        # `0` cannot make, since 0 is a correlator value.
+        self.assertEqual(rec["num_taps"], 0)
+        self.assertEqual({k: v for k, v in rec["ants"][0].items() if v is not None},
+                         {k: 0 for k in ("i_early", "q_early", "i_prompt",
+                                         "q_prompt", "i_late", "q_late")})
+        self.assertIsNone(rec["ants"][0]["i_very_early"])
+        self.assertIsNone(rec["ants"][0]["q_very_late"])
 
     def test_dumps_from_both_antennas_survive_alongside_strobes(self):
         # A marker must not preempt or corrupt a two-antenna dump.

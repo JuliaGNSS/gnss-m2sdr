@@ -22,6 +22,8 @@ Pinned here:
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.bank import GNSSTracking
@@ -55,7 +57,7 @@ class TestChannelUsesExternalCounter(unittest.TestCase):
 
         def bench():
             yield dut.code_step.eq(FAST_CODE_STEP)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield from set_el_offsets(dut, 1 << (FRAC - 1))
             yield dut.restart.eq(1)
             yield
             yield dut.restart.eq(0)
@@ -135,7 +137,7 @@ class TestBankGlobalCounter(unittest.TestCase):
         def bench():
             for chan in (dut.ch0, dut.ch1):
                 yield chan._code_freq.storage.eq(FAST_CODE_STEP)
-                yield chan._spacing.storage.eq(1 << (FRAC - 1))
+                yield from set_el_offsets_csr(chan, 1 << (FRAC - 1), FRAC)
             yield dut.source.ready.eq(1)
             yield
             # Strobes seen before the bank is enabled still advance the axis.

@@ -76,7 +76,8 @@ class TestChannelConsecutiveDumps(unittest.TestCase):
 
         def bench():
             yield dut.code_step.eq(CODE_STEP)
-            yield dut.spacing.eq(SPACING)
+            yield dut.tap_offset[0].eq(SPACING)
+            yield dut.tap_offset[2].eq(-SPACING)
             yield dut.carrier_fw.eq(0)       # constant replica: cos=127, sin=0
             yield dut.carrier_phase_in.eq(0)
             yield dut.carrier_set.eq(1)
@@ -155,7 +156,8 @@ class TestBankConsecutiveRecords(unittest.TestCase):
 
         def bench():
             yield dut.ch0._code_freq.storage.eq(CODE_STEP)
-            yield dut.ch0._spacing.storage.eq(SPACING)
+            yield dut.ch0._tap_offset_e.storage.eq(SPACING)
+            yield dut.ch0._tap_offset_l.storage.eq(-SPACING & ((1 << (FRAC + 1)) - 1))
             yield dut.ch0._carrier_freq.storage.eq(0)
             yield dut.ch0._carrier_phase.storage.eq(0)
             yield dut._control.storage.eq(1)          # enable bank

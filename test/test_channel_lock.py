@@ -11,6 +11,8 @@ import math
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.channel import TrackingChannel
@@ -56,7 +58,7 @@ def run_channel(prn, I, Q, spacing_chips=0.5, stb_gap=0):
     def bench():
         yield dut.carrier_fw.eq(carrier_fw)
         yield dut.code_step.eq(code_step)
-        yield dut.spacing.eq(spacing)
+        yield from set_el_offsets(dut, spacing)
         yield dut.carrier_phase_in.eq(0)
         yield dut.carrier_set.eq(1)
         yield dut.restart.eq(1)

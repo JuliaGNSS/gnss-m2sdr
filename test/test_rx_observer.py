@@ -12,6 +12,8 @@ import math
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.rx_observer import RXSampleObserver
@@ -149,7 +151,7 @@ class TestObservedBankLock(unittest.TestCase):
             yield bank.ch0._carrier_freq.storage.eq(carrier_fw)
             yield bank.ch0._carrier_phase.storage.eq(0)
             yield bank.ch0._code_freq.storage.eq(code_step)
-            yield bank.ch0._spacing.storage.eq(1 << (FRAC - 1))
+            yield from set_el_offsets_csr(bank.ch0, 1 << (FRAC - 1), FRAC)
             yield bank._control.storage.eq(1)          # enable bank
             yield bank.source.ready.eq(1)
             yield

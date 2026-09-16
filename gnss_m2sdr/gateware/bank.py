@@ -4,11 +4,11 @@
 # GNSS tracking channel bank with CSR control + record DMA stream.
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""A bank of BPSK tracking channels driven by the RX sample stream.
+"""A bank of tracking channels driven by the RX sample stream.
 
 Each channel is CSR-controlled (carrier/code frequency words, carrier/code
-phase, primary-code length, E/L spacing, PRN tag, runtime code loading,
-integration restart), either
+phase, primary-code length, per-tap offsets, replica shape, PRN tag, runtime
+code and subcarrier loading, integration restart), either
 immediately or -- for NCO updates and acquisition handover, where "whenever the
 PCIe write landed" is not good enough -- atomically on a sample index the host
 picks (``apply_at``; see ChannelWithCSR). All channels
@@ -36,14 +36,24 @@ A channel is not tied to GPS L1 C/A. What it replicates is set at runtime:
     RAM (up to the build's `max_code_length`);
   * `code_length` says how many of those chips are the code -- 330, 1023, 2046,
     4092, 5115, 10230 or anything else up to `max_code_length`;
-  * `code_freq` sets the chipping rate, as `round(f_chip / fs * 2**frac_bits)`.
+  * `code_freq` sets the chipping rate, as `round(f_chip / fs * 2**frac_bits)`;
+  * `subcarrier_load` writes the sub-chip subcarrier table and `replica.subchips`
+    says how many of its entries are a chip, which is what turns the same
+    channel from plain BPSK into BOC(1,1), CBOC or TMBOC (see
+    gnss_m2sdr/subcarrier.py);
+  * `replica.taps` picks the tap layout this channel's records report, 3 or 5,
+    so one bank runs GPS L1 C/A next to Galileo E1;
+  * `tap_offset_*` place each tap independently, in whole input samples times
+    `code_freq`.
 
-The first two are *armed*, not applied: starting a `code_load` raises the
-channel's `loading` bit, which suppresses its dumps, and the next `restart` --
-immediate or scheduled through `apply_at` -- both clears it and commits
-`code_length`. So a re-assignment is atomic with respect to the record stream:
-no record can ever describe a half-written code or a code read at the wrong
-length, and the first record after the restart is the new satellite's.
+`code_load`, `subcarrier_load`, `code_length` and `replica` are *armed*, not
+applied: a `code_load.reset_addr` or a subcarrier write raises the channel's
+`loading` bit, which suppresses its dumps, and the next `restart` -- immediate
+or scheduled through `apply_at` -- clears it and commits the staged shape. So a
+re-assignment is atomic with respect to the record stream: no record can ever
+describe a half-written code, a code read at the wrong length, or a replica
+whose amplitude changed under the integration, and the first record after the
+restart is the new satellite's.
 
 `code_freq` is one bit wider than `code_frac_bits` so an unrepresentable rate
 (>= 1 chip per input sample -- the code NCO crosses at most one chip boundary
@@ -68,11 +78,13 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 
 from gnss_m2sdr.gateware.channel import TrackingChannel
+from gnss_m2sdr.gateware.code_replica import replica_bits_for
 from gnss_m2sdr.gateware.record  import CorrelatorRecorder
 from gnss_m2sdr.gateware.ca_code import CA_CODE_LENGTH
 from gnss_m2sdr.record_format import (
-    ACC_SIGNALS, CSR_LAYOUT_VERSION, MAX_SECONDARY_CODE_LENGTH, MODULATIONS,
-    N_ANTS_MAX, NUM_TAPS, RECORD_FORMAT_VERSION,
+    CSR_LAYOUT_VERSION, MAX_SECONDARY_CODE_LENGTH, N_ANTS_MAX,
+    RECORD_FORMAT_VERSION, TAPS_EPL, TAPS_VEPL, acc_signals, modulations_mask,
+    tap_layouts_mask, tap_short_names,
 )
 
 
@@ -81,10 +93,10 @@ class ChannelWithCSR(LiteXModule):
 
     Two ways to get a parameter into the channel:
 
-    * **Immediately** -- write ``carrier_freq`` / ``code_freq`` / ``spacing``,
-      pulse ``control.restart`` / ``control.carrier_set``. Each write takes
-      effect on whatever sample happens to be in flight. Fine for bring-up,
-      acquisition sweeps and static configuration.
+    * **Immediately** -- write ``carrier_freq`` / ``code_freq`` /
+      ``tap_offset_*``, pulse ``control.restart`` / ``control.carrier_set``.
+      Each write takes effect on whatever sample happens to be in flight. Fine
+      for bring-up, acquisition sweeps and static configuration.
     * **At a known sample** -- stage ``carrier_freq_next`` / ``code_freq_next``
       (and ``carrier_phase`` / ``code_phase`` for the phase loads), write the
       target sample index to ``apply_at``, then arm ``apply`` with the selects
@@ -106,10 +118,16 @@ class ChannelWithCSR(LiteXModule):
     """
     def __init__(self, prn=1, code_frac_bits=24, accum_bits=32,
                  carrier_phase_bits=32, max_code_length=CA_CODE_LENGTH,
-                 num_ants=1):
+                 num_ants=1, num_taps=TAPS_EPL, max_subchips=1,
+                 replica_bits=None):
         len_bits  = bits_for(max_code_length)
         chip_bits = bits_for(max_code_length - 1)
         code_len_reset = min(CA_CODE_LENGTH, max_code_length)
+        self.num_taps = num_taps
+        acc_names     = acc_signals(num_taps)
+        tap_names     = tap_short_names(num_taps)
+        sub_bits      = bits_for(max_subchips)
+        sub_adr_bits  = bits_for(max(1, max_subchips - 1))
         # One I/Q pair per antenna, all on the same strobe. Antenna 0 keeps the
         # scalar names, so single-antenna wiring is unchanged.
         self.sample_i_ants = [Signal((16, True)) for _ in range(num_ants)]
@@ -122,7 +140,10 @@ class ChannelWithCSR(LiteXModule):
         self.channel = ch = TrackingChannel(
             prn=prn, code_frac_bits=code_frac_bits, accum_bits=accum_bits,
             carrier_phase_bits=carrier_phase_bits,
-            max_code_length=max_code_length, num_ants=num_ants)
+            max_code_length=max_code_length, num_ants=num_ants,
+            num_taps=num_taps, max_subchips=max_subchips,
+            replica_bits=replica_bits)
+        replica_bits = ch.code.replica_bits
 
         # CSRs. restart/carrier_set are edge-triggered: host writes 1 then 0;
         # a one-cycle pulse is generated on the 0->1 transition.
@@ -143,8 +164,31 @@ class ChannelWithCSR(LiteXModule):
             description="Primary-code chips (1..max_code_length). Staged: committed "
                         "by the next restart, so it changes with the code and the code "
                         "phase in one step.")
-        self._spacing       = CSRStorage(code_frac_bits, reset=(1 << (code_frac_bits - 1)),
-                                          description="E/L half spacing in chips (fixed-point). Default 0.5.")
+        # One signed offset per non-prompt tap, in fixed-point chips: prompt is
+        # zero by definition (GNSSReceiver's contract says so, and the register
+        # would have no other legal value). They are *independent* -- an
+        # asymmetric layout is programmable -- because Tracking's discriminators
+        # recover the spacing from the correlator they are handed, and a five-tap
+        # correlator's VE/VL distance enters the discriminator separately, so
+        # there is no single number to re-derive the array from. Write
+        # `sample_shift * code_freq` for each: whole input samples, the grid
+        # Tracking quantises onto.
+        half = 1 << (code_frac_bits - 1)
+        tap_reset = {"ve": 0, "e": half, "l": -half & ((1 << (code_frac_bits + 1)) - 1),
+                     "vl": 0}
+        self.tap_offset_csr = {}
+        for name in tap_names:
+            if name == "p":
+                continue
+            reg = CSRStorage(code_frac_bits + 1, name="tap_offset_" + name,
+                             reset=tap_reset[name], description=
+                f"Signed offset of the {name} tap from the prompt replica, in "
+                f"2**-{code_frac_bits} chips (positive = earlier). |offset| must "
+                f"stay below one chip: the taps reach chip index +/-1 only, and "
+                f"exactly -1.0 chip is rejected as code_status.replica_unsupported "
+                f"rather than silently landing on the wrong chip.")
+            setattr(self, "_tap_offset_" + name, reg)
+            self.tap_offset_csr[name] = reg
         self._prn           = CSRStorage(8, reset=prn, description="PRN tag emitted in records.")
         # atomic_write: chip+frac spans two bus words and a restart may fire
         # between them, which would load a half-written phase.
@@ -156,15 +200,52 @@ class ChannelWithCSR(LiteXModule):
             CSRField("dat",        size=1, description="Chip value to write."),
             CSRField("we",         size=1, description="Write dat at the current load address, then increment."),
             CSRField("reset_addr", size=1, description="Reset the load address to 0."),
+            CSRField("sub",        size=1, description=
+                "Subcarrier-table select stored with the chip: 0 = table A, 1 = "
+                "table B. Only TMBOC sets it; every other modulation leaves it 0. "
+                "Keeping it beside the chip is what frees the subcarrier from a "
+                "counter that would have to stay in step with the code wrap and "
+                "with every acquisition handover."),
         ])
         self._code_status   = CSRStatus(fields=[
             CSRField("loading", size=1, description=
-                "A code load is in progress (set by code_load.reset_addr, cleared by "
-                "restart). Dumps are suppressed while it is set, so no record can "
-                "describe a half-written code."),
+                "A code load is in progress (set by code_load.reset_addr or by a "
+                "subcarrier_load write, cleared by restart). Dumps are suppressed "
+                "while it is set, so no record can describe a half-written "
+                "replica."),
             CSRField("rate_unsupported", size=1, description=
                 "The code rate in force is >= 1 chip/sample; dumps are suppressed."),
+            CSRField("replica_unsupported", size=1, description=
+                "The replica shape in force cannot be evaluated -- subchips is 0 "
+                "or past the build's table, or a tap offset is a whole chip. "
+                "Dumps are suppressed."),
         ], description="Live per-channel replica status.")
+        # Replica shape. Staged like code_length and committed by the same
+        # restart, because both change what a record means: committing either
+        # mid-integration would produce one record of two different replicas.
+        replica_fields = [
+            CSRField("subchips", size=sub_bits, reset=1, description=
+                f"Sub-chips per chip of the subcarrier table (1..{max_subchips}); "
+                f"1 = plain BPSK. Staged: committed by the next restart."),
+        ]
+        if num_taps >= TAPS_VEPL:
+            replica_fields.append(CSRField("taps", size=1, description=
+                "0 = report 3 taps (E/P/L), 1 = report 5 (VE/E/P/L/VL). Staged: "
+                "committed by the next restart. Present only on a five-tap build "
+                "-- read gnss_signal_caps.tap_layouts first."))
+        self._replica = CSRStorage(fields=replica_fields, description=
+            "Replica shape staged for the next restart.")
+        if max_subchips > 1:
+            self._subcarrier_load = CSRStorage(fields=[
+                CSRField("dat", size=replica_bits, description=
+                    "Signed subcarrier amplitude for this sub-chip."),
+                CSRField("adr", size=sub_adr_bits, description="Sub-chip index."),
+                CSRField("lut", size=1, description="0 = table A, 1 = table B (TMBOC)."),
+                CSRField("we",  size=1, description=
+                    "Write dat. Also raises code_status.loading, so the next "
+                    "restart is what lets records flow again -- a replica whose "
+                    "amplitude changed mid-integration is not one record."),
+            ], description="Subcarrier table write port.")
         self._code_length_active = CSRStatus(len_bits, reset=code_len_reset,
             description="Primary-code length actually in force (code_length as of the "
                         "last restart). Read it back to confirm a commit landed.")
@@ -210,7 +291,7 @@ class ChannelWithCSR(LiteXModule):
         for n in range(num_ants):
             suffix = "" if n == 0 else f"_ant{n}"
             regs = {}
-            for k in ACC_SIGNALS:
+            for k in acc_names:
                 regs[k] = CSRStatus(32, name=k + suffix)
                 setattr(self, "_" + k + suffix, regs[k])
             self.acc_csr.append(regs)
@@ -223,6 +304,9 @@ class ChannelWithCSR(LiteXModule):
             "never reconstructs the chip from the code length.")
         self._dump_saturated     = CSRStatus(1,
             description="Set if the integration behind the latched dump clamped.")
+        self._dump_num_taps      = CSRStatus(8, reset=TAPS_EPL, description=
+            "Taps the latched dump reports (3 or 5); the acc CSRs above the "
+            "third tap read stale values when it says 3.")
 
         # # #
 
@@ -312,10 +396,57 @@ class ChannelWithCSR(LiteXModule):
             # code_phase storage: [code_frac_bits-1:0]=frac, above it=chip.
             ch.code_phase_frac.eq(self._code_phase.storage[:code_frac_bits]),
             ch.code_phase_chip.eq(self._code_phase.storage[code_frac_bits:]),
-            ch.spacing.eq(self._spacing.storage),
             ch.restart.eq(restart_pulse),
             ch.carrier_set.eq((ctl_carrier_set & ~carrier_set_d) | (apply_stb & self._apply.storage[2])),
         ]
+
+        # Tap offsets. The CSR is an unsigned register holding a two's-complement
+        # value; reinterpreting it is a same-width copy, not an arithmetic
+        # conversion, so the negative (late) offsets survive intact.
+        for t, name in enumerate(tap_names):
+            if name == "p":
+                # Prompt is the phase reference; the contract fixes it at zero and
+                # there is no register to get it wrong with.
+                self.comb += ch.tap_offset[t].eq(0)
+            else:
+                self.comb += ch.tap_offset[t].eq(
+                    self.tap_offset_csr[name].storage[:code_frac_bits + 1])
+
+        # Replica shape (sub-chip count, reported tap layout): staged and
+        # committed by the arming restart, exactly like code_length.
+        # `replica` storage: [sub_bits-1:0] = subchips, [sub_bits] = taps.
+        # Read through `storage` slices rather than `.fields`, like every other
+        # CSR here: `fields` are the bus-side registers, so a simulation poking
+        # `storage` (which is how these are driven in test) would leave them at
+        # their reset and the commit would silently take the wrong shape.
+        subchips_act = Signal(sub_bits, reset=1)
+        taps_act     = Signal(8, reset=TAPS_EPL)
+        staged_taps  = (Mux(self._replica.storage[sub_bits], TAPS_VEPL, TAPS_EPL)
+                        if num_taps >= TAPS_VEPL else C(TAPS_EPL, 8))
+        self.sync += If(restart_pulse,
+            subchips_act.eq(self._replica.storage[:sub_bits]),
+            taps_act.eq(staged_taps),
+        )
+        self.comb += [
+            ch.subchips.eq(subchips_act),
+            ch.taps_cfg.eq(taps_act),
+        ]
+
+        # Subcarrier table write port. A write also opens the load window, so the
+        # amplitude a record was integrated with cannot change under it.
+        # `subcarrier_load` storage: dat | adr | lut | we, low to high.
+        lut_write = Signal()
+        if max_subchips > 1:
+            st      = self._subcarrier_load.storage
+            adr_lsb = replica_bits
+            lut_lsb = adr_lsb + sub_adr_bits
+            self.comb += [
+                lut_write.eq(self._subcarrier_load.re & st[lut_lsb + 1]),
+                ch.code.lut_we.eq(lut_write),
+                ch.code.lut_sel.eq(st[lut_lsb]),
+                ch.code.lut_adr.eq(st[adr_lsb:lut_lsb]),
+                ch.code.lut_dat.eq(st[:replica_bits]),
+            ]
 
         # Primary-code length: staged in a CSR, committed by the arming restart.
         # Committing it anywhere else would let the wrap point move under a
@@ -335,13 +466,14 @@ class ChannelWithCSR(LiteXModule):
         self.sync += [
             If(restart_pulse,
                 loading.eq(0),
-            ).Elif(self._code_load.re & self._code_load.storage[2],
+            ).Elif((self._code_load.re & self._code_load.storage[2]) | lut_write,
                 loading.eq(1),
             ),
         ]
         self.comb += [
             ch.code_loading.eq(loading),
-            self._code_status.status.eq(Cat(loading, ch.rate_unsupported)),
+            self._code_status.status.eq(
+                Cat(loading, ch.rate_unsupported, ch.replica_unsupported)),
         ]
 
         # Sticky "an unrepresentable code rate was in force", cleared by the
@@ -371,6 +503,7 @@ class ChannelWithCSR(LiteXModule):
         self.comb += [
             ch.code.load_adr.eq(load_addr),
             ch.code.load_dat.eq(self._code_load.storage[0]),
+            ch.code.load_sub.eq(self._code_load.storage[3]),
             ch.code.load_we.eq(self._code_load.re & self._code_load.storage[1]),
         ]
 
@@ -378,12 +511,13 @@ class ChannelWithCSR(LiteXModule):
         self.sync += If(ch.dump_stb,
             self._dump_count.status.eq(self._dump_count.status + 1),
             *[regs[k].status.eq(ch.acc[n][k])
-              for n, regs in enumerate(self.acc_csr) for k in ACC_SIGNALS],
+              for n, regs in enumerate(self.acc_csr) for k in acc_names],
             self._integrated_samples.status.eq(ch.integrated_samples),
             self._sample_index.status.eq(ch.sample_index),
             self._dump_code_phase.status.eq(ch.dump_code_phase),
             self._dump_code_chip.status.eq(ch.dump_code_chip),
             self._dump_saturated.status.eq(ch.dump_saturated),
+            self._dump_num_taps.status.eq(ch.dump_num_taps),
         )
 
     def connect_dump(self, port):
@@ -391,7 +525,8 @@ class ChannelWithCSR(LiteXModule):
         return [
             port.stb.eq(ch.dump_stb),
             *[port.acc[n][k].eq(ch.acc[n][k])
-              for n in range(len(ch.acc)) for k in ACC_SIGNALS],
+              for n in range(len(ch.acc)) for k in ch.acc_signals],
+            port.num_taps.eq(ch.dump_num_taps),
             port.integrated_samples.eq(ch.integrated_samples),
             port.sample_index.eq(ch.sample_index),
             port.code_phase.eq(ch.dump_code_phase),
@@ -406,7 +541,8 @@ class GNSSTracking(LiteXModule):
     """Bank of tracking channels + recorder. Observes the RX sample stream."""
     def __init__(self, n_channels=4, prns=None, code_frac_bits=24, accum_bits=32,
                  num_ants=1, max_code_length=CA_CODE_LENGTH,
-                 carrier_phase_bits=32):
+                 carrier_phase_bits=32, num_taps=TAPS_EPL, max_subchips=1,
+                 replica_bits=None):
         if prns is None:
             prns = [i + 1 for i in range(n_channels)]
         assert len(prns) == n_channels
@@ -424,6 +560,14 @@ class GNSSTracking(LiteXModule):
         # warning. Fail the build instead of shipping mangled correlators.
         assert accum_bits == 32, (
             f"accum_bits must be 32 (record_format.py word layout), got {accum_bits}")
+        assert num_taps in (TAPS_EPL, TAPS_VEPL), (
+            f"num_taps must be one of {(TAPS_EPL, TAPS_VEPL)}, got {num_taps}")
+        assert 1 <= max_subchips <= 0xFF, "max_subchips must fit its capability field"
+        self.num_taps     = num_taps
+        self.max_subchips = max_subchips
+        if replica_bits is None:
+            replica_bits = replica_bits_for(max_subchips)
+        self.replica_bits = replica_bits
 
         # One I/Q pair per antenna, all on the same strobe (antenna 0 also under
         # the scalar names).
@@ -491,8 +635,11 @@ class GNSSTracking(LiteXModule):
             CSRField("n_channels",         size=8,  reset=n_channels),
             CSRField("num_ants_max",       size=8,  reset=num_ants,
                      description="Antenna blocks a dump can carry (build-time)."),
-            CSRField("num_taps",           size=8,  reset=NUM_TAPS,
-                     description="Correlator taps per record (3 = late/prompt/early)."),
+            CSRField("num_taps",           size=8,  reset=num_taps,
+                     description="Widest correlator layout this build produces "
+                                 "(3 = late/prompt/early, 5 adds very late/very "
+                                 "early). Narrower layouts are available per "
+                                 "channel -- see signal_caps.tap_layouts."),
             CSRField("code_frac_bits",     size=8,  reset=code_frac_bits,
                      description="Fixed-point scale of code_freq / code_phase.frac."),
             CSRField("carrier_phase_bits", size=8,  reset=carrier_phase_bits,
@@ -504,13 +651,33 @@ class GNSSTracking(LiteXModule):
                                  "can hold, i.e. max_primary_code_length."),
         ], description="Fixed limits of this build.")
         self._signal_caps = CSRStatus(fields=[
-            CSRField("modulations", size=8, reset=MODULATIONS,
-                     description="Replica modulations: bit0 = LOC (plain BPSK). "
-                                 "BOC/CBOC/TMBOC bits are allocated but read 0 here."),
+            CSRField("modulations", size=8, reset=modulations_mask(max_subchips),
+                     description="Replica modulations this build can synthesise: "
+                                 "bit0 = LOC, bit1 = BOCcos, bit2 = CBOC, "
+                                 "bit3 = TMBOC, bit4 = BOCsin. Declared from the "
+                                 "sub-chip table depth, so a LOC-only build reads "
+                                 "bit0 alone. Check max_subchips too: one bit "
+                                 "cannot distinguish BOC(1,1) from BOC(6,1)."),
             CSRField("max_secondary_code_length", size=8, reset=MAX_SECONDARY_CODE_LENGTH,
                      description="Longest overlay the gateware wipes off (1 = primary only)."),
             CSRField("reports_code_phase", size=1, reset=1,
                      description="Records carry a complete code phase (chip + fraction)."),
+            CSRField("tap_layouts", size=4, reset=tap_layouts_mask(num_taps),
+                     description="Tap layouts a channel can be configured for: "
+                                 "bit i means 2*i+3 taps (bit0 = 3, bit1 = 5). A "
+                                 "five-tap build declares both, which is what lets "
+                                 "one bank mix GPS L1 C/A with Galileo E1. Bit 1 "
+                                 "is also what says gnss_chN_replica.taps and the "
+                                 "very-early/very-late tap offsets exist."),
+            CSRField("max_subchips", size=8, reset=max_subchips,
+                     description="Sub-chips per chip the subcarrier table holds. "
+                                 "A modulation needs its own factor: 2 for "
+                                 "BOCsin(1,1), 4 for BOCcos(1,1), 12 for "
+                                 "CBOC(6,1) and TMBOC(6,1). 1 = no subcarrier."),
+            CSRField("replica_bits", size=8, reset=replica_bits,
+                     description="Signed width of a subcarrier table entry, so "
+                                 "the host can check the amplitudes it wants to "
+                                 "program fit before it writes them."),
         ], description="Signal-level capabilities.")
         # The one time axis: a free-running count of observed sample strobes,
         # ungated by `enable` and never reset (not by a channel restart either),
@@ -531,7 +698,8 @@ class GNSSTracking(LiteXModule):
 
         self.recorder = recorder = CorrelatorRecorder(n_channels, accum_bits, code_frac_bits,
                                                       num_ants=num_ants,
-                                                      max_code_length=max_code_length)
+                                                      max_code_length=max_code_length,
+                                                      num_taps=num_taps)
         self.source = recorder.source
         self.comb += [
             recorder.sample_stb.eq(self.sample_stb),      # ungated on purpose
@@ -549,7 +717,9 @@ class GNSSTracking(LiteXModule):
             chan = ChannelWithCSR(prn=prns[i], code_frac_bits=code_frac_bits,
                                   accum_bits=accum_bits, num_ants=num_ants,
                                   max_code_length=max_code_length,
-                                  carrier_phase_bits=carrier_phase_bits)
+                                  carrier_phase_bits=carrier_phase_bits,
+                                  num_taps=num_taps, max_subchips=max_subchips,
+                                  replica_bits=replica_bits)
             setattr(self.submodules, f"ch{i}", chan)
             self.channels.append(chan)
             self.comb += [

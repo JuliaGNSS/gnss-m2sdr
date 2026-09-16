@@ -36,6 +36,8 @@ cycle, not just any cycle.
 import unittest
 
 from migen import *
+
+from test.tap_helpers import set_el_offsets, set_el_offsets_csr
 from migen.sim import run_simulation
 
 from gnss_m2sdr.gateware.bank import GNSSTracking
@@ -117,7 +119,8 @@ def configure(dut, carrier_fw=CARRIER_A, code_fw=CODE_A):
     """Static configuration through the immediate CSRs, then enable the bank."""
     yield from poke(dut.ch0._carrier_freq, carrier_fw)
     yield from poke(dut.ch0._code_freq, code_fw)
-    yield from poke(dut.ch0._spacing, 1 << (FRAC - 1))
+    yield from poke(dut.ch0._tap_offset_e, 1 << (FRAC - 1))
+    yield from poke(dut.ch0._tap_offset_l, -(1 << (FRAC - 1)) & ((1 << (FRAC + 1)) - 1))
     yield from poke(dut._control, 1)
 
 
@@ -331,7 +334,7 @@ class TestCodePhasePreload(unittest.TestCase):
 
         def bench():
             yield dut.code_step.eq(STEP)
-            yield dut.spacing.eq(1 << (FRAC - 1))
+            yield from set_el_offsets(dut, 1 << (FRAC - 1))
             yield dut.restart_chip.eq(CHIP)
             yield dut.restart_frac.eq(CHIP_FRAC)
             yield dut.restart.eq(1)
