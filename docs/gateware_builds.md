@@ -559,7 +559,79 @@ fails to configure at all.
 back.** `m2sdr_util flash_write` of `op_slot_backup.bin` to `0x00800000`
 reported `Success.` and exited 0 at 2026-09-17 13:19 UTC, and the pre-flash
 driver headers, kernel module and user tools were restored and rebuilt in the
-same session. <!--ROLLBACK-CONFIRM--> 
+same session.
+
+**Confirmed on the board after the reboot** (2026-09-17): the SoC identifier
+reads *built on 2026-07-29 23:42:50* again, and the whole chain works — see
+§5.7b for the measurement. The regression baseline is intact.
+
+One trap worth writing down: the tracking bank is an observer on the RX stream,
+so it only sees samples while DMA0 is draining and `m2sdr_record` has to outlive
+whatever is running. Its byte limit is not a hint — `m2sdr_record /dev/null
+100000000` exits after ~6 s at 4 MSPS, and everything downstream then reads
+zeros or noise with no error anywhere. Give it a limit that cannot be reached
+and re-check the sample counter at the end. Note also that the CSR map of the
+image on the board predates #31: driving it needs the host code from commit
+`8220716`, not this branch's.
+
+### 5.7b How the board is confirmed working — and how not to do it
+
+**Acquisition belongs on the CPU. The FPGA does downconversion and correlation
+for *tracking*; closing the loop is CPU-side too.** The confirmation therefore
+has three steps, and the first draft of this section got it wrong by collapsing
+them into one.
+
+*Step 1 — CPU-acquire from the raw DMA0 stream, with Acquisition.jl.* 2.00 s
+capture at fs = 4 MHz (sc16, 2T2R, 8 bytes per sample instant, RX1 = words 1 and
+2), `min_doppler_coverage = 50 kHz`, 10 coherently integrated code periods, 10
+noncoherent accumulations. The wide Doppler span is not optional: the device
+TCXO is poor, 1 ppm at L1 is 1.575 kHz, and satellites have been found at
+−8.5 kHz — outside any sweep sized for satellite motion alone.
+
+Two captures 40 minutes apart, all 32 PRNs, CN0 in dBHz:
+
+| | floor (median ± MAD) | above floor |
+|---|---|---|
+| capture A | 39.6 ± 0.25 | PRN 20 (59.2, −6000 Hz), 19 (56.6, −1100), 15 (49.5, −4200), 10 (41.2, −1400) |
+| capture B | 38.5 ± 0.42 | PRN 20 (57.4, −6600), 19 (53.4, −1500), 15 (45.3, −5000), 24 (42.2, −2300), 10 (41.6, −2000) |
+
+28 of 32 PRNs inside ~1 dB of the median is what a noise floor looks like; a
+handful of satellites 6–20 dB clear of it is what a detection looks like.
+
+*Steps 2 and 3 — hand the code phase and Doppler to an FPGA channel, and close
+the loop on the host.* 40 s run, one FPGA correlator channel per satellite,
+Tracking.jl running every loop filter:
+
+| PRN | prompt \|P\|²/floor over 40 s | carrier the loop held | Acquisition.jl said | |
+|---:|---|---:|---:|---|
+| 19 | 24–32× | −1580 to −1627 Hz | −1100 / −1500 Hz | locked |
+| 15 | 26 → 52× | −5210 to −5281 Hz | −4200 / −5000 Hz | locked |
+| 20 | 26 → 46 → 7.8× | −6810 to −6877 Hz | −6000 / −6600 Hz | locked, fading |
+| 24 | 1.0–1.5× | diverged to +48 700 Hz | 42.2 dBHz, marginal | no lock |
+
+`saturation = 0xffff0` (bits 0–3, the channels in use, clear), `overflow = 0x0`.
+**That is the hardware-correlator claim worth recording**: the loop's carrier
+Doppler agrees with an independent CPU estimate on all three locked satellites,
+and prompt power holds 25–55× the noise floor for 40 s.
+
+*And the way that does not work.* `software/gnss_tracking.py:acquire()` sweeps
+for satellites *through* the FPGA correlator over CSR, scoring peak/median of
+prompt power. **It cannot distinguish signal from noise and must not be used to
+claim a detection.** Measured against the ground truth above, on the same sky:
+
+- real PRNs (20, 19, 15, 10) median metric **26.65**; known-floor PRNs
+  (3, 14, 17, 22, 28) median **24.47** — a separation of **1.09×**;
+- PRN 20, the strongest satellite in the sky at 59.2 dBHz with a true Doppler of
+  −6000 Hz, scored above the `detect_metric = 8.0` threshold at **all 33 Doppler
+  bins** of a ±8 kHz sweep, peaking at **+5500 Hz** — 11.5 kHz from the truth —
+  while reading 12.8 at the true Doppler, below its own sweep median;
+- PRN 14, which is not there, also scored above threshold at every bin.
+
+The mechanism is in that function's own docstring: the metric has a noise
+baseline of the same order as a real 1 ms peak, and the sliding scheme smears
+the peak further. An earlier revision of this page reported "GPS L1 C/A acquires
+on ten of ten PRNs tried" from exactly this sweep. Ten of ten should have been
+the tell — a real sky does not hand over every PRN you ask for.
 
 ### 5.8 Three things that cost hours on the hardware side
 
