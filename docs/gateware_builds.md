@@ -584,16 +584,55 @@ Both are in the **sample and accumulate path — not the replica**, which is whe
 that path is §5.2's registered sample bundle (`SampleStreamRegister`, and the
 rewiring of `soc.py` around it), and that rewiring has no SoC-level test.
 
-**The prime suspect is our own change.** `SampleStreamRegister` and the `soc.py`
-rewiring came in with §5.2 as one of the four pipeline stages; the only v3 image
-ever flashed carried them, and the §2 build without them was never put on
-silicon. So "the timing fix introduced the correlation bug" is a live
-hypothesis, and with the replica path cleared it is the leading one. That
-rewiring had no test either; it now has one (`TestObserverRegisterBankChain`),
-and the bank produces bit-identical records with and without the stage in both
-AD9361 channel modes, with and without DMA0 back-pressure. Correct in
-simulation — which does not clear it, because every check in this section is
-simulation and a synthesis-level fault survives all of them.
+**The prime suspect was our own change.** `SampleStreamRegister` and the
+`soc.py` rewiring came in with §5.2 as one of the four pipeline stages; the only
+v3 image ever flashed carried them, and the §2 build without them was never put
+on silicon. So "the timing fix introduced the correlation bug" was a live
+hypothesis and, with the replica path cleared, the leading one. That rewiring
+had no test either; it now has one (`TestObserverRegisterBankChain`), and the
+bank produces bit-identical records with and without the stage in both AD9361
+channel modes, with and without DMA0 back-pressure. **The netlist query below
+then cleared it in silicon too**, which simulation alone could not do.
+
+**Interrogating the implemented netlist.** The `_route.dcp` checkpoint is the
+exact netlist that became the flashed bitstream, so it answers "what did Vivado
+actually build" without a rebuild and without the board. Open it with
+`open_checkpoint` and query it (~2 min per query on this design):
+
+| Question | Answer |
+|---|---|
+| Were the replica registers optimised away or tied constant? | **No.** `word_r`, `k_r`, `w_prev`/`w_cur`/`w_next`, `idx_far`, `lut_a` all present; 293 flops in `codereplica0`; every net `TYPE=SIGNAL`, none a constant |
+| Did §5.2's pipeline stage survive? | **Yes, but not where you would look.** See below |
+
+Two traps worth knowing before reading such a query:
+
+1. **Migen names signals after the module *class*, not the instance.** The
+   attribute is `self.gnss_rx_pipe`, but every net is `samplestreamregister_*`;
+   `self.gnss_rx` becomes `rxsampleobserver_*`. A query for `*gnss_rx_pipe*`
+   returns zero cells and looks alarming. The instance names appear only in the
+   hierarchy *comment* at the top of the generated Verilog.
+2. **A register that has vanished may have moved into a DSP.** Querying
+   `*samplestreamregister*` finds exactly **one** flop — the strobe — and none
+   for the 32 bits of `out_i`/`out_q`. That reads like a bundle delay whose data
+   path lost its register while the strobe kept one, which would skew sample
+   against strobe and is precisely the shape of fault being hunted. It is not.
+   The sample-path DSP48E1s carry **`AREG = 1`** and their `A` pins are driven
+   straight from `rxsampleobserver0/1`: Vivado absorbed the data flops into the
+   DSP's own input register, which is exactly the placement §5.2 wanted.
+
+The alignment was then checked rather than assumed, because the whole question
+is whether both halves of the bundle are delayed equally:
+
+```
+trackingchannel0171      AREG=1  CEA1=<const0>  CEA2=<const1>  CLK=sys_clk
+trackingchannel017_reg   AREG=1  CEA1=<const0>  CEA2=<const1>  CLK=sys_clk
+samplestreamregister_out_stb_reg (FDRE)  CE=<const1>  R=ad9361_rx_cdc_cd_rst
+```
+
+One register on the data path and one on the strobe, same clock, both
+unconditionally enabled. **§5.2 is correctly implemented in silicon**, which is
+a stronger statement than the simulation test above and clears the leading
+suspect at the level that matters.
 
 **The next measurements, cheapest first.** The first two are single CSR reads
 and settle it — but note that **they need the v3 image reflashed**. The
