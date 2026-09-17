@@ -16,7 +16,9 @@ from migen import *
 from test.tap_helpers import set_el_offsets_csr
 from migen.sim import run_simulation
 
-from gnss_m2sdr.gateware.rx_observer import RXSampleObserver
+from gnss_m2sdr.gateware.rx_observer import (
+    RXSampleObserver, SampleStreamRegister,
+)
 from gnss_m2sdr.gateware.bank import GNSSTracking
 from test.test_channel_lock import (
     synth_signal, FS, F_IF, CHIP_RATE, FRAC, PHASE_BITS, AMP, CARRIER_AMP,
@@ -185,6 +187,51 @@ class TestObservedBankLock(unittest.TestCase):
         self.assertTrue(d, "no correlator dump")
         p = math.hypot(d["ip"], d["qp"])
         self.assertGreater(p, 0.9 * CARRIER_AMP * AMP * d["n"])
+
+
+class TestSampleStreamRegister(unittest.TestCase):
+    """The observer -> bank pipeline stage is a pure delay.
+
+    It exists to cut the combinational path from LitePCIe's DMA0 readiness to
+    the correlator DSP (see SampleStreamRegister), which only works if it
+    changes nothing else: every output must be its input exactly one cycle
+    later, with the strobe still on the samples it belongs to.
+    """
+
+    def test_bundle_is_delayed_by_exactly_one_cycle(self):
+        dut  = SampleStreamRegister(num_ants=2)
+        # (stb, i0, q0, i1, q1, ants_valid) driven in, sparse strobes included.
+        drive = [(1, 10, -20, 30, -40, 2),
+                 (0,  0,   0,  0,   0, 2),
+                 (1, -1,   2, -3,   4, 1),
+                 (1,  5,   6,  7,   8, 2),
+                 (0,  0,   0,  0,   0, 2),
+                 (0,  0,   0,  0,   0, 2)]
+        got = []
+
+        def bench():
+            for stb, i0, q0, i1, q1, av in drive:
+                yield dut.sample_stb.eq(stb)
+                yield dut.sample_i_ants[0].eq(i0)
+                yield dut.sample_q_ants[0].eq(q0)
+                yield dut.sample_i_ants[1].eq(i1)
+                yield dut.sample_q_ants[1].eq(q1)
+                yield dut.ants_valid.eq(av)
+                yield
+                got.append(((yield dut.out_stb),
+                            (yield dut.out_i_ants[0]), (yield dut.out_q_ants[0]),
+                            (yield dut.out_i_ants[1]), (yield dut.out_q_ants[1]),
+                            (yield dut.out_ants_valid)))
+
+        run_simulation(dut, bench())
+        # `yield` inside a migen bench reads the post-edge value, so got[k] is
+        # what the stage holds after driving item k -- i.e. item k-1.
+        self.assertEqual(got[1:], drive[:-1])
+
+    def test_antenna_zero_keeps_the_scalar_names(self):
+        dut = SampleStreamRegister(num_ants=1)
+        self.assertIs(dut.sample_i, dut.sample_i_ants[0])
+        self.assertIs(dut.out_i,    dut.out_i_ants[0])
 
 
 if __name__ == "__main__":

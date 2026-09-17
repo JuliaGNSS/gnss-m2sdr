@@ -59,21 +59,33 @@ word two bits wide (the chip plus the TMBOC table-select bit), so the table
 above doubles; see [sub-chip modulation](subchip_modulation.md) §6.
 
 **The read is asynchronous, so this is LUTRAM, not block RAM.** Block RAM on
-7-series reads synchronously; using it would need a pipeline stage between the
-chip-index arithmetic and the tap mux that the channel does not have today. At
-10230 chips a 4-channel bank is therefore ≈123 kbit of distributed RAM without a
-subcarrier and ≈246 kbit with one — a real but not alarming fraction of an
-XC7A200T's SLICEM capacity, and the first thing to revisit if the channel count
-grows. A five-tap bank costs neither more nor less: the taps share a
-three-address window rather than owning a copy each.
+7-series reads synchronously. At 10230 chips a 4-channel bank is therefore
+≈123 kbit of distributed RAM without a subcarrier and ≈246 kbit with one — a
+real but not alarming fraction of an XC7A200T's SLICEM capacity, and the first
+thing to revisit if the channel count grows. A five-tap bank costs neither more
+nor less: the taps share a three-address window rather than owning a copy each.
+
+The three read *outputs* are registered, though, and that is not an
+optimisation: an asynchronous 10230-deep read is a 160:1 LUT mux tree, and with
+`code_length`'s wrap arithmetic in front of it and the replica's subcarrier mux
+behind it the whole thing sat combinationally between a flop and a correlator
+DSP — seventeen logic levels in one 8 ns cycle, which is what missed setup by
+2.875 ns on the first five-tap build. `CodeReplica` now holds the three chip
+words the taps read in flops and moves that window one chip at a time, which
+costs no latency (the index only ever advances by one, and a `restart` reloads
+all three from ports parked around the rebase chip) and takes both the RAM and
+`code_length` off the per-sample path. See
+[gateware builds](gateware_builds.md) for the before/after numbers — **and
+§5.6b, which records that the pipelined replica closes timing and passes the
+board-free suite but did not correlate on the real board.**
 
 Synthesis and timing numbers are deliberately **not** quoted here: this
 repository's CI is board-free and has no Vivado, so any figure would be an
 estimate dressed as a measurement. Measured figures for a real build live in
-[gateware builds](gateware_builds.md) — including the finding that a
-4-channel / 10230-chip / five-tap build **misses timing by 2.875 ns**, on a
-critical path that runs straight through the asynchronous LUTRAM read this
-section describes. Reproduce them with
+[gateware builds](gateware_builds.md) — including the first
+4-channel / 10230-chip / five-tap build, which **missed timing by 2.875 ns** on
+a critical path running straight through the asynchronous LUTRAM read this
+section describes, and what pipelining it took to close. Reproduce them with
 
 ```
 python build.py --channels 4 --max-code-length 10230 --build

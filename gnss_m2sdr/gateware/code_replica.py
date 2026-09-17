@@ -36,6 +36,32 @@ Five taps cost exactly what three did: ``3 x max_code_length`` words, still a
 one-write/one-async-read distributed RAM. (The obvious alternative, a copy per
 tap, would have been 5/3 of the memory for the same answer.)
 
+The registered chip window
+--------------------------
+Those three words are held in *registers* (``w_prev``/``w_cur``/``w_next``), not
+taken straight off the asynchronous RAM outputs. With an async read the
+per-sample path ran ``code_length`` -> wrap arithmetic -> RAM address -> LUTRAM
+and its output mux tree -> tap muxes -> correlator DSP: seventeen logic levels,
+and at ``max_code_length = 10230`` the output mux alone is 160:1. That is what
+missed setup by 2.875 ns on the first real five-tap build (PR #34). Registering
+the window leaves only the tap muxes in front of the DSP and gives the RAM read
+a clock cycle of its own.
+
+The window is exact, not delayed. The index only ever moves one chip at a time,
+so an advance *shifts* the three words and needs exactly one new one -- the chip
+two ahead, which the "far" read port has been addressed at (``idx_far``) since
+the previous advance. ``restart`` is the only jump, and the other two read ports
+exist for it alone: they sit permanently on the chips either side of
+``restart_chip``, so a rebase reloads all three words in the restart cycle
+itself and the first sample after it already has the right replica.
+
+What the window does defer by one chip, deliberately, is a *reconfiguration*
+under a running index: a new ``code_length`` moves the wrap-around word
+(``code[last]``, which an early tap reads at chip 0) and a ``code_load`` write
+becomes visible only once the index has moved past it. Both are committed by the
+arming ``restart``, which reloads the whole window, and the bank suppresses dumps
+until then -- so no record can describe a half-applied shape either way.
+
 Sub-chip modulation
 -------------------
 A BOC-family replica is the primary chip times a subcarrier that varies *inside*
@@ -139,7 +165,7 @@ class CodeReplica(LiteXModule):
     """
     def __init__(self, prn=1, frac_bits=24, max_code_length=CA_CODE_LENGTH,
                  code_init=None, num_taps=TAPS_EPL, max_subchips=1,
-                 replica_bits=None):
+                 replica_bits=None, staged_length=False):
         assert max_code_length >= 2, "a code needs at least two chips"
         assert max_subchips >= 1, "a chip has at least one sub-chip"
         self.max_code_length = max_code_length
@@ -158,6 +184,9 @@ class CodeReplica(LiteXModule):
         # 1 bit of chip, plus the TMBOC "other subcarrier" bit once there is a
         # subcarrier at all. A LOC-only build keeps its 1-bit code RAM.
         word_bits  = 1 if max_subchips <= 1 else 2
+        # Length the build powers up with, and the depth the registered code
+        # window's reset values are taken at.
+        code_len_reset = min(CA_CODE_LENGTH, max_code_length)
         self.word_bits = word_bits
         sub_bits   = bits_for(max_subchips)
         idx_bits   = bits_for(max(1, max_subchips - 1))
@@ -167,7 +196,7 @@ class CodeReplica(LiteXModule):
         # build that is never configured behaves exactly as it did when the
         # length was a constant.
         self.code_length = Signal(bits_for(max_code_length),
-                                  reset=min(CA_CODE_LENGTH, max_code_length))
+                                  reset=code_len_reset)
         # Sub-chips per chip in force. Reset 1 = no subcarrier.
         self.subchips   = Signal(sub_bits, reset=1)
         # One signed offset per tap, earliest first. Prompt's is tied to 0.
@@ -195,6 +224,18 @@ class CodeReplica(LiteXModule):
         # a tap offset of a whole chip or more (the taps only reach idx +/- 1,
         # so a larger offset silently lands on the wrong chip).
         self.replica_unsupported = Signal()
+
+        # The code length a `restart` wraps with, i.e. the length in force for the
+        # window it loads. On a bank this is the *staged* CSR -- the value the
+        # restart is about to commit -- driven from outside (`staged_length`),
+        # because it is known a cycle early and the code-RAM read address must
+        # not wait on `restart` -> the commit mux -> `code_length - 1`. That
+        # chain measured 2.9 ns of a path that already had the LUTRAM read on
+        # the end of it. Standalone it simply follows `code_length`.
+        self.restart_length = Signal(bits_for(max_code_length),
+                                     reset=code_len_reset)
+        if not staged_length:
+            self.comb += self.restart_length.eq(self.code_length)
 
         # Runtime code-load port (host writes the acquired PRN's code here).
         self.load_we  = Signal()
@@ -255,19 +296,113 @@ class CodeReplica(LiteXModule):
         at_last  = Signal()
         idx      = self.chip_index
         idx_next = Signal(max=max_code_length)  # idx + 1 (wrapped)
-        idx_prev = Signal(max=max_code_length)  # idx - 1 (wrapped)
         self.comb += [
             last.eq(self.code_length - 1),
             # `>=`, not `==`: shortening code_length under a running index must
             # wrap on the next chip rather than after a lap of the RAM.
             at_last.eq(idx >= last),
             If(at_last, idx_next.eq(0)).Else(idx_next.eq(idx + 1)),
-            If(idx == 0, idx_prev.eq(last)).Else(idx_prev.eq(idx - 1)),
         ]
 
-        p_prev = make_port(idx_prev)
-        p_cur  = make_port(idx)
-        p_next = make_port(idx_next)
+        # The three chips around `restart_chip`, and the one after those, for a
+        # rebase. Wrapping uses the same `>=` rule as the running index, so a
+        # handover phase left over from a longer code lands where the running
+        # index would have.
+        r_last = Signal(max=max_code_length)   # last chip index a restart wraps at
+        r_prev = Signal(max=max_code_length)   # restart_chip - 1 (wrapped)
+        r_next = Signal(max=max_code_length)   # restart_chip + 1 (wrapped)
+        r_far  = Signal(max=max_code_length)   # restart_chip + 2 (wrapped)
+        self.comb += [
+            r_last.eq(self.restart_length - 1),
+            If(self.restart_chip == 0, r_prev.eq(r_last),
+            ).Else(r_prev.eq(self.restart_chip - 1)),
+            If(self.restart_chip >= r_last, r_next.eq(0),
+            ).Else(r_next.eq(self.restart_chip + 1)),
+            If(r_next >= r_last, r_far.eq(0)).Else(r_far.eq(r_next + 1)),
+        ]
+
+        # The three chip words the taps read -- code[idx-1], code[idx],
+        # code[idx+1] -- held in REGISTERS rather than read out of the RAM
+        # combinationally. This is the timing fix: with an asynchronous read the
+        # per-sample path ran
+        #
+        #   code_length -> last -> idx+/-1 -> RAM address -> LUTRAM + output mux
+        #   tree -> tap word mux -> subcarrier amplitude -> correlator DSP,
+        #
+        # seventeen logic levels deep, and at max_code_length = 10230 the LUTRAM
+        # output mux alone is a 160:1 tree. Registering the window takes the RAM
+        # *and* `code_length` out of that path entirely and leaves only the tap
+        # muxes in front of the DSP; the RAM read becomes an ordinary
+        # register-to-register hop with a whole clock cycle to itself.
+        #
+        # The window is exact, not delayed, because the index only ever moves by
+        # one chip: on an advance the three words shift by one and the single
+        # new word (the chip *two* ahead, addressed by `idx_far`) has been
+        # waiting at the far read port since the previous advance. `restart` is
+        # the only jump, and that is what the other two read ports are for --
+        # they sit permanently on the chips either side of `restart_chip`, so a
+        # rebase reloads all three words in the restart cycle itself, with no
+        # dead sample after it.
+        far_adr = Signal(max=max_code_length)
+        p_prev = make_port(r_prev)          # code[restart_chip - 1]
+        p_cur  = make_port(self.restart_chip)
+        p_next = make_port(far_adr)         # code[idx + 2], or code[restart_chip + 1]
+
+        w_prev = Signal(word_bits, reset=init[code_len_reset - 1])
+        w_cur  = Signal(word_bits, reset=init[0])
+        w_next = Signal(word_bits, reset=init[1])
+        # Address the far port reads while the code runs: two chips ahead, i.e.
+        # the word the window needs after the next advance.
+        idx_far = Signal(max=max_code_length, reset=2 % code_len_reset)
+        self.comb += far_adr.eq(Mux(self.restart, r_next, idx_far))
+
+        # Code NCO: fractional accumulator + chip index with mod-code_length wrap.
+        acc_next = Signal(frac_bits + 1)
+        self.comb += acc_next.eq(self.code_frac + self.code_step)
+        # epoch is COMBINATIONAL and aligned with the wrapping strobe (the sample
+        # that completes the last chip -> 0). It must coincide with `stb` because
+        # consumers sample it on `stb` cycles, and `stb` is sparse on hardware
+        # (one pulse every fs/sys_clk cycles) -- a registered epoch would land
+        # on a non-stb cycle and be missed.
+        self.comb += self.epoch.eq(
+            self.stb & ~self.restart & acc_next[frac_bits] & at_last)
+
+        # The advance that moves the chip window on, named once: `chip_index`,
+        # the window and `idx_far` all move together on it.
+        chip_adv = Signal()
+        self.comb += chip_adv.eq(self.stb & acc_next[frac_bits])
+
+        # The state one clock from now. Everything the taps look at --
+        # the fractional phase and the three-chip window -- is a register, so
+        # what each tap reads can be worked out a cycle in advance and
+        # registered too. That is what the per-tap logic below does, and it is
+        # why none of this arithmetic sits in front of the correlator's DSP.
+        # `nf` deliberately does NOT depend on `stb`. Everything downstream of it
+        # is the deep part -- a 26-bit phase add and the sub-chip multiply -- and
+        # `stb` arrives late (it is the RX strobe, gated by `control.enable`,
+        # routed across the bank), so putting it in front of that chain cost
+        # 1.733 ns. Instead `stb` gates the *registers* at the far end: when no
+        # sample is strobed they simply hold, which is the same answer because
+        # `code_frac` holds too.
+        nf = Signal(frac_bits)                     # code_frac after the next load
+        nw_prev = Signal(word_bits)                # ... and the window
+        nw_cur  = Signal(word_bits)
+        nw_next = Signal(word_bits)
+        self.comb += [
+            If(self.restart,
+                nf.eq(self.restart_frac),
+                nw_prev.eq(p_prev.dat_r),
+                nw_cur.eq(p_cur.dat_r),
+                nw_next.eq(p_next.dat_r),
+            ).Else(
+                nf.eq(acc_next[:frac_bits]),
+                If(chip_adv,
+                    nw_prev.eq(w_cur), nw_cur.eq(w_next), nw_next.eq(p_next.dat_r),
+                ).Else(
+                    nw_prev.eq(w_prev), nw_cur.eq(w_cur), nw_next.eq(w_next),
+                ),
+            ),
+        ]
 
         # Subcarrier tables. Registers rather than a RAM: they are at most
         # `max_subchips` entries and every tap reads a *different* index in the
@@ -286,41 +421,63 @@ class CodeReplica(LiteXModule):
 
         # Per-tap replica: pick the chip the offset lands on, then shape it with
         # the sub-chip the offset's fraction lands in.
+        #
+        # Both choices -- *which* chip word (`word_r`) and *which* sub-chip of it
+        # (`k_r`) -- are REGISTERS, computed from the phase and window the taps
+        # will see next cycle rather than the ones they see now. Only the two
+        # amplitude muxes are left in front of the correlator DSP.
+        #
+        # This is the second half of the timing fix (see the registered chip
+        # window above). `floor(sub * subchips)` is a 24x4 multiply whose *top*
+        # bits are wanted, so every carry in it is on the path; combinationally
+        # it put the fractional-phase adder, that multiply, the subcarrier table
+        # mux and the sign mux between `code_frac` and a DSP48E1 `B` pin --
+        # 8.493 ns of a 8.000 ns cycle. Computing it one cycle ahead costs no
+        # latency, because `code_frac` and the window are registers whose next
+        # value is already known this cycle.
+        #
+        # The one visible difference: a `tap_offset` or `subchips` write reaches
+        # the replica on the next strobe or `restart` rather than on the next
+        # cycle. Both are programmed before the arming `restart`, which is itself
+        # a cycle the registers below load on, so the first sample of an
+        # integration already has them.
         for t in range(num_taps):
-            phase = Signal((frac_bits + 2, True))   # code_frac + offset, signed
-            adv   = Signal()                        # landed on the next chip
-            ret   = Signal()                        # landed on the previous chip
-            sub   = Signal(frac_bits)               # fractional phase within it
-            word  = Signal(word_bits)
+            nphase = Signal((frac_bits + 2, True))  # next code_frac + offset
+            nadv   = Signal()                       # lands on the next chip
+            nret   = Signal()                       # lands on the previous chip
+            nsub   = Signal(frac_bits)              # fractional phase within it
+            nword  = Signal(word_bits)
+            word_r = Signal(word_bits, reset=init[0])
             self.comb += [
-                phase.eq(self.code_frac + self.tap_offset[t]),
-                adv.eq(phase >= (1 << frac_bits)),
-                ret.eq(phase < 0),
-                If(adv,
-                    sub.eq(phase - (1 << frac_bits)), word.eq(p_next.dat_r),
-                ).Elif(ret,
-                    sub.eq(phase + (1 << frac_bits)), word.eq(p_prev.dat_r),
+                nphase.eq(nf + self.tap_offset[t]),
+                nadv.eq(nphase >= (1 << frac_bits)),
+                nret.eq(nphase < 0),
+                If(nadv,
+                    nsub.eq(nphase - (1 << frac_bits)), nword.eq(nw_next),
+                ).Elif(nret,
+                    nsub.eq(nphase + (1 << frac_bits)), nword.eq(nw_prev),
                 ).Else(
-                    sub.eq(phase), word.eq(p_cur.dat_r),
+                    nsub.eq(nphase), nword.eq(nw_cur),
                 ),
             ]
+            self.sync += If(self.restart | self.stb, word_r.eq(nword))
             if max_subchips <= 1:
                 # No subcarrier: the replica is the chip, as it always was.
-                self.comb += self.replica[t].eq(Mux(word[0], 1, -1))
+                self.comb += self.replica[t].eq(Mux(word_r[0], 1, -1))
             else:
                 # floor(sub * subchips): the sub-chip the tap sits in. Computed
                 # from the *whole* fraction, not from its top bits, because the
                 # transitions of a P = 12 subcarrier are not on a dyadic grid
                 # and rounding them would put the replica one sub-chip out at
                 # some phases -- a plausible wrong answer, not an error.
-                prod = Signal(frac_bits + sub_bits)
-                k    = Signal(idx_bits)
-                amp  = Signal((replica_bits, True))
+                nprod = Signal(frac_bits + sub_bits)
+                k_r   = Signal(idx_bits)
+                amp   = Signal((replica_bits, True))
+                self.comb += nprod.eq(nsub * self.subchips)
+                self.sync += If(self.restart | self.stb, k_r.eq(nprod[frac_bits:]))
                 self.comb += [
-                    prod.eq(sub * self.subchips),
-                    k.eq(prod[frac_bits:]),
-                    amp.eq(Mux(word[1], lut_b[k], lut_a[k])),
-                    self.replica[t].eq(Mux(word[0], amp, -amp)),
+                    amp.eq(Mux(word_r[1], lut_b[k_r], lut_a[k_r])),
+                    self.replica[t].eq(Mux(word_r[0], amp, -amp)),
                 ]
 
         # An unevaluable replica shape. `subchips` has to index the table, and a
@@ -332,24 +489,43 @@ class CodeReplica(LiteXModule):
         bad += [self.tap_offset[t] == min_offset for t in range(num_taps)]
         self.comb += self.replica_unsupported.eq(Cat(*bad) != 0)
 
-        # Code NCO: fractional accumulator + chip index with mod-code_length wrap.
-        acc_next = Signal(frac_bits + 1)
-        self.comb += acc_next.eq(self.code_frac + self.code_step)
-        # epoch is COMBINATIONAL and aligned with the wrapping strobe (the sample
-        # that completes the last chip -> 0). It must coincide with `stb` because
-        # consumers sample it on `stb` cycles, and `stb` is sparse on hardware
-        # (one pulse every fs/sys_clk cycles) -- a registered epoch would land
-        # on a non-stb cycle and be missed.
-        self.comb += self.epoch.eq(
-            self.stb & ~self.restart & acc_next[frac_bits] & at_last)
         self.sync += [
             If(self.restart,
                 self.code_frac.eq(self.restart_frac),
                 self.chip_index.eq(self.restart_chip),
             ).Elif(self.stb,
                 self.code_frac.eq(acc_next[:frac_bits]),
-                If(acc_next[frac_bits],  # chip boundary crossed
+                If(chip_adv,  # chip boundary crossed
                     self.chip_index.eq(idx_next),
                 ),
+            ),
+        ]
+
+        # The registered code window, moved in lockstep with `chip_index` above
+        # so that (w_prev, w_cur, w_next) is always exactly
+        # (code[idx-1], code[idx], code[idx+1]) for the index the taps see this
+        # cycle -- no sample is ever read one chip late.
+        #
+        # A rebase reloads all three from the ports parked around `restart_chip`;
+        # an advance shifts them and pulls in the one genuinely new word from the
+        # far port, which has been addressed at `idx_far` (two chips ahead) since
+        # the previous advance.
+        #
+        # Two consequences, both of which the bank already arranges around: a
+        # `code_length` change moves the wrap-around word (code[last], seen by an
+        # early tap at chip 0) only from the next advance, and a `code_load` write
+        # is only visible once the index has moved past it. Both are committed by
+        # the arming `restart`, which reloads the whole window, and dumps are
+        # suppressed until then -- see bank.py.
+        self.sync += [
+            If(self.restart | chip_adv,
+                w_prev.eq(nw_prev),
+                w_cur.eq(nw_cur),
+                w_next.eq(nw_next),
+            ),
+            If(self.restart,
+                idx_far.eq(r_far),
+            ).Elif(chip_adv,
+                If(idx_far >= last, idx_far.eq(0)).Else(idx_far.eq(idx_far + 1)),
             ),
         ]

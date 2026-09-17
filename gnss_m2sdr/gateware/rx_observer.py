@@ -108,3 +108,53 @@ class RXSampleObserver(LiteXModule):
                 ),
                 self.ants_valid.eq(Mux(self.mode_1r1t, 1, num_ants)),
             ]
+
+
+class SampleStreamRegister(LiteXModule):
+    """One pipeline stage on the (samples, strobe, antenna count) bundle.
+
+    Purely a delay: every output is its input one sys_clk cycle later, and the
+    strobe moves with the samples it belongs to. The bank timestamps dumps from
+    its *own* free-running counter of the strobes it is handed, so delaying the
+    whole bundle together shifts nothing the host can observe -- no record, no
+    sample index and no code phase changes.
+
+    Why it exists is timing, and it is a SoC-level problem rather than a bank
+    one. `RXSampleObserver.sample_stb` is `rx_stream.valid & rx_stream.ready`,
+    and on the real SoC `ready` comes combinationally out of LitePCIe's DMA0
+    writer -- a FIFO-level comparator and its carry chain. That strobe selects
+    the observer's output mux, which lands straight on the A input of the
+    carrier wipe-off DSP48E1, whose A-to-PCOUT cascade is another 2.97 ns. The
+    first five-tap build had that whole chain in one 8 ns cycle and missed by
+    1.288 ns once the code-replica path was fixed (PR #34 build at
+    max_code_length = 1023). Registering the bundle here cuts it in two: the
+    DMA's readiness logic ends at these flops, and the DSP starts from them.
+
+    It belongs between the observer and the bank, not inside either: the
+    observer's `ready` input is the DMA's, and the bank must stay a module whose
+    inputs are "a sample and a strobe", whenever they arrive.
+    """
+    def __init__(self, num_ants=1, sample_bits=16):
+        assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
+        self.sample_i_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.sample_q_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.sample_i   = self.sample_i_ants[0]
+        self.sample_q   = self.sample_q_ants[0]
+        self.sample_stb = Signal()
+        self.ants_valid = Signal(max=num_ants + 1, reset=num_ants)
+
+        self.out_i_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.out_q_ants = [Signal((sample_bits, True)) for _ in range(num_ants)]
+        self.out_i      = self.out_i_ants[0]
+        self.out_q      = self.out_q_ants[0]
+        self.out_stb    = Signal()
+        self.out_ants_valid = Signal(max=num_ants + 1, reset=num_ants)
+
+        # # #
+
+        self.sync += [
+            self.out_stb.eq(self.sample_stb),
+            self.out_ants_valid.eq(self.ants_valid),
+            *[self.out_i_ants[n].eq(self.sample_i_ants[n]) for n in range(num_ants)],
+            *[self.out_q_ants[n].eq(self.sample_q_ants[n]) for n in range(num_ants)],
+        ]
