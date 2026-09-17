@@ -69,7 +69,11 @@ three-address window rather than owning a copy each.
 
 Synthesis and timing numbers are deliberately **not** quoted here: this
 repository's CI is board-free and has no Vivado, so any figure would be an
-estimate dressed as a measurement. Reproduce them with
+estimate dressed as a measurement. Measured figures for a real build live in
+[gateware builds](gateware_builds.md) — including the finding that a
+4-channel / 10230-chip / five-tap build **misses timing by 2.875 ns**, on a
+critical path that runs straight through the asynchronous LUTRAM read this
+section describes. Reproduce them with
 
 ```
 python build.py --channels 4 --max-code-length 10230 --build
