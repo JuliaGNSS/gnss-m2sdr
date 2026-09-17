@@ -518,8 +518,22 @@ Both are in the **sample and accumulate path — not the replica**, which is whe
 that path is §5.2's registered sample bundle (`SampleStreamRegister`, and the
 rewiring of `soc.py` around it), and that rewiring has no SoC-level test.
 
+**The prime suspect is our own change.** `SampleStreamRegister` and the `soc.py`
+rewiring came in with §5.2 as one of the four pipeline stages; the only v3 image
+ever flashed carried them, and the §2 build without them was never put on
+silicon. So "the timing fix introduced the correlation bug" is a live
+hypothesis, and with the replica path cleared it is the leading one. That
+rewiring had no test either; it now has one (`TestObserverRegisterBankChain`),
+and the bank produces bit-identical records with and without the stage in both
+AD9361 channel modes, with and without DMA0 back-pressure. Correct in
+simulation — which does not clear it, because every check in this section is
+simulation and a synthesis-level fault survives all of them.
+
 **The next measurements, cheapest first.** The first two are single CSR reads
-and settle it:
+and settle it — but note that **they need the v3 image reflashed**. The
+rolled-back 2026-07-29 gateware has `integrated_samples` too, and reading it
+there measures the *working* build: a useful control, not the measurement.
+There is no way to diagnose the failing build without putting it back on.
 
 1. **Read `integrated_samples` on a dump.** ~4000 ⇒ the integration window is
    right and the samples are wrong; far more ⇒ the accumulator is not being
