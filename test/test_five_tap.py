@@ -113,7 +113,7 @@ def software_channel_n(words, shape, samples, code_step, tap_offsets, carrier_fw
 
 
 def run_channel_n(words, shape, samples, code_step, tap_offsets, carrier_fw,
-                  num_taps=TAPS_VEPL, n_ants=1):
+                  num_taps=TAPS_VEPL, n_ants=1, phase_chip=0, phase_frac=0):
     """Drive a TrackingChannel with a configured sub-chip replica."""
     keys = acc_signals(num_taps)
     dut = TrackingChannel(code_frac_bits=FRAC, carrier_phase_bits=PHASE_BITS,
@@ -141,6 +141,8 @@ def run_channel_n(words, shape, samples, code_step, tap_offsets, carrier_fw,
         yield dut.taps_cfg.eq(num_taps)
         yield dut.carrier_fw.eq(carrier_fw)
         yield dut.carrier_phase_in.eq(0)
+        yield dut.code_phase_chip.eq(phase_chip)
+        yield dut.code_phase_frac.eq(phase_frac)
         yield dut.carrier_set.eq(1)
         yield dut.restart.eq(1)
         yield
@@ -253,6 +255,63 @@ class TestFiveTapAccumulators(unittest.TestCase):
         for a, b in zip(five, three):
             self.assertEqual({k: a["ants"][0][k] for k in acc_signals(TAPS_EPL)},
                              b["ants"][0])
+
+
+class TestBOCAcquisitionHandover(unittest.TestCase):
+    """Handing a BOC channel over onto a side peak, and seeing that it is one.
+
+    Acquisition hands over a measured code phase. For a BOC signal the search
+    surface has secondary peaks half a chip either side of the true one, so a
+    handover can legitimately land on the wrong lobe -- and a three-tap channel
+    then reports a perfectly healthy-looking lock. The channel has to (a) start
+    on exactly the phase it was given, subcarrier and all, and (b) make the
+    outer taps say which lobe it is on.
+    """
+
+    LENGTH, SPC = 64, 12         # 12 samples/chip: half a chip is 6 samples
+
+    def _dump(self, offset_chips, shifts):
+        shape = replica_shape("BOCsin", m=1)
+        words = pseudo_code(self.LENGTH)
+        step  = (1 << FRAC) // self.SPC
+        n     = 2 * self.SPC * self.LENGTH + 8
+        # The satellite is at code phase 0; the handover starts the replica at
+        # `offset_chips`, which is what an acquisition off by one lobe produces.
+        sig   = bpsk_boc_signal(words, shape, n, step, 0, amp=200)
+        chip  = int(offset_chips) % self.LENGTH
+        frac  = int(round((offset_chips - int(offset_chips)) * (1 << FRAC)))
+        got = run_channel_n(words, shape, [sig], step,
+                            [s * step for s in shifts], 0, num_taps=TAPS_VEPL,
+                            phase_chip=chip, phase_frac=frac)
+        self.assertTrue(got)
+        return got[-1]["ants"][0]
+
+    def test_a_handover_onto_the_main_peak_locks(self):
+        d = self._dump(0.0, (7, 1, 0, -1, -7))
+        self.assertGreater(d["ip"], 0)
+        self.assertGreater(abs(d["ip"]), abs(d["ive"]))
+        self.assertGreater(abs(d["ip"]), abs(d["ivl"]))
+
+    def test_a_handover_half_a_chip_out_lands_on_a_side_peak(self):
+        # BOC(1,1): R(+/-0.5) = -0.5 R(0). The prompt is *negative* and about
+        # half the size -- a lock a three-tap channel cannot distinguish from a
+        # weaker satellite.
+        main = self._dump(0.0, (7, 1, 0, -1, -7))
+        side = self._dump(0.5, (7, 1, 0, -1, -7))
+        self.assertLess(side["ip"], 0)
+        self.assertAlmostEqual(side["ip"] / main["ip"], -0.5, delta=0.08)
+        # The outer tap sitting near the true peak beats the prompt, which is
+        # the information the fifth and first taps were added for.
+        self.assertGreater(max(abs(side["ive"]), abs(side["ivl"])), abs(side["ip"]))
+
+    def test_the_replica_starts_on_the_phase_it_was_given(self):
+        # BOC(1,1)'s R(tau) = 1 - 3*tau over the first half chip, so a handover a
+        # quarter chip out must read 0.25 of the aligned prompt. A replica that
+        # reset its subcarrier on the restart instead of following the loaded
+        # fraction would read the full 1.0 and look like a perfect lock.
+        quarter = self._dump(0.25, (7, 1, 0, -1, -7))
+        main    = self._dump(0.0, (7, 1, 0, -1, -7))
+        self.assertAlmostEqual(quarter["ip"] / main["ip"], 0.25, delta=0.05)
 
 
 class TestFiveTapRecords(unittest.TestCase):

@@ -80,7 +80,8 @@ def code_init(key, shape):
 
 
 def run_replica(shape, init, tap_shifts, n_samples, code_step=CODE_STEP,
-                frac_bits=FRAC, max_subchips=MAX_SUB):
+                frac_bits=FRAC, max_subchips=MAX_SUB,
+                restart_chip=0, restart_frac=0):
     """Capture every tap of a configured CodeReplica for `n_samples` samples.
 
     `tap_shifts` are whole input samples, earliest first (the gateware's own
@@ -108,6 +109,8 @@ def run_replica(shape, init, tap_shifts, n_samples, code_step=CODE_STEP,
         yield dut.code_step.eq(code_step)
         for t, shift in enumerate(tap_shifts):
             yield dut.tap_offset[t].eq(shift * code_step)
+        yield dut.restart_chip.eq(restart_chip)
+        yield dut.restart_frac.eq(restart_frac)
         yield dut.restart.eq(1)
         yield
         yield dut.restart.eq(0)
@@ -282,6 +285,51 @@ class TestTapPlacement(unittest.TestCase):
         self.assertEqual(five[1], three[0])
         self.assertEqual(five[2], three[1])
         self.assertEqual(five[3], three[2])
+
+
+class TestAcquisitionHandover(unittest.TestCase):
+    """A handover lands on the phase the CPU measured, subcarrier included.
+
+    This is the reason the TMBOC select bit lives beside its chip in the code RAM
+    rather than in a counter: a counter has to be seeded, and a seed that is one
+    position out puts four chips in every 33 on the wrong subcarrier -- which
+    correlates, just not to the satellite. Here the replica is restarted onto an
+    arbitrary chip *and* fraction and compared against GNSSSignals from that
+    phase onward.
+    """
+
+    # Sample indices whose phases are used as handover targets. 1 is a whole
+    # sub-chip in, 7 lands mid-sub-chip, 1301 is past a code wrap.
+    TARGETS = (1, 7, 1301)
+
+    def _handover(self, key, k0):
+        shape = shape_for(key)
+        init  = code_init(key, shape)
+        phase = (k0 * CODE_STEP) % (NCHIP << FRAC)
+        chip  = phase >> FRAC
+        frac  = phase & ((1 << FRAC) - 1)
+        n     = 200
+        taps  = run_replica(shape, init, [0, 0, 0], n,
+                            restart_chip=chip, restart_frac=frac)
+        want  = golden_signal(key)["replica"]
+        amp   = shape.code_amplitude
+        tol   = CBOC_TOL if shape.kind == "CBOC" else 0.0
+        for k in range(n):
+            self.assertLessEqual(abs(taps[0][k] / amp - want[k0 + k]), tol,
+                                 f"{key} handover to sample {k0}, sample {k}")
+
+    def test_cboc_handover(self):
+        for k0 in self.TARGETS:
+            with self.subTest(k0=k0):
+                self._handover("GalileoE1B_prn1", k0)
+
+    def test_tmboc_handover(self):
+        for k0 in self.TARGETS:
+            with self.subTest(k0=k0):
+                self._handover("GPSL1C_P_prn1", k0)
+
+    def test_boc11_handover(self):
+        self._handover("GalileoE1B_BOC11_prn1", self.TARGETS[1])
 
 
 class TestReplicaShapeRefusals(unittest.TestCase):
