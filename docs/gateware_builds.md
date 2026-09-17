@@ -631,6 +631,143 @@ not correlate (§5.6c above), so there would be nothing to see. **Arming a chann
 was not reached** either — two accessor calls in the probe failed on the probe's
 own scoping mistakes, and the rollback took priority over fixing them.
 
+### 5.6e The clamp that was lowered to an unsigned compare
+
+§5.6c isolated the fault to the multiply/accumulate/saturate stage. It is in
+none of the places that were searched: not the RTL's meaning, not Migen, not
+synthesis, but **the Verilog the build writes**.
+
+`litex/gen/fhdl/expression.py::_generate_constant` formats a negative constant
+as `"-" + nbits + "'" + hex(abs(value))` and never writes the `'s` signedness
+marker. The saturating accumulator's lower bound therefore came out as
+
+```verilog
+if ((trackingchannel_raw0 > $signed({1'd0, 31'h7fffffff})))   // upper: signed
+if ((trackingchannel_raw0 <  -32'h80000000))                  // lower: UNSIGNED
+```
+
+`32'h80000000` is an unsigned literal and unary minus keeps it unsigned. Verilog
+evaluates a relational expression as unsigned whenever *either* operand is, so
+`raw` — a signed sum — was reinterpreted as unsigned and **every positive
+partial sum compared "less than" the negative rail**. The accumulator was
+clamped to −2³¹ on the first sample of every integration.
+
+Proven rather than argued, in Vivado's own xsim:
+
+```
+raw = 40000000     emitted (raw < -32'h80000000) = 1    signed compare = 0
+raw = -40000000    emitted = 0
+raw = 2147483647   emitted = 1
+```
+
+and running the pre-fix RTL through LiteX's converter reproduces the flashed
+bitstream's line byte for byte, ten times — one per tap per I/Q.
+
+**Why the board-free suite could never see it.** The tests convert with
+`migen.fhdl.verilog`, which renders the same constant as `32'sd2147483648` —
+signed, two's complement, correct. The build converts with
+`litex.gen.fhdl.verilog`. *The suite and the bitstream were never produced by
+the same backend*, so no amount of simulation could have found this.
+
+**The fix.** Both magnitude comparisons are replaced by the standard range test:
+a two's-complement value fits in `accum_bits` exactly when every bit at or above
+the sign position equals the sign bit. That is an equality on unsigned slices,
+so no signed literal exists for any backend to render wrongly — and it is
+cheaper, 25 395 LUTs against 25 550, two 34-bit comparators traded for a few.
+
+`test/test_verilog_lowering.py` checks both backends: that the accumulate sum
+never meets a relational operator at all (the shape is what is dangerous, since
+how a constant renders is a backend detail), and directly that LiteX's output
+carries no negative literal in a comparison. Six of its tests fail against the
+pre-fix code.
+
+### 5.6f What the fix changed on silicon — and what it did not
+
+Built at `--timing-effort max` (WNS **+0.012 ns**, TNS 0.000, 0 of 109 826
+endpoints; `high` missed at −0.070 with 24 failing, 21 of them in litex_m2sdr's
+own AD9361 block-floating-point comparator). Flashed 2026-09-17 19:57.
+
+| | broken build | fixed build |
+|---|---|---|
+| `dump_saturated` | 1 on every dump | **0 on every dump** |
+| `gnss_saturation` | `0xf` (all four channels) | **`0x0`** |
+| `ip` | pinned at −2.147×10⁹ | ±10⁵–10⁶, noise-like |
+| `integrated_samples` | 4000 | 4000 |
+| dump stream | 11 lost-record gaps, 186 skipped epochs | **0 across every counter** |
+
+The clamp does exactly what it was meant to do. **The correlator still does not
+correlate.**
+
+Against a satellite Acquisition.jl measures at **53.5 dBHz** (PRN 29, −2200 Hz),
+a code-phase sweep of the FPGA channel at that Doppler gives:
+
+```
+peak/median = 5.9          (1 ms coherent at 53.5 dBHz predicts ~224)
+top bins:  692.5  855.0  921.0  397.0  650.0  611.0   -- scattered
+bins within 1 chip of the peak: some as low as 0.4x median
+```
+
+A real correlation peak is one to two chips wide, so every half-chip bin beside
+it must be elevated too. This one is a single isolated bin among noise. The
+sweep's own drift (code Doppler over 15 s ≈ 21 chips) would *move* a peak, not
+erase it, and the integration window is the correct 4000 samples.
+
+This also retro-explains the closed-loop run on the same image: channels arm,
+NCO words commit, the dump stream is perfectly clean — and C/N₀ reads `-Inf`,
+because there is no signal power in the records. (No position fix was expected
+regardless: the build has four channels, the link reserves one as its noise
+reference, and a fix needs four.)
+
+**So the clamp was masking a second fault, not causing it.** That is worth
+recording as a result: §5.6c's isolation was correct as far as it went, and the
+remaining question is now bounded to the same stage with the clamp eliminated.
+
+**Hypotheses for the second fault, in the order they should be tested.** None of
+these is demonstrated; this is where to start, not what is true.
+
+1. **The replica never reaches the DSP `B` input.** This was the original §5.6b
+   reading and the clamp bug does not rule it out. *Test:* the all-ones vs
+   all-zeros comparison is uninformative on this board because DMA0 is zero-mean
+   (I mean +0.07), so a constant replica integrates to ~0 either way. Give it a
+   DC term instead — an AD9361 DC-offset-correction setting, or an in-band CW —
+   and the two loads must come out equal and opposite.
+2. **The carrier wipe-off.** `i_bb`/`q_bb` are formed one cycle before the
+   replica multiply; if the carrier LUT or its phase is wrong the product is
+   destroyed without any symptom in the code NCO, which is separately confirmed
+   good (`dump_code_chip` 1022 every epoch). *Test:* set `carrier_freq` to 0 and
+   read a channel correlating against an all-ones code with a CW injected at the
+   LO — the accumulator should then follow the CW's amplitude.
+3. **Tap/replica alignment inside the two-stage pipeline.** `rep_r`, `epoch_r`
+   and `cphase_r` are registered on `sample_stb` while `i_bb`/`q_bb` are formed
+   from the same strobe; a one-cycle skew between the replica and the baseband
+   it multiplies would leave every counter healthy and destroy correlation.
+   *Test:* a bank-level simulation that drives a *known* modulated signal
+   (`bpsk_boc_signal` already exists in `test_five_tap.py`) through
+   `GNSSTracking` and asserts the prompt accumulator peaks at the right code
+   phase — the suite currently checks accumulator arithmetic against a software
+   model, but never that a real signal correlates.
+4. A CSR readback artefact is **ruled out**: the same values appear in the DMA1
+   record path through GNSSReceiver, which read `-Inf` C/N₀ independently.
+
+Hypothesis 3 is the one to do first: it needs no hardware, and the gap it names
+— no test anywhere asserts that a modulated input produces a correlation peak —
+is the same shape of hole as the `load_we` gap and this clamp.
+
+**Galileo E1B/E1C: untested.** This build carries what E1 needs — 4092-chip
+codes, five taps and the sub-chip machinery — and demonstrating a non-GPS-L1-C/A
+signal through the hardware correlator is the point of the whole exercise. It
+was not attempted, deliberately: there is nothing to learn from tracking E1
+through a correlator that does not correlate GPS L1 C/A, and a result there
+could only be noise. It stays untested rather than being inferred from the L1
+C/A work either way.
+
+**`--timing-effort max`.** Vivado is deterministic for a given netlist and
+directive set, so a build that misses by picoseconds cannot simply be run again
+— the directives have to change. `max` escalates the two passes that move a
+sub-100 ps setup miss: post-place phys_opt and routing both go to
+`AggressiveExplore`. On this design `high` gave −0.070 ns and `max` gave
++0.012 ns, on the same RTL.
+
 ### 5.7 What is on the board, and rolling back
 
 The identification in the first version of this page was wrong and it matters

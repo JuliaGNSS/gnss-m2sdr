@@ -282,18 +282,38 @@ class TrackingChannel(LiteXModule):
         sum_bits = max(accum_bits, prod_bits + replica_bits) + 1
 
         def sat_mac(acc_sig, sign, bb):
-            """acc + sign*bb clamped to accum_bits; returns (value, clamped)."""
+            """acc + sign*bb clamped to accum_bits; returns (value, clamped).
+
+            The range test is deliberately *not* written as `raw > acc_max` /
+            `raw < acc_min`. Migen renders a negative bound as an **unsigned**
+            Verilog literal (`-32'h80000000`), and Verilog evaluates a
+            relational expression as unsigned whenever either operand is -- so
+            `raw < -32'h80000000` reinterprets `raw` as unsigned and is *true
+            for every positive partial sum*, clamping it to the negative rail.
+            Migen's own simulator evaluates in Python ints and never sees it,
+            which is how it reached silicon; docs/gateware_builds.md 5.6e has
+            the measurement and the xsim proof.
+
+            Instead: a two's-complement value fits in `accum_bits` exactly when
+            every bit at or above the sign position equals the sign bit. That is
+            an equality test on plain unsigned slices, so there is no signed
+            literal for the lowering to get wrong, and it is the cheaper circuit
+            besides -- a few LUTs against two 34-bit comparators.
+            """
             raw = Signal((sum_bits, True))
             val = Signal((accum_bits, True))
             sat = Signal()
+            top  = raw[accum_bits - 1:]      # sign bit and everything above it
+            fits = Signal()
             self.comb += [
                 raw.eq(acc_sig + sign * bb),
-                If(raw > acc_max,
-                    val.eq(acc_max), sat.eq(1),
-                ).Elif(raw < acc_min,
+                fits.eq((top == 0) | (top == (1 << len(top)) - 1)),
+                If(fits,
+                    val.eq(raw),
+                ).Elif(raw[sum_bits - 1],    # the sum's real sign bit
                     val.eq(acc_min), sat.eq(1),
                 ).Else(
-                    val.eq(raw),
+                    val.eq(acc_max), sat.eq(1),
                 ),
             ]
             return val, sat
