@@ -343,11 +343,10 @@ with the thing that says whether a sample happened" is not.
 
 ```
 python build.py --channels 4 --num-ants 1 --max-code-length 4092 \
-                --taps 5 --max-subchips 12 --build
+                --taps 5 --max-subchips 12 --timing-effort high --build
 ```
 
-`gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12 --timing-effort high` —
-**timing closed**:
+`gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12` — **timing closed**:
 
 ```
 WNS(ns)   TNS(ns)  Failing  Total      WHS(ns)  THS(ns)  WPWS(ns)
