@@ -137,39 +137,68 @@ samples while DMA0 is draining. Run a continuous RX in the background:
 ./user/m2sdr_rx /dev/null &        # or the appropriate continuous-RX tool
 ```
 
-## 5. Acquire + observe a satellite (FPGA sliding-correlator)
+## 5. Acquire on the CPU, track on the FPGA
 
-```bash
-cd ~/gnss-m2sdr
-PYTHONPATH=. python3 -c "
-from software.m2sdr_csr import LiteXCSR
-from software.gnss_tracking import GNSSChannel, GNSSBank, acquire
-csr  = LiteXCSR('build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/csr.csv')
-fs   = 4_000_000
-bank = GNSSBank(csr); chan = GNSSChannel(csr, fs, index=0)
-best = acquire(chan, bank, prn=1, fs=fs)   # try PRNs known to be visible
-print(best)   # metric, doppler_hz, power, code_phase, sample_index, detected
-if best.detected:
-    print(f'PRN 1: {best.doppler_hz:+.0f} Hz, code phase {best.code_phase:.2f} chips'
-          f' at sample {best.sample_index} (peak/median {best.metric:.1f})')
-"
+**Acquisition belongs on the host.** The FPGA does downconversion and
+correlation for *tracking*, and the loop filters run CPU-side too. Do not sweep
+for satellites through the FPGA correlator: `software/gnss_tracking.py:acquire()`
+scores peak/median of prompt power, whose noise baseline is the same order as a
+real 1 ms peak, and measured against Acquisition.jl it fires on every PRN at
+every Doppler (see [gateware builds](gateware_builds.md) 5.7b for the numbers).
+
+### 5.1 CPU-acquire from the raw DMA0 stream
+
+Capture and run Acquisition.jl -- the project's own, already a GNSSM2SDR.jl
+dependency. The capture is sc16, 2T2R, **8 bytes per sample instant**, with RX1
+in the first two `Int16` of each 4-word group:
+
+```julia
+raw   = reinterpret(Int16, read(CAPTURE_FILE))
+words = reshape(view(raw, 1:4(length(raw) ÷ 4)), 4, :)
+signal = ComplexF32.(Float32.(view(words, 1, :)), Float32.(view(words, 2, :)))
+
+results = acquire(GPSL1CA(), signal, 4e6Hz, collect(1:32);
+                  min_doppler_coverage = 50_000.0Hz,
+                  num_coherently_integrated_code_periods = 10,
+                  num_noncoherent_accumulations = 10)
 ```
 
-`code_phase` is in chips at the global sample index `sample_index` (the bank's
-free-running sample counter, see `record_format.py`) -- both halves are needed
-to start a tracking channel, and `best.code_phase_at(n, fs)` propagates the
-phase to any other sample index. `detected` is the `detect_metric` threshold
-already applied.
+`min_doppler_coverage` of 50 kHz is not optional. The device TCXO is poor -- 1
+ppm at L1 is 1.575 kHz -- and satellites have been observed at -8.5 kHz, outside
+any window sized for satellite motion alone.
 
-A clear prompt-power peak at a particular Doppler for a visible PRN is the
-hardware-in-the-loop validation: the on-FPGA carrier/code NCOs + correlators
-locked onto a real GPS satellite.
+Read the result as a distribution, not a threshold: the noise floor is tight
+(32 PRNs with a median-absolute-deviation of 0.25-0.42 dBHz in measured
+captures), and a satellite stands 6-20 dB clear of it. If most of the
+constellation "detects", the threshold is in the noise.
 
-## 6. Closed-loop tracking (next)
+### 5.2 Hand over to an FPGA channel and close the loop
 
-Hold `carrier_freq`/`code_freq` at the acquired peak, then run the DLL/FLL/PLL
-loop on the host: each dump -> discriminators -> NCO updates, and feed
-`CorrelatorOutput` into Tracking.jl via `append_correlator_output!` +
-`estimate_dopplers_and_filter_prompt!`. The lossless DMA1 record path
-(record_format.py) replaces CSR polling once the kernel driver exposes the 2nd
-DMA channel.
+`~/hwloop/closed_loop_multi.jl` on orin2 does all three steps and is the
+reference: CPU-acquire, sweep the code phase to refine the handover, commit it,
+then feed every FPGA dump into Tracking.jl. A good run holds prompt power tens
+of times the noise floor with a carrier Doppler that agrees with the CPU
+estimate:
+
+```
+   t(s)   PRN19 |P|^2/fl  carr(Hz)   PRN15 |P|^2/fl  carr(Hz)
+    1.0            29.11   -1596.6            26.19   -5221.8
+   20.0            27.83   -1591.9            53.21   -5237.3
+   39.0            25.62   -1614.2            53.64   -5260.5
+```
+
+A channel that reads ~1x floor with a carrier running away by tens of kHz never
+locked -- that is what a failed handover looks like, and it is unambiguous.
+
+**DMA0 must keep draining throughout.** The tracking bank is a non-intrusive
+observer on the RX stream, so it sees nothing unless something is reading DMA0,
+and `m2sdr_record`'s byte-count argument is a hard limit that silently ends the
+capture when reached.
+
+## 6. Next: the lossless record path
+
+Step 5 polls the correlator CSRs, and that readback is lossy -- a dump can be
+replaced before it is read, which is why a 40 s run folds ~40 000 dumps and
+skips ~19 700 of them. The DMA1 record path (`record_format.py`) has neither
+problem and replaces CSR polling once the kernel driver exposes the second DMA
+channel. It has not yet been exercised on hardware.

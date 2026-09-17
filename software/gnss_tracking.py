@@ -685,13 +685,27 @@ class GNSSBank:
 
 def acquire(chan, bank, prn, fs, doppler_range=5000.0, doppler_step=500.0,
             slide_chips=800.0, dwell=1.4, detect_metric=8.0, verbose=True):
-    """Sliding-correlator acquisition of `prn` (validated on hardware, PRN 24
-    detected live with peak/median >> 100).
+    """Sliding-correlator sweep through the FPGA correlator. **Do not use this
+    to decide whether a satellite is present.**
+
+    Acquisition belongs on the CPU: capture the raw DMA0 stream and run
+    Acquisition.jl over it (>= 50 kHz Doppler coverage -- the device TCXO is
+    poor, 1 ppm at L1 is 1.575 kHz), then hand the code phase and Doppler to a
+    channel here. The FPGA does downconversion and correlation for *tracking*.
+
+    This function cannot tell signal from noise, measured against Acquisition.jl
+    on the same sky (docs/gateware_builds.md 5.7b): real PRNs scored a median
+    metric of 26.65 against 24.47 for known-floor PRNs, a separation of 1.09x;
+    and the strongest satellite in the sky (59.2 dBHz, true Doppler -6000 Hz)
+    scored above `detect_metric` at *all 33* bins of a +/-8 kHz sweep, peaking
+    11.5 kHz away from the truth. A PRN that is not there scores the same. It is
+    kept because the code-phase sweep it performs is still how a handover is
+    refined once the CPU has said which PRN and roughly which Doppler.
 
     For each trial Doppler, offset the code rate by `slide_chips` chips/s so the
     code phase slides through all 1023 chips within `dwell`; collect prompt
-    power over the dumps and score peak/median (noise ~5-10; a live PRN gives
-    tens to hundreds).
+    power over the dumps and score peak/median. The noise baseline of that ratio
+    is the same order as a real 1 ms peak, which is the whole problem.
 
     Returns an AcquisitionResult: metric, Doppler, peak power, *and* the code
     phase of the peak plus the global sample index it applies to, which is what
