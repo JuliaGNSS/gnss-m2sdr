@@ -38,8 +38,35 @@ sudo rmmod litepcie 2>/dev/null; sudo ./kernel/init.sh   # rescan/reload after r
 ./user/m2sdr_util info                                   # expect the new SoC identifier
 ```
 
-Recovery: the golden/fallback image at offset 0x0 boots if the operational
-image is bad; reflash a known-good `.bin` to recover.
+### Recovery / rollback
+
+`flash.py` writes the **operational** multiboot slot at `0x00800000` only. The
+golden/fallback image at offset `0x0` is untouched by a normal flash and still
+boots if the operational image is bad, so a bad operational image cannot brick
+the board. (Verified against `litex_m2sdr_platform.py`: the fallback bitstream
+is built with `BITSTREAM.CONFIG.NEXT_CONFIG_ADDR 0x00800000` and written to `0x0`,
+the operational one with `CONFIGFALLBACK Enable` and a watchdog `TIMER_CFG`.)
+
+**Before flashing anything, confirm the rollback image is present on the
+board host**, and note its checksum so you know it is the known-good one:
+
+```bash
+md5sum ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1/gateware/gnss_m2sdr_m2_x1_ch4_ant1.bin
+# 1fec0c83f9fb63a6252014897fad396f  = RELEASE_ch4_ant1_timing_clean (v1, WNS +0.005 ns)
+```
+
+To restore that known-good v1 image:
+
+```bash
+cd ~/litex_m2sdr/litex_m2sdr/software
+printf 'yes\n' | ./flash.py ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1/gateware/gnss_m2sdr_m2_x1_ch4_ant1.bin
+sudo rmmod litepcie 2>/dev/null; sudo ./kernel/init.sh
+./user/m2sdr_util info        # expect the 2026-07-29 SoC identifier back
+```
+
+**Do not flash a bitstream that misses timing.** See
+[gateware builds](gateware_builds.md): a design that fails setup does not
+degrade gracefully, it produces non-deterministically wrong correlator results.
 
 ## 3. Configure the RF front-end for GPS L1
 

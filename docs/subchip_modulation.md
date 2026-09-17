@@ -243,20 +243,27 @@ them.
 
 ## 6. Cost, throughput and numerical range
 
-This repository's CI is board-free and has no Vivado, so there are **no measured
-utilisation or timing figures here**. What follows is the analytic cost and the
-command that produces a real report:
+This repository's CI is board-free and has no Vivado, so the analytic cost below
+is what the *design* predicts. That build has since been run on Vivado 2024.1,
+and the measured result is recorded in
+[gateware builds](gateware_builds.md): **it does not close timing.** The
+analytic cost is still the right model for sizing; it simply never claimed a
+clock period, and the measured critical path is the thing to fix before this
+configuration can be flashed.
 
 ```
 python build.py --channels 4 --num-ants 2 --max-code-length 10230 \
                 --taps 5 --max-subchips 12 --build
 ```
 
-and record the utilisation report against the build name, which now carries the
-tap count and sub-chip depth
-(`gnss_m2sdr_m2_x1_ch4_ant2_code10230_tap5_sub12`). No such build has been run,
-so nothing about place-and-route, timing closure or real device occupancy is
-claimed.
+Build `gnss_m2sdr_m2_x1_ch4_ant2_code10230_tap5_sub12`, XC7A200T-3, Vivado
+2024.1: routes cleanly (0 failed nets) at 24.8% LUT / 15.1% DSP / 13.2% BRAM,
+but post-route **WNS = -2.875 ns against an 8 ns sys_clk**, 18 685 of 167 097
+endpoints failing. The critical path runs from the runtime `code_length`
+register through the code-phase wrap, the `max_code_length`-deep distributed-RAM
+read and into the replica multiply — 17 logic levels, unpipelined. See
+[gateware builds](gateware_builds.md) for the full numbers, the per-clock
+breakdown and the path listing.
 
 **Code memory**, per channel: `3 × word_bits × max_code_length` bits, where
 `word_bits` is 1 for a `--max-subchips 1` build and 2 once the subcarrier-select
