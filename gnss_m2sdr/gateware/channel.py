@@ -103,7 +103,8 @@ class TrackingChannel(LiteXModule):
                  carrier_lut_addr_bits=8, carrier_amp_bits=8,
                  code_frac_bits=24, accum_bits=32,
                  max_code_length=CA_CODE_LENGTH, num_ants=1, code_init=None,
-                 num_taps=TAPS_EPL, max_subchips=1, replica_bits=None):
+                 num_taps=TAPS_EPL, max_subchips=1, replica_bits=None,
+                 staged_length=False):
         assert 1 <= num_ants <= N_ANTS_MAX, f"1..{N_ANTS_MAX} antennas"
         self.max_code_length = max_code_length
         self.num_taps        = num_taps
@@ -134,6 +135,10 @@ class TrackingChannel(LiteXModule):
         self.code_step     = Signal(code_frac_bits + 1)
         self.code_length   = Signal(bits_for(max_code_length),
                                     reset=min(CA_CODE_LENGTH, max_code_length))
+        # The length the next `restart` wraps with. The bank drives it from the
+        # staged CSR; left alone it follows `code_length` (see code_replica.py).
+        self.restart_length = Signal(bits_for(max_code_length),
+                                     reset=min(CA_CODE_LENGTH, max_code_length))
         # Sub-chips per chip of the replica in force (1 = plain BPSK).
         self.subchips      = Signal(bits_for(max_subchips), reset=1)
         # One signed tap offset per tap, earliest first, in fixed-point chips.
@@ -190,7 +195,8 @@ class TrackingChannel(LiteXModule):
                                              code_init=code_init,
                                              num_taps=num_taps,
                                              max_subchips=max_subchips,
-                                             replica_bits=replica_bits)
+                                             replica_bits=replica_bits,
+                                             staged_length=staged_length)
         replica_bits = code.replica_bits
         # An out-of-range step still drives the NCO with its low bits (the
         # replica keeps running at *some* rate rather than freezing), but every
@@ -215,6 +221,8 @@ class TrackingChannel(LiteXModule):
             code.restart_chip.eq(self.code_phase_chip),
             code.restart_frac.eq(self.code_phase_frac),
         ]
+        if staged_length:
+            self.comb += code.restart_length.eq(self.restart_length)
 
         # Two-stage pipeline (RFIC samples are many sys cycles apart, so extra
         # latency is free and it keeps the multiply and the accumulate off the

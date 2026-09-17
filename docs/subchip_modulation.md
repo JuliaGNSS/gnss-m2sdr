@@ -244,12 +244,10 @@ them.
 ## 6. Cost, throughput and numerical range
 
 This repository's CI is board-free and has no Vivado, so the analytic cost below
-is what the *design* predicts. That build has since been run on Vivado 2024.1,
-and the measured result is recorded in
-[gateware builds](gateware_builds.md): **it does not close timing.** The
-analytic cost is still the right model for sizing; it simply never claimed a
-clock period, and the measured critical path is the thing to fix before this
-configuration can be flashed.
+is what the *design* predicts. The build has since been run on Vivado 2024.1 and
+the measured numbers live in [gateware builds](gateware_builds.md). The analytic
+cost is the right model for sizing; what it never claimed was a clock period,
+and that turned out to be the thing that mattered.
 
 ```
 python build.py --channels 4 --num-ants 2 --max-code-length 10230 \
@@ -257,13 +255,16 @@ python build.py --channels 4 --num-ants 2 --max-code-length 10230 \
 ```
 
 Build `gnss_m2sdr_m2_x1_ch4_ant2_code10230_tap5_sub12`, XC7A200T-3, Vivado
-2024.1: routes cleanly (0 failed nets) at 24.8% LUT / 15.1% DSP / 13.2% BRAM,
-but post-route **WNS = -2.875 ns against an 8 ns sys_clk**, 18 685 of 167 097
-endpoints failing. The critical path runs from the runtime `code_length`
-register through the code-phase wrap, the `max_code_length`-deep distributed-RAM
-read and into the replica multiply — 17 logic levels, unpipelined. See
-[gateware builds](gateware_builds.md) for the full numbers, the per-clock
-breakdown and the path listing.
+2024.1. As first built it routed cleanly (0 failed nets) at 24.8% LUT / 15.1%
+DSP / 13.2% BRAM but missed setup by **2.875 ns against an 8 ns sys_clk**, on a
+path running from the runtime `code_length` register through the code-phase
+wrap, the `max_code_length`-deep distributed-RAM read and into the replica
+multiply — 17 logic levels, unpipelined. The replica is now pipelined (the chip
+window and the tap chip/sub-chip selection are registers, at no cost in
+latency); [gateware builds](gateware_builds.md) §5 has what changed and the
+numbers it closed at. **It has not been shown to work on hardware**: §5.6b
+records a flash of that build in which the correlator output was independent of
+the code RAM contents.
 
 **Code memory**, per channel: `3 × word_bits × max_code_length` bits, where
 `word_bits` is 1 for a `--max-subchips 1` build and 2 once the subcarrier-select

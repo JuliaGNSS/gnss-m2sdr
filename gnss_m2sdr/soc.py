@@ -113,7 +113,9 @@ class GNSSSoC(BaseSoC):
 
     def add_rx_datapath_processing(self, rx_stream):
         from gnss_m2sdr.gateware.bank import GNSSTracking
-        from gnss_m2sdr.gateware.rx_observer import RXSampleObserver
+        from gnss_m2sdr.gateware.rx_observer import (
+            RXSampleObserver, SampleStreamRegister,
+        )
         self.gnss = GNSSTracking(
             n_channels     = self._gnss_channels,
             prns           = self._gnss_prns,
@@ -133,16 +135,33 @@ class GNSSSoC(BaseSoC):
         # (default) and DMA0 draining.
         self.gnss_rx = RXSampleObserver(data_width=len(rx_stream.data),
                                         num_ants=self._gnss_num_ants)
+        # One pipeline stage between the observer and the bank. `rx_stream.ready`
+        # is LitePCIe's DMA0 writer saying it has room, which is a FIFO-level
+        # comparator and its carry chain; it gates the observer's output mux,
+        # which feeds the carrier wipe-off DSP48E1 directly. Left combinational
+        # that is one 8 ns cycle from a FIFO level to a DSP cascade output, and
+        # it does not make it (see SampleStreamRegister). The stage is a pure
+        # delay of the whole bundle -- samples, strobe and antenna count together
+        # -- and the bank counts the strobes it is handed, so nothing the host
+        # reads moves.
+        self.gnss_rx_pipe = pipe = SampleStreamRegister(num_ants=self._gnss_num_ants)
         self.comb += [
             self.gnss_rx.rx_data.eq(rx_stream.data),
             self.gnss_rx.rx_stb.eq(rx_stream.valid & rx_stream.ready),
             self.gnss_rx.mode_1r1t.eq(self.ad9361.phy.control.fields.mode),
-            *[self.gnss.sample_i_ants[n].eq(self.gnss_rx.sample_i_ants[n])
+            *[pipe.sample_i_ants[n].eq(self.gnss_rx.sample_i_ants[n])
               for n in range(self._gnss_num_ants)],
-            *[self.gnss.sample_q_ants[n].eq(self.gnss_rx.sample_q_ants[n])
+            *[pipe.sample_q_ants[n].eq(self.gnss_rx.sample_q_ants[n])
               for n in range(self._gnss_num_ants)],
-            self.gnss.sample_stb.eq(self.gnss_rx.sample_stb),
-            self.gnss.ants_valid.eq(self.gnss_rx.ants_valid),
+            pipe.sample_stb.eq(self.gnss_rx.sample_stb),
+            pipe.ants_valid.eq(self.gnss_rx.ants_valid),
+
+            *[self.gnss.sample_i_ants[n].eq(pipe.out_i_ants[n])
+              for n in range(self._gnss_num_ants)],
+            *[self.gnss.sample_q_ants[n].eq(pipe.out_q_ants[n])
+              for n in range(self._gnss_num_ants)],
+            self.gnss.sample_stb.eq(pipe.out_stb),
+            self.gnss.ants_valid.eq(pipe.out_ants_valid),
         ]
         require_record_dma(self)
         self.comb += [

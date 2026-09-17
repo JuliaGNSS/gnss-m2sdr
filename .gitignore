@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-build/
 *.vcd
 /julia/Manifest.toml
 .venv/
+build*/

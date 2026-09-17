@@ -20,23 +20,55 @@ Copy them + this repo to orin2 (see `scripts/deploy_orin.sh`).
 
 ## 1. Rebuild the M2SDR driver + tools with this gateware's headers
 
+**Take the lock first, and keep the old headers.** `make clean` deletes
+`m2sdr.ko` and `m2sdr_util` before it rebuilds them, so a build that fails
+leaves the host with no working tools at all.
+
 ```bash
 cd ~/litex_m2sdr/litex_m2sdr/software
-cp ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/software/include/generated/{csr,soc,mem}.h kernel/
-# user tools include the same headers
-cd kernel && make clean all && sudo ./init.sh        # rebuild + load litepcie driver
+mkdir -p ~/gnss-m2sdr/rollback/headers_before
+cp kernel/{csr,soc,mem}.h user/csr.h ~/gnss-m2sdr/rollback/headers_before/
+
+B=~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023
+cp $B/software/include/generated/{soc,mem}.h kernel/
+# csr.h needs adapting -- see below
+python3 ~/gnss-m2sdr/scripts/driver_headers.py $B/software/include/generated/csr.h kernel/csr.h
+cp kernel/csr.h user/csr.h
+cd kernel && make clean all && sudo make install && sudo ./init.sh
 cd ../user  && make clean all                         # rebuild m2sdr_util, m2sdr_rf, ...
 ```
+
+LiteX's generated `csr.h` cannot be copied in as-is: it `#include`s
+`generated/soc.h`, `system.h` and `hw/common.h`, none of which exist in the
+M2SDR software tree, and the build fails on the first file that pulls it in.
+`scripts/driver_headers.py` strips those three includes and substitutes the
+handful of accessors the tree expects. Restore
+`~/gnss-m2sdr/rollback/headers_before/` and rebuild if anything goes wrong.
 
 ## 2. Flash the gateware (multiboot operational slot) and reload
 
 ```bash
-cd ~/litex_m2sdr/litex_m2sdr/software
-./flash.py ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/gateware/gnss_m2sdr_m2_x1_ch4_ant1_code1023.bin
-# flash.py runs: m2sdr_util flash_write ... 0x00800000 ; flash_reload
-sudo rmmod litepcie 2>/dev/null; sudo ./kernel/init.sh   # rescan/reload after reflash
-./user/m2sdr_util info                                   # expect the new SoC identifier
+cd ~/litex_m2sdr/litex_m2sdr/software/user
+./m2sdr_util flash_write -y -c 0 \
+  /home/orin/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/gateware/gnss_m2sdr_m2_x1_ch4_ant1_code1023.bin \
+  0x00800000
+sudo shutdown -r +0                                      # reconfigure the FPGA
+# after the host is back:
+./m2sdr_util info                                        # expect the new SoC identifier
 ```
+
+Three things that are not obvious and each cost an hour:
+
+- **Call `m2sdr_util flash_write` directly, not `flash.py`.** `flash.py` builds
+  its command as `cd user && ./m2sdr_util flash_write ... ../$bitstream`, so an
+  **absolute** path turns into `..//home/orin/...` and the write fails.
+- **Give the write no timeout.** 7 MiB takes ~80 s. A timeout that fires
+  mid-erase leaves a half-written operational slot.
+- **Reboot the host; do not rely on `flash_reload`.** On this Orin the ICAP
+  reload wedges the PCIe link: every config read returns `0xff`, the kernel logs
+  AER `CmpltTO`, and the device disappears from `/sys/bus/pci/devices` so a
+  `remove` + `rescan` cannot bring it back. A reboot does, and the board comes up
+  on the newly written image. Budget ~2 minutes for the round trip.
 
 ### Recovery / rollback
 
@@ -47,22 +79,33 @@ the board. (Verified against `litex_m2sdr_platform.py`: the fallback bitstream
 is built with `BITSTREAM.CONFIG.NEXT_CONFIG_ADDR 0x00800000` and written to `0x0`,
 the operational one with `CONFIGFALLBACK Enable` and a watchdog `TIMER_CFG`.)
 
-**Before flashing anything, confirm the rollback image is present on the
-board host**, and note its checksum so you know it is the known-good one:
+**Do not assume you know what is on the board.** The image that was actually
+running here was *not* any of the release `.bin`s in this tree — it was a
+20-channel build whose `.bin` had been deleted. The only rollback you can trust
+is one you read back off the flash yourself, **before** you overwrite it:
 
 ```bash
-md5sum ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1/gateware/gnss_m2sdr_m2_x1_ch4_ant1.bin
-# 1fec0c83f9fb63a6252014897fad396f  = RELEASE_ch4_ant1_timing_clean (v1, WNS +0.005 ns)
+cd ~/litex_m2sdr/litex_m2sdr/software/user
+mkdir -p ~/gnss-m2sdr/rollback
+./m2sdr_util flash_read -c 0 ~/gnss-m2sdr/rollback/op_slot_backup.bin 0x00800000 0x700000
+md5sum ~/gnss-m2sdr/rollback/op_slot_backup.bin
+# 8f04c9ecf12711efb76bf2a7dd700219  = what was on the board on 2026-09-17
 ```
 
-To restore that known-good v1 image:
+Sanity-check the dump before trusting it: a valid bitstream has the `aa995566`
+sync word near the start (offset `0x30` here) and a long `0xff` tail after the
+content ends. To restore it:
 
 ```bash
-cd ~/litex_m2sdr/litex_m2sdr/software
-printf 'yes\n' | ./flash.py ~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1/gateware/gnss_m2sdr_m2_x1_ch4_ant1.bin
-sudo rmmod litepcie 2>/dev/null; sudo ./kernel/init.sh
-./user/m2sdr_util info        # expect the 2026-07-29 SoC identifier back
+cd ~/litex_m2sdr/litex_m2sdr/software/user
+./m2sdr_util flash_write -y -c 0 /home/orin/gnss-m2sdr/rollback/op_slot_backup.bin 0x00800000
+sudo shutdown -r +0
+./m2sdr_util info        # expect the 2026-07-29 23:42:50 SoC identifier back
 ```
+
+The `~/gnss-m2sdr/build/...` `.bin`s are still worth keeping as a second
+fallback, but identify what you are restoring by SoC identifier and content
+size, not by filename.
 
 **Do not flash a bitstream that misses timing.** See
 [gateware builds](gateware_builds.md): a design that fails setup does not

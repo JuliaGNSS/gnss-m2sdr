@@ -136,13 +136,18 @@ class ChannelWithCSR(LiteXModule):
         self.sample_q     = self.sample_q_ants[0]
         self.sample_stb   = Signal()
         self.sample_count = Signal(64)   # global counter, from GNSSTracking
+        # The strobe that advances `sample_count`. It is the bank's *ungated*
+        # strobe, not this channel's (which `control.enable` gates), because the
+        # counter is ungated -- see the scheduled-commit comparison below, which
+        # needs to know what the counter will read next cycle.
+        self.count_stb    = Signal()
 
         self.channel = ch = TrackingChannel(
             prn=prn, code_frac_bits=code_frac_bits, accum_bits=accum_bits,
             carrier_phase_bits=carrier_phase_bits,
             max_code_length=max_code_length, num_ants=num_ants,
             num_taps=num_taps, max_subchips=max_subchips,
-            replica_bits=replica_bits)
+            replica_bits=replica_bits, staged_length=True)
         replica_bits = ch.code.replica_bits
 
         # CSRs. restart/carrier_set are edge-triggered: host writes 1 then 0;
@@ -335,9 +340,26 @@ class ChannelWithCSR(LiteXModule):
         arm_bit   = self._apply.storage[0]
         arm_d     = Signal()
         first_governed = Signal(64)     # sample index the commit takes effect for
+        # "have we reached the target yet", held in a register rather than
+        # computed on the strobe. The comparison is 64 bits wide -- an increment
+        # and a compare, ~30 carry stages -- and `apply_stb` fans out through
+        # `restart_pulse` into the code replica, where it now selects a code-RAM
+        # read address. Combinationally that was 26 logic levels from
+        # `sample_count` to a replica window flop and missed setup by 2.309 ns.
+        #
+        # It is exact, not a cycle late: it is evaluated against the value the
+        # counter will hold *next* cycle (`count_stb` says whether it advances),
+        # so on any strobe `reached` already describes that strobe's sample. The
+        # only staleness is a `apply_at` write in the immediately preceding
+        # cycle, which cannot race a commit: arming needs a 0->1 edge on
+        # `apply.arm` after the write, and `armed` only comes up the cycle after
+        # that.
+        reached = Signal()
+        self.sync += reached.eq(
+            (self.sample_count + self.count_stb + 1) >= self._apply_at.storage)
         self.comb += [
             first_governed.eq(self.sample_count + 1),
-            apply_stb.eq(armed & self.sample_stb & (first_governed >= self._apply_at.storage)),
+            apply_stb.eq(armed & self.sample_stb & reached),
             self._apply_status.status.eq(Cat(armed, late)),
         ]
         self.sync += [
@@ -455,6 +477,13 @@ class ChannelWithCSR(LiteXModule):
         self.sync += If(restart_pulse, code_length_act.eq(self._code_length.storage))
         self.comb += [
             ch.code_length.eq(code_length_act),
+            # The length the replica's chip window wraps with when `restart`
+            # reloads it -- which is the *staged* value, because the restart is
+            # what commits it. Handing it over separately (rather than bypassing
+            # the commit register with a mux on `restart_pulse`) keeps the whole
+            # of `restart -> code_length - 1 -> code-RAM address` off the restart
+            # path; that chain measured 2.9 ns in front of the LUTRAM read.
+            ch.restart_length.eq(self._code_length.storage),
             self._code_length_active.status.eq(code_length_act),
         ]
 
@@ -727,6 +756,7 @@ class GNSSTracking(LiteXModule):
                 *[chan.sample_q_ants[n].eq(self.sample_q_ants[n]) for n in range(num_ants)],
                 chan.sample_stb.eq(gated_stb),
                 chan.sample_count.eq(self.sample_count),
+                chan.count_stb.eq(self.sample_stb),   # ungated, like the counter
             ]
             self.comb += chan.connect_dump(recorder.ports[i])
             # One drop counter per channel (name must be explicit: the tracer

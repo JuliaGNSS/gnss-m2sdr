@@ -79,5 +79,114 @@ class TestCodeReplica(unittest.TestCase):
             self.assertEqual(rec["l"][i], rec["p"][i])
 
 
+class TestRegisteredChipWindow(unittest.TestCase):
+    """The three chip words the taps read are registers, not asynchronous RAM
+    reads (see code_replica.py). That is a timing fix, so what these tests pin
+    is that it changed *nothing* about the replica: the window has to be exact
+    on every sample, including the first one after an arbitrary rebase and the
+    one where an early tap reaches back across the wrap.
+    """
+
+    FRAC = 20
+
+    def _dut(self, code, max_code_length=64):
+        return CodeReplica(frac_bits=self.FRAC,
+                           max_code_length=max_code_length, code_init=code)
+
+    @staticmethod
+    def _pm(bit):
+        return 1 if bit else -1
+
+    def _taps_from(self, code, length, start_chip, spc, n, max_code_length=64):
+        """Rebase onto `start_chip` and collect (early, prompt, late) per sample."""
+        dut  = self._dut(code, max_code_length)
+        step = (1 << self.FRAC) // spc
+        off  = (1 << self.FRAC) // spc          # one input sample of offset
+        got  = []
+
+        def bench():
+            yield dut.code_step.eq(step)
+            yield dut.code_length.eq(length)
+            yield dut.tap_offset[0].eq(off)     # early: one sample ahead
+            yield dut.tap_offset[2].eq(-off)    # late:  one sample behind
+            yield dut.restart_chip.eq(start_chip)
+            yield dut.restart.eq(1)
+            yield
+            yield dut.restart.eq(0)
+            yield dut.stb.eq(1)
+            yield
+            for _ in range(n):
+                got.append(((yield dut.early), (yield dut.prompt),
+                            (yield dut.late), (yield dut.chip_index)))
+                yield
+
+        run_simulation(dut, bench())
+        return got
+
+    def test_first_sample_after_a_rebase_is_already_right(self):
+        # The window reloads in the restart cycle itself, so there is no dead
+        # sample: chip 37's word must be on the prompt tap immediately.
+        code = [(i * 7 + 3) % 2 for i in range(64)]
+        got  = self._taps_from(code, length=64, start_chip=37, spc=4, n=1)
+        self.assertEqual(got[0][3], 37)
+        self.assertEqual(got[0][1], self._pm(code[37]))
+
+    def test_early_tap_reaches_across_the_wrap_at_chip_zero(self):
+        # At chip 0 the late tap reads code[length-1] -- the one word the
+        # shifting window has to have brought round with it. Rebase one chip
+        # short of the wrap and walk through it.
+        length, spc = 16, 4
+        code = [(i * 5 + 1) % 2 for i in range(64)]
+        got  = self._taps_from(code, length=length, start_chip=length - 1,
+                               spc=spc, n=3 * spc)
+        seen_wrap = False
+        for early, prompt, late, idx in got:
+            self.assertEqual(prompt, self._pm(code[idx]))
+            # Taps sit one input sample either side; with spc samples per chip
+            # they only ever leave the chip on its first/last sample.
+            self.assertIn(early, (self._pm(code[idx]),
+                                  self._pm(code[(idx + 1) % length])))
+            self.assertIn(late, (self._pm(code[idx]),
+                                 self._pm(code[(idx - 1) % length])))
+            if idx == 0:
+                seen_wrap = True
+        self.assertTrue(seen_wrap, "never reached chip 0")
+
+    def test_window_matches_a_software_walk_of_the_code(self):
+        # The strong form: every tap of every sample against a direct
+        # floor(phase)-based evaluation of the same code, across two wraps at a
+        # non-integer number of samples per chip (so the taps change chip at
+        # phases the integer case never visits).
+        length = 23
+        code   = [(i * 11 + 4) % 2 for i in range(64)]
+        step   = int(round((1 << self.FRAC) / 2.13))
+        off    = step                              # one input sample
+        dut    = self._dut(code)
+        got, want = [], []
+
+        def bench():
+            yield dut.code_step.eq(step)
+            yield dut.code_length.eq(length)
+            yield dut.tap_offset[0].eq(off)
+            yield dut.tap_offset[2].eq(-off)
+            yield dut.restart.eq(1)
+            yield
+            yield dut.restart.eq(0)
+            yield dut.stb.eq(1)
+            yield
+            for _ in range(2 * length * 3):
+                idx  = (yield dut.chip_index)
+                frac = (yield dut.code_frac)
+                got.append(((yield dut.early), (yield dut.prompt), (yield dut.late)))
+                # floor(phase +/- offset) in chips, wrapped into the code.
+                want.append(tuple(
+                    self._pm(code[(idx + ((frac + d) >> self.FRAC)) % length])
+                    for d in (off, 0, -off)))
+                yield
+
+        run_simulation(dut, bench())
+        self.assertEqual(got, want)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

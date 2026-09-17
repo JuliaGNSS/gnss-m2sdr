@@ -44,6 +44,16 @@ def main():
     p.add_argument("--variant",  default="m2",         help="Board variant.", choices=["m2", "baseboard"])
     p.add_argument("--pcie-lanes", default=1, type=int, choices=[1, 2, 4])
     p.add_argument("--output-dir", default="build",     help="Build output directory.")
+    p.add_argument("--timing-effort", default="default", choices=["default", "high"],
+                   help="Vivado implementation effort. 'high' asks for "
+                        "ExtraTimingOpt placement, Explore routing and an "
+                        "AggressiveExplore post-route phys_opt; it roughly "
+                        "doubles the run. The five-tap builds need it: at four "
+                        "channels the design leaves litex_m2sdr's own AD9361 "
+                        "block-floating-point path about 0.26 ns short at the "
+                        "default effort, and that path is 52% routing, which is "
+                        "what the stronger directives are for. See "
+                        "docs/gateware_builds.md.")
     args = p.parse_args()
 
     soc = GNSSSoC(
@@ -62,7 +72,15 @@ def main():
                   f"_tap{args.taps}_sub{args.max_subchips}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),
                       csr_csv=os.path.join(args.output_dir, build_name, "csr.csv"))
-    builder.build(build_name=build_name, run=args.build)
+    effort = {}
+    if args.timing_effort == "high":
+        effort = dict(
+            vivado_place_directive               = "ExtraTimingOpt",
+            vivado_post_place_phys_opt_directive = "Explore",
+            vivado_route_directive               = "Explore",
+            vivado_post_route_phys_opt_directive = "AggressiveExplore",
+        )
+    builder.build(build_name=build_name, run=args.build, **effort)
 
 
 if __name__ == "__main__":
