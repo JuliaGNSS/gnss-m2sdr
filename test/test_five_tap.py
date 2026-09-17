@@ -23,6 +23,7 @@ Three things this covers that a three-tap E/P/L bank could not:
 """
 
 import math
+import random
 import unittest
 
 from migen import *
@@ -667,6 +668,106 @@ class TestFiveTapWireFormat(unittest.TestCase):
     def test_the_record_still_divides_the_dma_buffer(self):
         self.assertEqual(len(self._rec(num_taps=TAPS_VEPL)), RECORD_WORDS)
         self.assertEqual(max(ANT_VERY_WORD) + 2, RECORD_WORDS)
+
+
+class TestAccumulatorsDependOnTheLoadedCode(unittest.TestCase):
+    """A full integration, on a runtime-loaded code, with DC in the samples.
+
+    This is the board symptom turned into an assertion. A flashed v3 build came
+    back with every accumulator railed at the `accum_bits` limit *and identical*
+    for an all-ones code, an all-zeros code and a real C/A code -- which is what
+    a correlator whose replica never reaches the multiplier looks like, because
+    saturation clamps all three to the same number.
+
+    Two properties catch that, and neither was covered: the accumulators have to
+    **follow the code** (all-ones and all-zeros are exact negatives of each
+    other), and a constant replica against realistic samples has to **stay
+    inside the rail**, so a real railing is a real fault and not the arithmetic
+    running out of room. The DC offset matters -- a constant replica turns the
+    accumulator into amp x sum(sample), so DC is what drives it toward the rail,
+    and a zero-mean stimulus would never exercise it.
+    """
+
+    LENGTH, SPC, EPOCHS = 128, 4, 2
+    DC, STD = 80, 80
+
+    def _run(self, bits):
+        dut = GNSSTracking(n_channels=1, prns=[1], code_frac_bits=FRAC,
+                           max_code_length=self.LENGTH, num_ants=1,
+                           num_taps=TAPS_VEPL, max_subchips=MAX_SUB)
+        step = (1 << FRAC) // self.SPC
+        rnd  = random.Random(20260917)
+        n    = self.EPOCHS * self.LENGTH * self.SPC + 4 * self.SPC
+        recs = []
+
+        def bench():
+            yield dut.source.ready.eq(1)
+            yield dut.ch0._code_freq.storage.eq(step)
+            yield dut.ch0._carrier_freq.storage.eq(0)
+            yield dut._control.storage.eq(1)
+            for name, shift in (("ve", 2), ("e", 1), ("l", -1), ("vl", -2)):
+                reg = getattr(dut.ch0, "_tap_offset_" + name, None)
+                if reg is not None:
+                    yield reg.storage.eq((shift * step) & ((1 << (FRAC + 1)) - 1))
+            # GPS L1 C/A on a sub-chip build: LOC, a one-entry unit table.
+            yield from csr_write(dut.ch0._subcarrier_load, 1 | (0 << 8) | (1 << 13))
+            yield from csr_write(dut.ch0._code_length, self.LENGTH)
+            yield from csr_write(dut.ch0._code_load, LOAD_RESET)
+            for bit in bits:
+                yield from csr_write(dut.ch0._code_load,
+                                     LOAD_WE | (LOAD_DAT if bit else 0))
+            yield from csr_write(dut.ch0._replica, 1 | (1 << 4))
+            yield from pulse_control(dut.ch0, CTL_RESTART | CTL_CARRIER_SET)
+            out = []
+            for _ in range(n):
+                yield dut.sample_i_ants[0].eq(int(rnd.gauss(self.DC, self.STD)))
+                yield dut.sample_q_ants[0].eq(int(rnd.gauss(self.DC, self.STD)))
+                yield dut.sample_stb.eq(1)
+                yield
+                if (yield dut.source.valid):
+                    out.append((yield dut.source.data))
+            yield dut.sample_stb.eq(0)
+            for _ in range(4 * RECORD_WORDS):
+                yield
+                if (yield dut.source.valid):
+                    out.append((yield dut.source.data))
+            for k in range(len(out) // RECORD_WORDS):
+                recs.append(unpack_record(out[k * RECORD_WORDS:(k + 1) * RECORD_WORDS]))
+
+        run_simulation(dut, bench())
+        return [r for r in recs if not r.get("epoch_strobe")]
+
+    def test_all_ones_and_all_zeros_give_opposite_accumulators(self):
+        ones  = self._run([1] * self.LENGTH)
+        zeros = self._run([0] * self.LENGTH)
+        self.assertTrue(ones and zeros)
+        for a, b in zip(ones, zeros):
+            self.assertEqual(a["i_prompt"], -b["i_prompt"])
+            self.assertEqual(a["q_prompt"], -b["q_prompt"])
+            # ...and not by both being clamped to the same rail.
+            self.assertNotEqual(a["i_prompt"], 0)
+
+    def test_a_constant_replica_on_realistic_samples_does_not_rail(self):
+        # The worst case for headroom: every sample pushed the same way.
+        for r in self._run([1] * self.LENGTH):
+            self.assertFalse(r.get("saturated"),
+                             f"accumulator saturated on {r['integrated_samples']} "
+                             f"samples: i_prompt={r['i_prompt']}")
+            self.assertLess(abs(r["i_prompt"]), 1 << 30)
+
+    def test_a_real_code_accumulates_far_less_than_a_constant_one(self):
+        # A zero-mean code cancels the DC a constant replica integrates; if the
+        # replica were stuck, these two would be the same size.
+        const = self._run([1] * self.LENGTH)
+        code  = self._run(pseudo_code(self.LENGTH))
+        self.assertTrue(const and code)
+        self.assertLess(abs(code[0]["i_prompt"]), abs(const[0]["i_prompt"]) // 4)
+
+    def test_every_dump_integrates_one_code_period(self):
+        # `integrated_samples` is the other half of the rail arithmetic: a dump
+        # that never cleared would read far more than one period's worth.
+        for r in self._run(pseudo_code(self.LENGTH)):
+            self.assertEqual(r["integrated_samples"], self.LENGTH * self.SPC)
 
 
 if __name__ == "__main__":
