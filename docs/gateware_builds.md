@@ -462,6 +462,14 @@ index and epoch are right), so the fault is in the registered replica path of
 §5.1/§5.4 — between the code RAM read and the DSP `B` input — in a way the
 board-free suite does not reproduce.
 
+The saturation is a consequence, not a second fault. A constant replica makes
+the accumulator `±amp × Σ sample` over the ~4000 samples of a 1 ms epoch, and
+with `replica_bits = 8` (`amp` up to 127) and 16-bit samples that rails on any
+DC at all in the RX chain — 4000 × 127 × 4200 already exceeds 2³¹. A *correct*
+zero-mean replica cancels that DC, which is exactly why the previous image did
+not saturate. So one fault explains both observations, and there is no need to
+suspect the sample path as well.
+
 *DMA1 record capture: attempted, not completed.* With the v3 image on the board,
 `read()` on `/dev/m2sdr1` blocked and the probe timed out after 200 s. Whether
 that is `software/record_stream.py`'s DMA-writer ioctl or the record path itself
