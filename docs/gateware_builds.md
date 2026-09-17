@@ -474,44 +474,63 @@ suspect the sample path as well.
 that is `software/record_stream.py`'s DMA-writer ioctl or the record path itself
 was not established. **No record was captured, framed or parsed on hardware.**
 
-### 5.6c What the next person should try
+### 5.6c Diagnosis so far: what is ruled out, and where it points now
 
-The simulation suite proves the replica is right *functionally*, and timing
-closes, so the gap is something neither covers. In rough order of likelihood:
+No silicon was used for any of this; it is all from the synthesis reports, the
+generated Verilog and the board-free simulator.
 
-0. **Establish whether the code RAM is being read at all, or merely not being
-   written.** The three loads above produce *identical* sums, which has two
-   economical explanations and they need different fixes: either the replica
-   never reaches the DSP `B` input (a broken window/tap register), or
-   `load_we` never lands in the RAM, so all three "different" codes left the
-   power-on `init` in place — in which case the outputs are identical because
-   the memory contents were. The discriminator is free: each channel's RAM is
-   initialised with *its own* PRN (`prn=i+1`), so read the prompt accumulator of
-   channel 0 and channel 1 under identical settings. Different sums ⇒ the RAM is
-   read and the *write* path is the bug; identical sums ⇒ the replica is not
-   reaching the multiplier.
-1. **Build the same RTL with `--max-subchips 1`** (`replica_bits` drops from 8 to
-   2, and the whole `lut_a`/`lut_b` `Array` mux and the `nsub * subchips`
-   multiply disappear). If that correlates, the bug is in the registered
-   sub-chip index `k_r` or the subcarrier-table mux, not in the chip window.
-   This is the cheapest discriminator and it isolates §5.4 from §5.1.
-2. **Then `--taps 3`**, to separate the five-tap fan-out from the replica logic.
-3. Check the `Array(...)[k_r]` mux for an out-of-range index: `k_r` is
-   `bits_for(max_subchips - 1)` = 4 bits for `max_subchips = 12`, so it can
-   address 16 entries of a 12-entry `Array`. Migen lowers an `Array` read to a
-   combinational `if/elif` chain with **no final `else`**, which is total in
-   simulation (the target keeps its previous value, and it is re-evaluated every
-   delta) but is an incompletely-specified combinational assignment in Verilog —
-   the classic latch-inference shape. With `subchips = 1` the index should be 0
-   and the first branch should always hit, so this is unlikely to be the fault,
-   but it is the one construct in the new code whose hardware and simulation
-   semantics are not identical, and it is worth an explicit `else` regardless.
-   Note that none of the sub-chip machinery has ever run on hardware: the image
-   the board has been running is a three-tap, `subchips = 1`, 1023-chip build.
-4. Add a CSR that reads the live `replica[t]` (or `word_r`/`k_r`) for one
-   channel. Everything above is inference from accumulator values; one readable
-   register would have made this a five-minute diagnosis instead of an hour of
-   bisection by correlator output.
+**Ruled out.**
+
+| Hypothesis | How | Result |
+|---|---|---|
+| Latch inference on the `Array(...)[k_r]` subcarrier mux | `grep -i latch` in the synthesis log; read the emitted Verilog | **No.** `checking latch_loops (0)`, and Migen emits a default assignment (`comb_self8 = 8'd0;`) ahead of the case, so the assignment is complete |
+| Code RAM mis-inferred or wrong depth | Vivado's Distributed RAM mapping report | **No.** All twelve code RAMs (4 channels × 3 copies) map to `RAM128X1D`/`RAM64X1D`/`RAM32X1D`/`RAM16X1D` totalling exactly 4096 × 2 bits |
+| Memory Verilog wrong | Read the emitted block | **No.** Async read at `rp_adr`, synchronous write, `$readmemh` init — a clean LUTRAM template |
+| A runtime code load never reaching the replica | New tests, `TestRuntimeCodeLoadReachesTheReplica` and `TestAccumulatorsDependOnTheLoadedCode` | **No.** See below |
+| Accumulator headroom lost to `replica_bits` 8 | `replica_shape("LOC")` is a one-entry **unit** table | **No.** GPS L1 C/A's replica is ±1 on a sub-chip build exactly as on v1 |
+
+The load hypothesis was the strongest one and deserved the most care, because
+**`load_we` had no test anywhere** — every other test seeds the RAM through
+`code_init` at construction and never writes a chip at runtime. A load that
+never landed would leave the power-on `init` in place and make all three test
+codes produce the same sums, which is precisely the board symptom. It is now
+covered at both levels, and it **passes**: the replica follows a code written at
+runtime, a second load replaces the first, the subcarrier-select bit is written
+beside the chip, and at bank level an all-ones and an all-zeros load produce
+accumulators that are *exact negatives* of each other over a full integration.
+So the write path is correct in simulation, and a missing load is not the fault.
+
+**Where the arithmetic now points.** The same simulation gives a hard bound that
+the earlier guesswork did not have. With `integrated_samples = 4000` per dump,
+replica ±1 and carrier amplitude ≤ 127, a constant replica makes the accumulator
+`amp × Σ sample`, so a DC offset *d* in the samples gives |sum| ≈ 508 000·*d*.
+Simulation confirms it: at *d* = 80 an all-ones code accumulates 40 768 905, and
+an all-zeros code −40 768 905. That is a factor of **52 below** the 2³¹ rail.
+
+For the board to rail, therefore, one of these must be true:
+
+- the samples arriving at the correlator are ~50× larger than the ones DMA0
+  carries (std ≈ 80 measured), i.e. |sample| ≈ 4200; **or**
+- roughly 50× more samples are being integrated per dump than one code period.
+
+Both are in the **sample and accumulate path — not the replica**, which is where
+§5.6b and the first version of this section pointed. The one change §5 made in
+that path is §5.2's registered sample bundle (`SampleStreamRegister`, and the
+rewiring of `soc.py` around it), and that rewiring has no SoC-level test.
+
+**The next measurements, cheapest first.** The first two are single CSR reads
+and settle it:
+
+1. **Read `integrated_samples` on a dump.** ~4000 ⇒ the integration window is
+   right and the samples are wrong; far more ⇒ the accumulator is not being
+   cleared at the epoch. This one number splits the two branches above.
+2. **Read the observer's sample registers** and compare their magnitude against
+   a DMA0 capture taken at the same moment. A ~50× discrepancy names §5.2.
+3. Only then bisect by building: `--max-subchips 1` first (it removes the whole
+   `lut_a`/`lut_b` mux and the `nsub × subchips` multiply), then `--taps 3`.
+4. Whatever the cause, add a CSR that reads the live `replica[t]` and the
+   observer's sample. Everything above is inference from accumulator values; two
+   readable registers would have made this minutes rather than a build cycle.
 
 ### 5.7 What is on the board, and rolling back
 

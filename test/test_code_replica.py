@@ -188,5 +188,162 @@ class TestRegisteredChipWindow(unittest.TestCase):
         self.assertEqual(got, want)
 
 
+class TestRuntimeCodeLoadReachesTheReplica(unittest.TestCase):
+    """`load_we` -> code RAM -> registered chip window -> replica output.
+
+    This path had **no test at all** until a flashed v3 build came back from the
+    board with every accumulator railed and, worse, *independent of the code RAM
+    contents*: all-ones, all-zeros and a real C/A code produced identical sums
+    with the same sign. A runtime load that never reached the replica would
+    produce exactly that, and nothing in the suite would have noticed -- every
+    other test here seeds the RAM through `code_init` at construction time and
+    never writes a chip at runtime.
+
+    So these tests assert the property the hardware violated, at the one place
+    it can be checked without silicon: the replica must *follow the loaded code*.
+    They pass, which is the finding -- the load path is correct in simulation,
+    so whatever the board was doing is not a missing write.
+    """
+
+    FRAC = 20
+    LEN  = 32
+    SPC  = 2                                  # samples per chip
+
+    @staticmethod
+    def _each(seq, spc):
+        return [v for v in seq for _ in range(spc)]
+
+    def _load_then_run(self, bits, n, max_subchips=1, sub=None):
+        """Write `bits` through the load port, then sample the prompt tap."""
+        dut  = CodeReplica(frac_bits=self.FRAC, max_code_length=self.LEN,
+                           code_init=[0] * self.LEN, max_subchips=max_subchips)
+        # Two samples per chip: one chip per sample is the boundary the NCO
+        # rejects as an unsupported rate, so every chip appears twice.
+        step = (1 << self.FRAC) // self.SPC
+        out  = []
+
+        def bench():
+            yield dut.load_adr.eq(0)
+            yield
+            for adr, bit in enumerate(bits):
+                yield dut.load_adr.eq(adr)
+                yield dut.load_dat.eq(bit)
+                if sub is not None:
+                    yield dut.load_sub.eq(sub[adr])
+                yield dut.load_we.eq(1)
+                yield
+            yield dut.load_we.eq(0)
+            yield dut.code_step.eq(step)
+            yield dut.code_length.eq(len(bits))
+            yield dut.subchips.eq(1)
+            yield dut.restart_chip.eq(0)
+            yield dut.restart.eq(1)
+            yield
+            yield dut.restart.eq(0)
+            yield dut.stb.eq(1)
+            yield
+            for _ in range(n):
+                out.append((yield dut.prompt))
+                yield
+
+        run_simulation(dut, bench())
+        return out
+
+    def test_the_replica_follows_a_code_written_at_runtime(self):
+        # The RAM is built all-zeros; every +1 in the output can only come from
+        # the load port.
+        bits = [(i * 5 + 1) % 2 for i in range(self.LEN)]
+        got  = self._load_then_run(bits, n=self.LEN * self.SPC)
+        want = self._each([1 if b else -1 for b in bits], self.SPC)
+        self.assertEqual(got, want)
+
+    def test_all_ones_and_all_zeros_are_opposite_everywhere(self):
+        # The hardware's decisive symptom, inverted into an assertion: these two
+        # loads must differ in sign on every single sample, never coincide.
+        n     = self.LEN * self.SPC
+        ones  = self._load_then_run([1] * self.LEN, n=n)
+        zeros = self._load_then_run([0] * self.LEN, n=n)
+        self.assertEqual(ones,  [1] * n)
+        self.assertEqual(zeros, [-1] * n)
+        self.assertTrue(all(a == -b for a, b in zip(ones, zeros)))
+
+    def test_a_second_load_replaces_the_first(self):
+        # A channel is re-tasked by loading a different PRN over the old one; if
+        # the write only ever landed once, this is what would catch it.
+        first  = [(i * 5 + 1) % 2 for i in range(self.LEN)]
+        second = [(i * 3) % 2 for i in range(self.LEN)]
+        dut    = CodeReplica(frac_bits=self.FRAC, max_code_length=self.LEN,
+                             code_init=[0] * self.LEN)
+        step   = (1 << self.FRAC) // self.SPC
+        out    = []
+
+        def bench():
+            for bits in (first, second):
+                for adr, bit in enumerate(bits):
+                    yield dut.load_adr.eq(adr)
+                    yield dut.load_dat.eq(bit)
+                    yield dut.load_we.eq(1)
+                    yield
+                yield dut.load_we.eq(0)
+                yield
+            yield dut.code_step.eq(step)
+            yield dut.code_length.eq(self.LEN)
+            yield dut.restart_chip.eq(0)
+            yield dut.restart.eq(1)
+            yield
+            yield dut.restart.eq(0)
+            yield dut.stb.eq(1)
+            yield
+            for _ in range(self.LEN * self.SPC):
+                out.append((yield dut.prompt))
+                yield
+
+        run_simulation(dut, bench())
+        self.assertEqual(out, self._each([1 if b else -1 for b in second], self.SPC))
+
+    def test_the_subcarrier_select_bit_is_written_beside_the_chip(self):
+        # word_bits is 2 once a build has a subcarrier: bit 0 is the chip and
+        # bit 1 picks table B. A load that dropped bit 1 would silently run
+        # every TMBOC chip on the wrong table.
+        bits = [1] * self.LEN
+        sub  = [i % 2 for i in range(self.LEN)]
+        dut  = CodeReplica(frac_bits=self.FRAC, max_code_length=self.LEN,
+                           code_init=[0] * self.LEN, max_subchips=2)
+        step = (1 << self.FRAC) // self.SPC
+        out  = []
+
+        def bench():
+            for adr in range(self.LEN):
+                yield dut.load_adr.eq(adr)
+                yield dut.load_dat.eq(bits[adr])
+                yield dut.load_sub.eq(sub[adr])
+                yield dut.load_we.eq(1)
+                yield
+            yield dut.load_we.eq(0)
+            # Table A = +3 everywhere, table B = +5, so the tables are telling
+            # apart rather than the chip.
+            for adr in range(2):
+                yield dut.lut_adr.eq(adr); yield dut.lut_sel.eq(0)
+                yield dut.lut_dat.eq(3);   yield dut.lut_we.eq(1); yield
+                yield dut.lut_adr.eq(adr); yield dut.lut_sel.eq(1)
+                yield dut.lut_dat.eq(5);   yield dut.lut_we.eq(1); yield
+            yield dut.lut_we.eq(0)
+            yield dut.code_step.eq(step)
+            yield dut.code_length.eq(self.LEN)
+            yield dut.subchips.eq(1)
+            yield dut.restart_chip.eq(0)
+            yield dut.restart.eq(1)
+            yield
+            yield dut.restart.eq(0)
+            yield dut.stb.eq(1)
+            yield
+            for _ in range(self.LEN * self.SPC):
+                out.append((yield dut.prompt))
+                yield
+
+        run_simulation(dut, bench())
+        self.assertEqual(out, self._each([5 if s else 3 for s in sub], self.SPC))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
