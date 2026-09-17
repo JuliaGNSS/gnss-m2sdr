@@ -259,10 +259,12 @@ Build `gnss_m2sdr_m2_x1_ch4_ant2_code10230_tap5_sub12`, XC7A200T-3, Vivado
 DSP / 13.2% BRAM but missed setup by **2.875 ns against an 8 ns sys_clk**, on a
 path running from the runtime `code_length` register through the code-phase
 wrap, the `max_code_length`-deep distributed-RAM read and into the replica
-multiply — 17 logic levels, unpipelined. The replica is now pipelined (the chip
-window and the tap chip/sub-chip selection are registers, at no cost in
-latency); [gateware builds](gateware_builds.md) §5 has what changed and the
-numbers it closed at. **It has not been shown to work on hardware**: §5.6b
+multiply — 17 logic levels, unpipelined. Trimming the code length is not a
+workaround on its own: the same configuration at `--max-code-length 1023` still
+misses, at −1.288 ns, on a different path (§2b). The replica is now pipelined
+(the chip window and the tap chip/sub-chip selection are registers, at no cost
+in latency), and that plus a reduced build is what closed it;
+[gateware builds](gateware_builds.md) §2b and §5 have the numbers. **It has not been shown to work on hardware**: §5.6b
 records a flash of that build in which the correlator output was independent of
 the code RAM contents.
 
