@@ -698,20 +698,69 @@ Two captures 40 minutes apart, all 32 PRNs, CN0 in dBHz:
 handful of satellites 6–20 dB clear of it is what a detection looks like.
 
 *Steps 2 and 3 — hand the code phase and Doppler to an FPGA channel, and close
-the loop on the host.* 40 s run, one FPGA correlator channel per satellite,
-Tracking.jl running every loop filter:
+the loop on the host.* **Name the loop filter, or the run is not reproducible**
+— this was the one parameter the first version of this section left out, and it
+turned out to change how two of the numbers should be read.
+
+**Run A — `ConventionalAssistedPLLAndDLL`.** 40 s, one FPGA channel per
+satellite, on orin2 via `~/hwloop/closed_loop_multi.jl` (a bespoke `M2Bank.jl`
+CSR shim, not GNSSM2SDR.jl), Tracking.jl `NPTna`:
 
 | PRN | prompt \|P\|²/floor over 40 s | carrier the loop held | Acquisition.jl said | |
 |---:|---|---:|---:|---|
 | 19 | 24–32× | −1580 to −1627 Hz | −1100 / −1500 Hz | locked |
 | 15 | 26 → 52× | −5210 to −5281 Hz | −4200 / −5000 Hz | locked |
-| 20 | 26 → 46 → 7.8× | −6810 to −6877 Hz | −6000 / −6600 Hz | locked, fading |
-| 24 | 1.0–1.5× | diverged to +48 700 Hz | 42.2 dBHz, marginal | no lock |
+| 20 | 26 → 46 → **7.8×** | −6810 to −6877 Hz | −6000 / −6600 Hz | locked, **fading** |
+| 24 | 1.0–1.5× | **diverged to +48 700 Hz** | 42.2 dBHz, marginal | no lock |
 
 `saturation = 0xffff0` (bits 0–3, the channels in use, clear), `overflow = 0x0`.
-**That is the hardware-correlator claim worth recording**: the loop's carrier
-Doppler agrees with an independent CPU estimate on all three locked satellites,
-and prompt power holds 25–55× the noise floor for 40 s.
+
+**Run B — `NCOReferencedPLLAndDLL`**, the delay-aware estimator GNSSReceiver
+calls the hardware receiver's default, at GPS L1 C/A's 18 Hz reference
+bandwidth. 180 s, same board, same image, through GNSSReceiver's own
+`HardwareCorrelatorLink` and GNSSM2SDR.jl
+(`~/delay-study/GNSSReceiver/examples/hardware_correlator_m2sdr.jl`,
+`feedback_delay_epochs = 1.5`):
+
+```
+t=138.0 s  cn0[20:46  15:37  23:44]
+t=158.4 s  cn0[20:45  23:43]
+t=178.8 s  cn0[20:42  23:43]
+
+NCO commits: 381095 at their scheduled sample, landing 0.085 ms late on
+             average (max 17.437 ms); 148 dropped as stale
+dump stream: lost-record gaps 11, re-arm gaps 0, device-reported drops 0,
+             skipped epochs 186, implausible indices 0, dropped NCO updates 0
+```
+
+**PRN 20 held 42–46 dBHz across the whole 180 s with no decay.** Under the
+conventional loop the same satellite faded monotonically to 7.8× floor over the
+last 20 s of 40 s. The fade was **the loop, not the correlator** — which is
+exactly the failure `nco_referenced_loop.jl` documents: a hardware NCO word
+lands milliseconds after the record that motivated it, and at 18 Hz a
+correction acting 3–4 ms late overshoots and limit-cycles "while C/N₀ and code
+lock look perfect". PRN 24's divergence to +48.7 kHz in run A is the same shape
+and should be read the same way.
+
+**So the hardware-correlator claim is run B's**, and it is stronger than run
+A's: satellites tracked through the FPGA correlator at 42–46 dBHz for three
+minutes, 381 095 NCO words committed at their scheduled sample landing 0.085 ms
+late on average, and zero device-reported drops, zero implausible indices and
+zero dropped NCO updates. Run A stands only as a *comparison*: the prompt power
+and the carrier agreement are real, but its two failures are attributable to the
+estimator and must not be quoted as correlator behaviour.
+
+Two caveats, recorded because they were observed. Run B reached **no position
+fix** — only two to three satellites held ephemeris-long, and four are needed.
+And the example **segfaulted at exit**, after the measurement and the summary
+lines above were printed; nothing in the run depends on what happened after.
+
+*A note for anyone reusing `~/hwloop/closed_loop_multi.jl`*: it sets
+`doppler_estimator = ConventionalAssistedPLLAndDLL()` (line 178), and it also
+needs a fix to run at all against Tracking `NPTna` — it calls
+`reset_start_sample_and_bit_buffer!` only inside its once-per-second print
+branch, so the 128-bit hard-bit buffer overflows before the first print. Prefer
+run B's path.
 
 *And the way that does not work.* `software/gnss_tracking.py:acquire()` sweeps
 for satellites *through* the FPGA correlator over CSR, scoring peak/median of
