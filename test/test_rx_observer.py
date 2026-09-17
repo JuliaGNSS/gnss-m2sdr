@@ -9,6 +9,7 @@ single RX stream, not two antennas). Taking only bits [0:32] halves the sample
 rate in 1R1T, so the bank never locks -- these tests pin both modes."""
 
 import math
+import random
 import unittest
 
 from migen import *
@@ -20,6 +21,10 @@ from gnss_m2sdr.gateware.rx_observer import (
     RXSampleObserver, SampleStreamRegister,
 )
 from gnss_m2sdr.gateware.bank import GNSSTracking
+from gnss_m2sdr.record_format import RECORD_WORDS, unpack_record
+from test.test_bank_csr import (CTL_RESTART, CTL_CARRIER_SET, LOAD_DAT,
+                                LOAD_RESET, LOAD_WE, csr_write, pulse_control)
+from test.test_signal_config import FRAC, pseudo_code
 from test.test_channel_lock import (
     synth_signal, FS, F_IF, CHIP_RATE, FRAC, PHASE_BITS, AMP, CARRIER_AMP,
 )
@@ -232,6 +237,134 @@ class TestSampleStreamRegister(unittest.TestCase):
         dut = SampleStreamRegister(num_ants=1)
         self.assertIs(dut.sample_i, dut.sample_i_ants[0])
         self.assertIs(dut.out_i,    dut.out_i_ants[0])
+
+
+class TestObserverRegisterBankChain(unittest.TestCase):
+    """The `soc.py` composition: observer -> SampleStreamRegister -> bank.
+
+    `SampleStreamRegister` is tested above as a one-cycle delay, and the bank is
+    tested everywhere else, but the *wiring between them* had no test -- and it
+    is the only part of the sample path that PR #36 changed. When a flashed v3
+    build came back with railed, code-independent accumulators, that rewiring
+    was the leading suspect precisely because nothing covered it.
+
+    The property that matters is that the stage is invisible: the bank must
+    produce identical records with it and without it. The observer's samples are
+    pulse-qualified -- `sample_i` is only driven while `sample_stb` is high and
+    reads zero otherwise -- so delaying the bundle is only correct if the strobe
+    moves with the samples it belongs to. Both AD9361 channel modes are covered
+    (1R1T emits two strobes per 64-bit word, from a register, which is where a
+    skew would show), and so is DMA0 back-pressure, since `rx_stb` is
+    `valid & ready` and the real stream is full of gaps.
+    """
+
+    LENGTH, SPC = 64, 4
+
+    class Chain(Module):
+        def __init__(self, piped, num_ants=1):
+            self.submodules.rx = rx = RXSampleObserver(data_width=64,
+                                                       num_ants=num_ants)
+            self.submodules.gnss = gnss = GNSSTracking(
+                n_channels=1, prns=[1], code_frac_bits=FRAC,
+                max_code_length=TestObserverRegisterBankChain.LENGTH,
+                num_ants=num_ants, num_taps=5, max_subchips=12)
+            src_i, src_q = rx.sample_i_ants, rx.sample_q_ants
+            src_stb, src_valid = rx.sample_stb, rx.ants_valid
+            if piped:
+                self.submodules.pipe = pipe = SampleStreamRegister(num_ants=num_ants)
+                self.comb += [
+                    *[pipe.sample_i_ants[n].eq(rx.sample_i_ants[n])
+                      for n in range(num_ants)],
+                    *[pipe.sample_q_ants[n].eq(rx.sample_q_ants[n])
+                      for n in range(num_ants)],
+                    pipe.sample_stb.eq(rx.sample_stb),
+                    pipe.ants_valid.eq(rx.ants_valid),
+                ]
+                src_i, src_q = pipe.out_i_ants, pipe.out_q_ants
+                src_stb, src_valid = pipe.out_stb, pipe.out_ants_valid
+            self.comb += [
+                *[gnss.sample_i_ants[n].eq(src_i[n]) for n in range(num_ants)],
+                *[gnss.sample_q_ants[n].eq(src_q[n]) for n in range(num_ants)],
+                gnss.sample_stb.eq(src_stb),
+                gnss.ants_valid.eq(src_valid),
+            ]
+
+    def _records(self, piped, mode_1r1t, gap, nword=700, dc=80, std=80):
+        dut  = self.Chain(piped)
+        rnd  = random.Random(4242)
+        bits = pseudo_code(self.LENGTH)
+        step = (1 << FRAC) // self.SPC
+        recs = []
+
+        def bench():
+            g = dut.gnss
+            yield g.source.ready.eq(1)
+            yield dut.rx.mode_1r1t.eq(mode_1r1t)
+            yield g.ch0._code_freq.storage.eq(step)
+            yield g.ch0._carrier_freq.storage.eq(0)
+            yield g._control.storage.eq(1)
+            yield from csr_write(g.ch0._subcarrier_load, 1 | (0 << 8) | (1 << 13))
+            yield from csr_write(g.ch0._code_length, self.LENGTH)
+            yield from csr_write(g.ch0._code_load, LOAD_RESET)
+            for b in bits:
+                yield from csr_write(g.ch0._code_load,
+                                     LOAD_WE | (LOAD_DAT if b else 0))
+            yield from csr_write(g.ch0._replica, 1 | (1 << 4))
+            yield from pulse_control(g.ch0, CTL_RESTART | CTL_CARRIER_SET)
+            out = []
+            for _ in range(nword):
+                w = 0
+                for slot in range(4):
+                    w |= (int(rnd.gauss(dc, std)) & 0xffff) << (16 * slot)
+                yield dut.rx.rx_data.eq(w)
+                yield dut.rx.rx_stb.eq(1)
+                yield
+                if (yield g.source.valid):
+                    out.append((yield g.source.data))
+                for _ in range(gap):          # DMA0 not ready
+                    yield dut.rx.rx_stb.eq(0)
+                    yield
+                    if (yield g.source.valid):
+                        out.append((yield g.source.data))
+            yield dut.rx.rx_stb.eq(0)
+            for _ in range(4 * RECORD_WORDS):
+                yield
+                if (yield g.source.valid):
+                    out.append((yield g.source.data))
+            for n in range(len(out) // RECORD_WORDS):
+                recs.append(unpack_record(out[n * RECORD_WORDS:(n + 1) * RECORD_WORDS]))
+
+        run_simulation(dut, bench())
+        return [r for r in recs if not r.get("epoch_strobe")]
+
+    def _assert_same(self, mode_1r1t, gap):
+        direct = self._records(False, mode_1r1t, gap)
+        piped  = self._records(True,  mode_1r1t, gap)
+        self.assertTrue(direct, "no records at all -- the stimulus is wrong")
+        self.assertEqual(len(direct), len(piped))
+        for a, b in zip(direct, piped):
+            for field in ("i_prompt", "q_prompt", "i_early", "q_early",
+                          "i_late", "q_late", "integrated_samples",
+                          "code_phase_chip"):
+                self.assertEqual(a[field], b[field],
+                                 f"{field} differs with the pipeline stage "
+                                 f"(mode_1r1t={mode_1r1t}, gap={gap})")
+
+    def test_the_stage_is_invisible_in_2r2t(self):
+        self._assert_same(mode_1r1t=0, gap=1)
+
+    def test_the_stage_is_invisible_with_no_dma_gaps(self):
+        # rx_stb high every cycle: the strobe never falls, so a stage that
+        # leaked the strobe's edge rather than delaying it would still pass
+        # here -- this is the easy case, kept as the control for the next two.
+        self._assert_same(mode_1r1t=0, gap=0)
+
+    def test_the_stage_is_invisible_in_1r1t(self):
+        # 1R1T emits a second strobe from `pending`, a cycle after the word.
+        self._assert_same(mode_1r1t=1, gap=1)
+
+    def test_the_stage_is_invisible_under_long_back_pressure(self):
+        self._assert_same(mode_1r1t=0, gap=3)
 
 
 if __name__ == "__main__":
