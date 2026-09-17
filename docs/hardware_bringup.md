@@ -52,9 +52,10 @@ cd ~/litex_m2sdr/litex_m2sdr/software/user
 ./m2sdr_util flash_write -y -c 0 \
   /home/orin/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023/gateware/gnss_m2sdr_m2_x1_ch4_ant1_code1023.bin \
   0x00800000
-sudo shutdown -r +0                                      # reconfigure the FPGA
+./m2sdr_util flash_reload     # ICAP: makes the FPGA re-read the flash. REQUIRED.
+sudo shutdown -r +0           # mandatory: flash_reload wedges PCIe
 # after the host is back:
-./m2sdr_util info                                        # expect the new SoC identifier
+./m2sdr_util info             # expect the new SoC identifier
 ```
 
 Three things that are not obvious and each cost an hour:
@@ -64,11 +65,15 @@ Three things that are not obvious and each cost an hour:
   **absolute** path turns into `..//home/orin/...` and the write fails.
 - **Give the write no timeout.** 7 MiB takes ~80 s. A timeout that fires
   mid-erase leaves a half-written operational slot.
-- **Reboot the host; do not rely on `flash_reload`.** On this Orin the ICAP
-  reload wedges the PCIe link: every config read returns `0xff`, the kernel logs
-  AER `CmpltTO`, and the device disappears from `/sys/bus/pci/devices` so a
-  `remove` + `rescan` cannot bring it back. A reboot does, and the board comes up
-  on the newly written image. Budget ~2 minutes for the round trip.
+- **`flash_reload` is required, *and* the reboot after it is required.** A warm
+  `shutdown -r` does not drop power to the M.2 card, so the FPGA keeps its
+  current configuration and never re-reads the flash — a write that reported
+  `Success.` then looks like it did nothing, because `m2sdr_util info` still
+  shows the old SoC identifier. `flash_reload` is the ICAP reconfiguration that
+  makes it re-read. It then wedges the PCIe link (every config read `0xff`, AER
+  `CmpltTO`, the device gone from `/sys/bus/pci/devices`, and `remove` +
+  `rescan` cannot bring it back), so the reboot is mandatory too. Sequence:
+  **flash_write → flash_reload → reboot**, ~2 minutes.
 
 ### Recovery / rollback
 
@@ -99,7 +104,7 @@ content ends. To restore it:
 ```bash
 cd ~/litex_m2sdr/litex_m2sdr/software/user
 ./m2sdr_util flash_write -y -c 0 /home/orin/gnss-m2sdr/rollback/op_slot_backup.bin 0x00800000
-sudo shutdown -r +0
+./m2sdr_util flash_reload && sudo shutdown -r +0
 ./m2sdr_util info        # expect the 2026-07-29 23:42:50 SoC identifier back
 ```
 

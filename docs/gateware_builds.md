@@ -540,116 +540,96 @@ suspect the sample path as well.
 that is `software/record_stream.py`'s DMA-writer ioctl or the record path itself
 was not established. **No record was captured, framed or parsed on hardware.**
 
-### 5.6c Diagnosis so far: what is ruled out, and where it points now
+### 5.6c Measured on the failing build: what it is not, and what is left
 
-No silicon was used for any of this; it is all from the synthesis reports, the
-generated Verilog and the board-free simulator.
+On 2026-09-17 the v3 bitstream was put back on the board for one session, the
+two readings of the previous revision of this section were taken, and it was
+rolled back. **Everything below is measured on the failing gateware**, which is
+the thing none of the earlier simulation and netlist work could reach.
 
-**Ruled out.**
+*Reading 1 — the integration window is exact.* `integrated_samples` reads
+**4000 on every dump**, which is one 1023-chip epoch at fs = 4 MHz, with
+`dump_code_chip` 1022 and `code_length_active` 1023. **The "accumulator is never
+cleared" branch is dead**: the accumulator is cleared, every epoch, on time.
 
-| Hypothesis | How | Result |
-|---|---|---|
-| Latch inference on the `Array(...)[k_r]` subcarrier mux | `grep -i latch` in the synthesis log; read the emitted Verilog | **No.** `checking latch_loops (0)`, and Migen emits a default assignment (`comb_self8 = 8'd0;`) ahead of the case, so the assignment is complete |
-| Code RAM mis-inferred or wrong depth | Vivado's Distributed RAM mapping report | **No.** All twelve code RAMs (4 channels × 3 copies) map to `RAM128X1D`/`RAM64X1D`/`RAM32X1D`/`RAM16X1D` totalling exactly 4096 × 2 bits |
-| Memory Verilog wrong | Read the emitted block | **No.** Async read at `rp_adr`, synchronous write, `$readmemh` init — a clean LUTRAM template |
-| A runtime code load never reaching the replica | New tests, `TestRuntimeCodeLoadReachesTheReplica` and `TestAccumulatorsDependOnTheLoadedCode` | **No.** See below |
-| Accumulator headroom lost to `replica_bits` 8 | `replica_shape("LOC")` is a one-entry **unit** table | **No.** GPS L1 C/A's replica is ±1 on a sub-chip build exactly as on v1 |
+*Reading 2 — the samples are fine.* A DMA0 capture taken from the same stream
+while the correlators ran: I mean **+0.07**, std **86.8**, |I|max **1148**; Q
+mean +0.06, std 86.4. Zero-mean, no DC, nothing unusual.
 
-The load hypothesis was the strongest one and deserved the most care, because
-**`load_we` had no test anywhere** — every other test seeds the RAM through
-`code_init` at construction and never writes a chip at runtime. A load that
-never landed would leave the power-on `init` in place and make all three test
-codes produce the same sums, which is precisely the board symptom. It is now
-covered at both levels, and it **passes**: the replica follows a code written at
-runtime, a second load replaces the first, the subcarrier-select bit is written
-beside the chip, and at bank level an all-ones and an all-zeros load produce
-accumulators that are *exact negatives* of each other over a full integration.
-So the write path is correct in simulation, and a missing load is not the fault.
+*And those two together are a contradiction.* With a constant `+1` replica (an
+all-ones code, LOC unit table), 4000 samples and a carrier amplitude of at most
+127, the largest `|ip|` this stream can possibly produce is
+127 × 4000 × 1148 = **5.8 × 10⁸**. The measured `ip` is **−2.147 × 10⁹**, and
+`dump_saturated` is 1. Even a worst-case accumulation, every sample pushing the
+same way, cannot reach the rail. **The correlator is not summing these samples.**
 
-**Where the arithmetic now points.** The same simulation gives a hard bound that
-the earlier guesswork did not have. With `integrated_samples = 4000` per dump,
-replica ±1 and carrier amplitude ≤ 127, a constant replica makes the accumulator
-`amp × Σ sample`, so a DC offset *d* in the samples gives |sum| ≈ 508 000·*d*.
-Simulation confirms it: at *d* = 80 an all-ones code accumulates 40 768 905, and
-an all-zeros code −40 768 905. That is a factor of **52 below** the 2³¹ rail.
+(A method note, because the first attempt got it wrong: once the accumulator has
+saturated, `ip` only bounds the sum, so dividing it by `N × amp` does *not*
+measure the mean sample. The resulting "−4226" is a lower bound — and the fact
+that it exceeds the stream's own maximum of 1148 is the contradiction, not a
+measurement of anything.)
 
-For the board to rail, therefore, one of these must be true:
+*The decisive test — the replica's sign does not reach the output.* Load an
+all-ones code (replica constant **+1**), read the accumulators; load an
+all-zeros code (replica constant **−1**), read them again:
 
-- the samples arriving at the correlator are ~50× larger than the ones DMA0
-  carries (std ≈ 80 measured), i.e. |sample| ≈ 4200; **or**
-- roughly 50× more samples are being integrated per dump than one code period.
+| code | replica | `ip` |
+|---|---|---:|
+| all ones | +1 | −2 147 472 091 … −2 143 939 205 |
+| all zeros | −1 | −2 146 150 275 … −2 147 357 537 |
 
-Both are in the **sample and accumulate path — not the replica**, which is where
-§5.6b and the first version of this section pointed. The one change §5 made in
-that path is §5.2's registered sample bundle (`SampleStreamRegister`, and the
-rewiring of `soc.py` around it), and that rewiring has no SoC-level test.
+**The same, both railed negative.** Inverting the replica must invert the sum;
+it does not. A real C/A code gives the same picture. `gnss_saturation` reads
+`0xf` — all four channels — with `gnss_overflow` 0, `gnss_rate_error` 0 and
+`code_status` 0.
 
-**The prime suspect was our own change.** `SampleStreamRegister` and the
-`soc.py` rewiring came in with §5.2 as one of the four pipeline stages; the only
-v3 image ever flashed carried them, and the §2 build without them was never put
-on silicon. So "the timing fix introduced the correlation bug" was a live
-hypothesis and, with the replica path cleared, the leading one. That rewiring
-had no test either; it now has one (`TestObserverRegisterBankChain`), and the
-bank produces bit-identical records with and without the stage in both AD9361
-channel modes, with and without DMA0 back-pressure. **The netlist query below
-then cleared it in silicon too**, which simulation alone could not do.
+*What is still alive.* The five taps are not identical: `ip`, `ie` and `il`
+differ from each other dump to dump (VE/P/VL coincide only because the channel
+was in its three-tap layout, `dump_num_taps` 3). So the tap structure and the
+per-tap selection are doing something; it is the sign and magnitude of the
+product that are wrong.
 
-**Interrogating the implemented netlist.** The `_route.dcp` checkpoint is the
-exact netlist that became the flashed bitstream, so it answers "what did Vivado
-actually build" without a rebuild and without the board. Open it with
-`open_checkpoint` and query it (~2 min per query on this design):
+**What this leaves.** Measured good *on the failing silicon*: the sample path,
+the integration window, the code RAM, the code NCO, the epoch detector, the dump
+machinery and the whole CSR map. Cleared earlier in simulation and in the
+implemented netlist: the runtime code load, the `soc.py` rewiring and §5.2's
+pipeline stage, latch inference, RAM inference and replica constant-propagation.
 
-| Question | Answer |
-|---|---|
-| Were the replica registers optimised away or tied constant? | **No.** `word_r`, `k_r`, `w_prev`/`w_cur`/`w_next`, `idx_far`, `lut_a` all present; 293 flops in `codereplica0`; every net `TYPE=SIGNAL`, none a constant |
-| Did §5.2's pipeline stage survive? | **Yes, but not where you would look.** See below |
+The fault is in the **multiply / accumulate / saturate stage** — between the
+replica and the accumulator — and nowhere else that has been looked at.
 
-Two traps worth knowing before reading such a query:
+One hypothesis the evidence is consistent with but which is **not demonstrated**:
+this is the first build with `replica_bits = 8` (every image that ever worked had
+2, because `replica_bits_for` returns 2 for `max_subchips <= 1`). The product and
+accumulator datapath is therefore sized for an 8-bit replica even though GPS L1
+C/A's runtime amplitude is ±1, and `dump_saturated` is set on the very first dump
+after a restart. Testing that means reading the accumulate stage in `channel.py`
+against `accum_bits`, and then a build — neither of which is in this session's
+scope.
 
-1. **Migen names signals after the module *class*, not the instance.** The
-   attribute is `self.gnss_rx_pipe`, but every net is `samplestreamregister_*`;
-   `self.gnss_rx` becomes `rxsampleobserver_*`. A query for `*gnss_rx_pipe*`
-   returns zero cells and looks alarming. The instance names appear only in the
-   hierarchy *comment* at the top of the generated Verilog.
-2. **A register that has vanished may have moved into a DSP.** Querying
-   `*samplestreamregister*` finds exactly **one** flop — the strobe — and none
-   for the 32 bits of `out_i`/`out_q`. That reads like a bundle delay whose data
-   path lost its register while the strobe kept one, which would skew sample
-   against strobe and is precisely the shape of fault being hunted. It is not.
-   The sample-path DSP48E1s carry **`AREG = 1`** and their `A` pins are driven
-   straight from `rxsampleobserver0/1`: Vivado absorbed the data flops into the
-   DSP's own input register, which is exactly the placement §5.2 wanted.
+### 5.6d The v3-aware host adapter, against real v3 silicon
 
-The alignment was then checked rather than assumed, because the whole question
-is whether both halves of the bundle are delayed equally:
+Taken in the same window because it is otherwise unobtainable: the board is
+normally on the 2026-07-29 image, whose v1 CSR layout `M2SDRCorrelator` refuses
+by name at construction.
+
+GNSSM2SDR.jl master `67ca254` (PR #11 made `M2SDRCorrelator` speak CSR layout v3,
+PR #12 moved the examples onto GNSSReceiver's `HardwareCorrelatorLink` with
+`NCOReferencedPLLAndDLL`), with GNSSReceiver at `hardware-correlator-12`:
 
 ```
-trackingchannel0171      AREG=1  CEA1=<const0>  CEA2=<const1>  CLK=sys_clk
-trackingchannel017_reg   AREG=1  CEA1=<const0>  CEA2=<const1>  CLK=sys_clk
-samplestreamregister_out_stb_reg (FDRE)  CE=<const1>  R=ad9361_rx_cdc_cd_rst
+raw stream started: RawStream{SignalChannels.SignalChannel{Complex{Int16}, 1, Matrix{Complex{Int16}}}}
+*** CONSTRUCTED against v3 silicon:
+    M2SDRCorrelator{1, Tracking.VeryEarlyPromptLateCorrelator{1, ComplexF64}}
 ```
 
-One register on the data path and one on the strobe, same clock, both
-unconditionally enabled. **§5.2 is correctly implemented in silicon**, which is
-a stronger statement than the simulation test above and clears the leading
-suspect at the level that matters.
-
-**The next measurements, cheapest first.** The first two are single CSR reads
-and settle it — but note that **they need the v3 image reflashed**. The
-rolled-back 2026-07-29 gateware has `integrated_samples` too, and reading it
-there measures the *working* build: a useful control, not the measurement.
-There is no way to diagnose the failing build without putting it back on.
-
-1. **Read `integrated_samples` on a dump.** ~4000 ⇒ the integration window is
-   right and the samples are wrong; far more ⇒ the accumulator is not being
-   cleared at the epoch. This one number splits the two branches above.
-2. **Read the observer's sample registers** and compare their magnitude against
-   a DMA0 capture taken at the same moment. A ~50× discrepancy names §5.2.
-3. Only then bisect by building: `--max-subchips 1` first (it removes the whole
-   `lut_a`/`lut_b` mux and the `nsub × subchips` multiply), then `--taps 3`.
-4. Whatever the cause, add a CSR that reads the live `replica[t]` and the
-   observer's sample. Everything above is inference from accumulator values; two
-   readable registers would have made this minutes rather than a build cycle.
+**It constructs, and it negotiates the five-tap layout** — the correlator type it
+selects is `VeryEarlyPromptLateCorrelator`, chosen from the gateware's own
+capability registers, so the v3 capability gate and the `tap_layouts` handshake
+both work against real hardware. Tracking was not attempted: the correlators do
+not correlate (§5.6c above), so there would be nothing to see. **Arming a channel
+was not reached** either — two accessor calls in the probe failed on the probe's
+own scoping mistakes, and the rollback took priority over fixing them.
 
 ### 5.7 What is on the board, and rolling back
 
@@ -702,6 +682,12 @@ same session.
 **Confirmed on the board after the reboot** (2026-09-17): the SoC identifier
 reads *built on 2026-07-29 23:42:50* again, and the whole chain works — see
 §5.7b for the measurement. The regression baseline is intact.
+
+The v3 image went back on once more the same evening for the measurement session
+of §5.6c, and was rolled back from the same byte-exact backup. Confirmed again
+afterwards: identifier *2026-07-29 23:42:50*, FPGA Operational, and GPS L1 C/A
+acquiring on five PRNs above a median-38.8 dBHz floor (MAD 0.39) — PRN 24 at
+58.0, 32 at 50.2, 25 at 45.8, 29 at 45.3, 28 at 41.4.
 
 One trap worth writing down: the tracking bank is an observer on the RX stream,
 so it only sees samples while DMA0 is draining and `m2sdr_record` has to outlive
@@ -822,11 +808,24 @@ the tell — a real sky does not hand over every PRN you ask for.
 
 ### 5.8 Three things that cost hours on the hardware side
 
-*`flash_reload` wedges PCIe on this host.* After the ICAP reload the device
-answers every config read with `0xff` and the kernel logs AER `CmpltTO`. A PCIe
-`remove` + `rescan` does **not** recover it — the bridge is gone from
-`/sys/bus/pci/devices` entirely. A host reboot does. So: flash, then reboot;
-budget ~2 min, not the ~10 s `flash_reload` suggests.
+*`flash_reload` is required, and it wedges PCIe on this host.* Both halves
+matter, and an earlier revision of this page got the first one wrong.
+
+**A warm reboot does not reconfigure the FPGA.** `shutdown -r` does not drop
+power to the M.2 card, so the FPGA keeps the configuration it already holds and
+never re-reads the flash. Measured on 2026-09-17: `flash_write` reported
+`Success.` and exited 0, the host rebooted, and `m2sdr_util info` still showed
+the *old* SoC identifier. The bitstream was in the flash the whole time. Anyone
+following the old advice would flash, reboot, see no change and conclude the
+write had failed.
+
+`flash_reload` is the ICAP reconfiguration that makes the FPGA re-read the
+flash, so it is not optional. It then wedges PCIe: the device answers every
+config read with `0xff`, the kernel logs AER `CmpltTO`, and a `remove` +
+`rescan` does **not** recover it — the bridge is gone from
+`/sys/bus/pci/devices` entirely. So the reboot *after* `flash_reload` is
+mandatory too. The working sequence is **flash_write → flash_reload → reboot**,
+about 2 minutes end to end; orin2 has come back in ~5 min and, once, in ~40.
 
 *Rebuilding the driver needs three headers, not one.* Copying LiteX's generated
 `csr.h` into `litex_m2sdr/software/{kernel,user}` breaks the build — the
