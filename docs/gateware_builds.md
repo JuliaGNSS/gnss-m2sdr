@@ -559,7 +559,23 @@ fails to configure at all.
 back.** `m2sdr_util flash_write` of `op_slot_backup.bin` to `0x00800000`
 reported `Success.` and exited 0 at 2026-09-17 13:19 UTC, and the pre-flash
 driver headers, kernel module and user tools were restored and rebuilt in the
-same session. <!--ROLLBACK-CONFIRM--> 
+same session.
+
+**Confirmed on the board after the reboot** (2026-09-17 15:0x UTC): the SoC
+identifier reads *built on 2026-07-29 23:42:50* again, the sample stream runs at
+4 002 068 samples/s against fs = 4 MHz, and GPS L1 C/A acquires on **ten of ten
+PRNs tried** — 1, 3, 8, 14, 17, 19, 21, 22, 28, 32, peak/median 16.8 to 39.6,
+Dopplers between −4000 and +3500 Hz. The regression baseline is intact.
+
+One trap on the way there, worth writing down: the acquisition sweep reads the
+correlators over CSR, but the bank only sees samples while DMA0 is draining, so
+`m2sdr_record` has to outlive the whole sweep. Its byte limit is not a hint —
+`m2sdr_record /dev/null 100000000` exits after ~6 s at 4 MSPS, and every PRN
+after that returns **metric exactly 0.00** with no error anywhere. Give it a
+limit that cannot be reached (`100000000000`) and check the sample counter is
+still advancing when the sweep ends. Note also that the CSR map of the image on
+the board predates #31: driving it needs the host code from commit `8220716`,
+not this branch's.
 
 ### 5.8 Three things that cost hours on the hardware side
 
