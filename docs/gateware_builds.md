@@ -17,6 +17,7 @@ was built against).
 |---|---:|---:|---:|---:|---|---|
 | `RELEASE_ch4_ant1_timing_clean` (v1, 2026-07-28) | 3 | 1 | 1023 | 1 | **WNS +0.005 ns** — met | no (see §5) |
 | `gnss_m2sdr_m2_x1_ch4_ant2_code10230_tap5_sub12` (as of #32) | 5 | 12 | 10230 | 2 | **WNS −2.875 ns** — *not met* | **no** |
+| `gnss_m2sdr_m2_x1_ch4_ant2_code1023_tap5_sub12` (isolation, §2b) | 5 | 12 | 1023 | 2 | **WNS −1.288 ns** — *not met* | **no** |
 | same, after the pipeline fixes of §5 | 5 | 12 | 10230 | 2 | **WNS −0.788 ns** — *not met* | no |
 | `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12` (§5.6) | 5 | 12 | 4092 | 1 | **WNS +0.015 ns** — met | **flashed, then rolled back** (§5.6b) |
 
@@ -151,6 +152,71 @@ what this build ran out of.
 Route delay is 66% of the path, so placement is fighting it too, but 17 logic
 levels at 125 MHz is the primary problem: no placement fixes a path that deep.
 
+## 2b. Isolating the cause: is it just the code depth?
+
+Before any pipelining, one question had to be answered: is the failure *the
+10 230-chip code RAM being too deep*, or *the five-tap sub-chip channel being
+too deep*? That decides whether a smaller build is a usable workaround at all,
+and the whole all-signal chain was blocked on it. So the identical build was
+repeated with only `--max-code-length` reduced:
+
+```
+python build.py --channels 4 --num-ants 2 --max-code-length 1023 \
+                --taps 5 --max-subchips 12 --build
+```
+
+| | 10230 chips | 1023 chips |
+|---|---:|---:|
+| WNS | −2.875 ns | **−1.288 ns** |
+| TNS | −17 020.270 ns | −2 431.957 ns |
+| Failing endpoints | 18 685 / 167 097 | 4 572 / 103 169 |
+| Slice LUTs | 33 185 (24.80%) | 24 816 (18.55%) |
+| LUT as Memory | 10 416 (22.55%) | 3 442 (7.45%) |
+| F7 Muxes | 4 796 | 1 421 |
+| DSP48E1 | 112 | 112 |
+
+The deep code RAM is worth about **1.59 ns** of the 2.875 ns — a large share,
+and exactly where the collapse in LUT-as-memory and F7 muxes says it should be.
+**But the shorter build still misses by 1.288 ns**, on a path that has moved off
+the code RAM entirely:
+
+```
+Source:      litepciedma0_buffering_syncfifo1_readable_reg/C             (FDRE)
+Destination: gnsstracking_channelwithcsr2_trackingchannel232_reg/PCIN[0] (DSP48E1)
+Data Path Delay: 8.234 ns  (logic 5.121 ns 62.2%, route 3.113 ns 37.8%)
+Logic Levels:    10  (CARRY4=5 DSP48E1=1 LUT2=1 LUT4=1 LUT6=2)
+```
+
+That is LitePCIe's DMA0 writer FIFO level driving `rx_stream.ready`, through the
+RX observer's output mux, into the correlator **accumulator** DSP48E1 cascade —
+*logic*-dominated at 62%, and untouched by the code length.
+
+(One caveat, recorded because it was measured: in the 1023-chip build `rfic_clk`
+also shows −0.245 ns over 76 endpoints, where the 10 230-chip build met it at
++0.015 ns. Both are near zero and the domain is unrelated to this work, so it is
+most likely placement variance rather than a real difference.)
+
+### What this experiment established, and how §5 used it
+
+Two conclusions, and they are the two halves of the eventual fix rather than
+opposing claims:
+
+1. **Reducing the configuration alone cannot close this.** At 1023 chips — a
+   16:1 LUTRAM output mux instead of 160:1, the most aggressive reduction
+   available — the design still missed by 1.288 ns. Anyone hoping to flash a
+   smaller v3 build without touching the RTL would have burned a day finding
+   that out.
+2. **The code RAM depth, not the tap depth, is the expensive half.** 1.59 ns of
+   2.875 ns came off for the code length alone, while `DSP48E1` stayed at 112 —
+   five taps cost nothing extra in multipliers, exactly as designed.
+
+§5 closed timing with *both* halves: the four pipeline stages **and** a reduced
+configuration (4092 chips, one antenna). Neither would have done it alone. The
+second path this experiment exposed — the accumulator's DSP48E1 cascade — was
+not pipelined at all; it went away because dropping to one antenna halved those
+cascades, which is why §5.6 calls the second antenna the expensive concession
+rather than the code length.
+
 ## 3. What this means
 
 - **That bitstream must not be flashed.** A design that misses setup by 2.9 ns
@@ -160,12 +226,11 @@ levels at 125 MHz is the primary problem: no placement fixes a path that deep.
   read (or the replica product). It does not even have to cost a cycle of
   latency — see §5.
 
-A shorter code does **not** rescue it. The same configuration at
-`--max-code-length 1023` (a 16:1 LUTRAM output mux instead of 160:1) still
-misses, at **WNS −1.288 ns**, and on a *different* path: LitePCIe's DMA0 writer
-FIFO level → `rx_stream.ready` → the RX observer's output mux → the A input of
-the carrier wipe-off DSP48E1 → its PCOUT/PCIN cascade. Two independent paths
-were over budget, so trimming the configuration was never going to be enough.
+A shorter code does **not** rescue it on its own — §2b measured that
+directly: the same configuration at `--max-code-length 1023` still misses, at
+**WNS −1.288 ns**, on a different path. Two independent paths were over budget,
+so trimming the configuration was never going to be enough by itself. It was
+still necessary: §5 needed the pipeline stages *and* a reduced build.
 
 ## 4. Reproducing a build in this sandbox
 
@@ -216,11 +281,12 @@ loops on `os.waitpid(-1, 0)`) works. Confirm the fix by checking that no new
 Do not "fix" this by lowering `general.maxThreads` unless you have to; reaping
 is the actual bug and single-threaded synthesis is much slower.
 
-## 5. Closing it: three pipeline stages, no extra latency
+## 5. Closing it: four pipeline stages, no extra latency
 
-Three paths were over budget, and they had to be fixed in that order because
-each one hid the next. None of them needed the configuration to shrink, and none
-of them cost a cycle of correlator latency: every stage below is computed from a
+Four paths were over budget, and they had to be fixed in that order because each
+one hid the next. Pipelining alone was not enough — §2b had already shown that
+reducing the configuration alone was not either, and closure needed both — but
+none of these stages cost a cycle of correlator latency: every stage below is computed from a
 value that is *already known one cycle early*, so the sample it describes still
 arrives on the sample it belongs to. The board-free suite is the check that this
 is true rather than merely intended.
