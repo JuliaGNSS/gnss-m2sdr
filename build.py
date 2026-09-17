@@ -44,7 +44,8 @@ def main():
     p.add_argument("--variant",  default="m2",         help="Board variant.", choices=["m2", "baseboard"])
     p.add_argument("--pcie-lanes", default=1, type=int, choices=[1, 2, 4])
     p.add_argument("--output-dir", default="build",     help="Build output directory.")
-    p.add_argument("--timing-effort", default="default", choices=["default", "high"],
+    p.add_argument("--timing-effort", default="default",
+                   choices=["default", "high", "max"],
                    help="Vivado implementation effort. 'high' asks for "
                         "ExtraTimingOpt placement, Explore routing and an "
                         "AggressiveExplore post-route phys_opt; it roughly "
@@ -72,12 +73,24 @@ def main():
                   f"_tap{args.taps}_sub{args.max_subchips}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),
                       csr_csv=os.path.join(args.output_dir, build_name, "csr.csv"))
+    # Vivado is deterministic for a given netlist and directive set, so a build
+    # that misses by picoseconds cannot be "tried again" -- the directives have
+    # to change. 'max' escalates the two passes that move a sub-100 ps setup
+    # miss: routing explores harder, and the post-place phys_opt matches the
+    # post-route one instead of trailing it.
     effort = {}
     if args.timing_effort == "high":
         effort = dict(
             vivado_place_directive               = "ExtraTimingOpt",
             vivado_post_place_phys_opt_directive = "Explore",
             vivado_route_directive               = "Explore",
+            vivado_post_route_phys_opt_directive = "AggressiveExplore",
+        )
+    elif args.timing_effort == "max":
+        effort = dict(
+            vivado_place_directive               = "ExtraTimingOpt",
+            vivado_post_place_phys_opt_directive = "AggressiveExplore",
+            vivado_route_directive               = "AggressiveExplore",
             vivado_post_route_phys_opt_directive = "AggressiveExplore",
         )
     builder.build(build_name=build_name, run=args.build, **effort)
