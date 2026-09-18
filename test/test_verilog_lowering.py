@@ -184,6 +184,114 @@ class TestTheLiteXConverterEmitsNoUnsignedNegativeLiteral(unittest.TestCase):
                                 max_subchips=12), "CodeReplica")
 
 
+class TestTheMemoryInitFilesAreReadable(unittest.TestCase):
+    """Every `.init` file the build writes must be plain unsigned hex.
+
+    A `Memory.init` entry goes to Vivado through `$readmemh`, and LiteX writes
+    it as a bare hex number -- so a negative Python int comes out as `-3`,
+    which is not a hex digit. xsim stops reading the file there and leaves the
+    rest of the ROM `x`; Vivado's synthesis silently drops the sign. The
+    carrier NCO's sin/cos ROMs are signed tables, and the flashed five-tap
+    build carried |sin| and |cos| -- a rectified carrier with no fundamental,
+    so the correlators integrated noise against every satellite while every
+    counter stayed healthy. docs/gateware_builds.md 5.6g has the measurement.
+
+    Checked on the LiteX converter's output, which is what the build uses, for
+    the whole bank -- any memory anyone adds later is covered too.
+    """
+
+    HEX = re.compile(r"^[0-9a-fA-F]+$")
+
+    def _data_files(self, dut, ios):
+        from litex.gen.fhdl.verilog import convert as litex_convert
+
+        class Wrap(Module):
+            def __init__(self, inner):
+                self.clock_domains.cd_sys = ClockDomain("sys")
+                self.submodules.inner = inner
+
+        w = Wrap(dut)
+        out = litex_convert(w, ios={w.cd_sys.clk, w.cd_sys.rst} | set(ios))
+        return out.main_source, out.data_files
+
+    def _check(self, dut, ios, label):
+        try:
+            source, files = self._data_files(dut, ios)
+        except ImportError:                      # pragma: no cover
+            self.skipTest("litex is not installed")
+        self.assertTrue(files, f"{label}: expected at least one memory init file")
+        for name, content in files.items():
+            width = None
+            m = re.search(r"reg \[(\d+):0\] (\w+)\[0:(\d+)\];\s*initial begin\s*"
+                          r"\$readmemh\(\"" + re.escape(name) + r"\"", source)
+            if m:
+                width = int(m.group(1)) + 1
+            bad = [(n, l) for n, l in enumerate(content.split(), 1)
+                   if not self.HEX.match(l)]
+            self.assertEqual(
+                bad, [],
+                f"{label}: {name} has {len(bad)} entries that are not unsigned "
+                f"hex -- $readmemh cannot read them (xsim stops at the first, "
+                f"Vivado drops the sign):\n"
+                + "\n".join(f"  line {n}: {l}" for n, l in bad[:8]))
+            if width is not None:
+                over = [l for l in content.split() if int(l, 16) >= (1 << width)]
+                self.assertEqual(over, [], f"{label}: {name} has entries wider than {width} bits")
+
+    def test_the_carrier_rom(self):
+        from gnss_m2sdr.gateware.carrier_nco import CarrierNCO
+        nco = CarrierNCO()
+        self._check(nco, [nco.freq_word, nco.stb, nco.cos, nco.sin], "CarrierNCO")
+
+    def test_the_whole_bank(self):
+        bank = GNSSTracking(n_channels=1, max_code_length=64, num_taps=5,
+                            max_subchips=12)
+        self._check(bank, [bank.sample_i, bank.sample_q, bank.sample_stb], "GNSSTracking")
+
+
+class TestNoNegativeLiteralAnywhere(unittest.TestCase):
+    """LiteX must never write `-N'h...` -- not only in comparisons.
+
+    The pinned LiteX (requirements-test.txt) renders a negative signed constant
+    as `$signed(N'h<pattern>)`; the commit before it wrote `-N'h<abs>`, which
+    Verilog reads as an unsigned literal. In a comparison that inverts the
+    test (5.6e); in an assignment or a product it is right only by the
+    accident of two's-complement wrap. Pin the property, so a toolchain
+    downgrade shows up here and not on the board.
+    """
+
+    # A unary minus on a literal: `-32'h80000000`. A minus that follows an
+    # operand (`produce - 1'd1`) is a subtraction and is fine, so those are
+    # rewritten out of the line before the search.
+    BINARY_MINUS = re.compile(r"([\w)\]])\s*-\s*", re.ASCII)
+    NEG_LITERAL  = re.compile(r"-\s*\d+'[hdb]", re.ASCII)
+
+    @classmethod
+    def unary_negative_literal(cls, line):
+        return cls.NEG_LITERAL.search(cls.BINARY_MINUS.sub(r"\1 SUB ", line))
+
+    def test_the_whole_bank(self):
+        from litex.gen.fhdl.verilog import convert as litex_convert
+
+        class Wrap(Module):
+            def __init__(self, inner):
+                self.clock_domains.cd_sys = ClockDomain("sys")
+                self.submodules.inner = inner
+
+        bank = GNSSTracking(n_channels=1, max_code_length=64, num_taps=5,
+                            max_subchips=12)
+        w = Wrap(bank)
+        src = litex_convert(w, ios={w.cd_sys.clk, w.cd_sys.rst, bank.sample_i,
+                                    bank.sample_q, bank.sample_stb}).main_source
+        bad = [(n, l.strip()) for n, l in enumerate(src.splitlines(), 1)
+               if self.unary_negative_literal(l)]
+        self.assertEqual(
+            bad, [],
+            f"{len(bad)} negative unsigned literal(s) in the LiteX output; the "
+            f"pinned LiteX renders them as $signed(): is an older LiteX installed?\n"
+            + "\n".join(f"  line {n}: {l[:120]}" for n, l in bad[:8]))
+
+
 class TestTheSaturatingAccumulatorClamp(unittest.TestCase):
     """The clamp itself, in Migen's simulator.
 

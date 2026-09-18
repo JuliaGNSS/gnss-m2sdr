@@ -20,12 +20,19 @@ was built against).
 | `gnss_m2sdr_m2_x1_ch4_ant2_code1023_tap5_sub12` (isolation, §2b) | 5 | 12 | 1023 | 2 | **WNS −1.288 ns** — *not met* | **no** |
 | same, after the pipeline fixes of §5 | 5 | 12 | 10230 | 2 | **WNS −0.788 ns** — *not met* | no |
 | `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12` (§5.6) | 5 | 12 | 4092 | 1 | **WNS +0.015 ns** — met | **flashed, then rolled back** (§5.6b) |
+| same RTL + #42 clamp fix, `--timing-effort max` (§5.6f) | 5 | 12 | 4092 | 1 | **WNS +0.012 ns** — met | flashed, did not correlate, rolled back (§5.6f) |
+| `…_code4092_tap5_sub12` with the carrier-ROM fix, `max` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.069 ns — *not met* (14 AD9361 BFP endpoints) | no |
+| same, `max` + `--directive place=ExtraPostPlacementOpt` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.115 ns — *not met* | no |
+| same, `max` + `--directive synth=PerformanceOptimized` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.000 ns** — met | no |
+| `…_code4092_tap5_sub12_placeSpread`: `max` + `--directive place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.003 ns** — met | **flashed 2026-09-18** (§5.9) |
 
 The v1 reference closed with **5 ps** of margin over 73 880 endpoints. That is
 the context for everything below: this design was already at the edge of the
 part before steps 3–5 added to it.
 
-**What is on the board today is none of these.** It is a **20-channel** build
+**What is on the board today** is the last row: the carrier-ROM fix at
+`--directive place=AltSpreadLogic_high`, flashed 2026-09-18 10:00 UTC; §5.9
+has what it does on sky. Before that it was a **20-channel** build
 (`gnss_m2sdr_m2_x1_ch20_ant1`, SoC identifier *built on 2026-07-29 23:42:50*),
 which is itself **WNS −0.181 ns** over 507 endpoints. §5.7 has the evidence and
 the rollback command. The timing-clean v3 build *was* flashed on 2026-09-17; it
@@ -767,6 +774,112 @@ directive set, so a build that misses by picoseconds cannot simply be run again
 sub-100 ps setup miss: post-place phys_opt and routing both go to
 `AggressiveExplore`. On this design `high` gave −0.070 ns and `max` gave
 +0.012 ns, on the same RTL.
+
+### 5.6g The second fault: the carrier ROM was written as `-3`
+
+§5.6f left one bounded question: with the clamp fixed, why does the channel
+still not correlate? Hypothesis 2 there — *the carrier wipe-off* — is the
+answer, and like the clamp it is a property of the Verilog the build writes,
+not of the design.
+
+**What the build writes.** The carrier NCO's sin/cos tables are `Memory`
+specials with signed `init` values (`_sincos_tables` returns −127…127). LiteX
+emits every memory's contents into a `$readmemh` file, formatting each entry
+with `"{:02x}".format(d)`. For a negative `d` that is not hex at all:
+
+```
+$ sed -n 127,134p gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_sin_mem.init
+06
+03
+00
+-3
+-6
+-9
+-c
+-10
+```
+
+Generated from `build.py --channels 4 --num-ants 1 --max-code-length 4092
+--taps 5 --max-subchips 12` on 2026-09-18 with the toolchain of
+requirements-test.txt: **eight `.init` files (sin and cos, four channels), 127
+of 256 entries negative in each.** Every bitstream this repository has ever
+built shipped those files.
+
+**What the two readers make of them — measured, not inferred.**
+
+| Reader | `00 03 06 -3 -6 7f 81 00` becomes | Effect on the ROM |
+|---|---|---|
+| xsim `$readmemh` | `00 03 06` then *"Illegal hex digit '-'"* and it stops | entries 3… keep their previous value (`x`) |
+| Vivado 2024.1 `synth_design` | `00 03 06 03 06 7f 81 00` — no warning, no error | **the sign is dropped** |
+
+The synthesis row is the one that reached the board: a tiny ROM with exactly
+that file, synthesised out of context and its netlist simulated with the
+unisim library, reads back `03`/`06` where `-3`/`-6` were written. So the
+flashed gateware held **|sin θ| and |cos θ|**. A rectified carrier has no
+component at the carrier frequency — only DC and even harmonics — so the
+wipe-off product `I·|cos| + Q·|sin|` averages to zero over any integration in
+which the NCO phase turns, i.e. for every Doppler but zero. That is exactly the
+§5.6f picture: code NCO right, chip index right, integration window right,
+accumulators noise-like at ±10⁵–10⁶ (the noise floor a 127-amplitude
+"carrier" produces), and no peak anywhere in a code-phase sweep of a 53.5 dBHz
+satellite.
+
+**Why the board-free suite was blind, again.** The Migen simulator holds
+`Memory.init` as Python integers; it never writes or reads a file. The gap is
+the same one §5.6e named — the suite and the bitstream are produced by
+different tools — and it is now closed from both sides:
+
+- `test/test_verilog_lowering.py::TestTheMemoryInitFilesAreReadable` lowers the
+  bank with LiteX's converter and requires every `.init` entry to be unsigned
+  hex within the memory's width. It fails on the pre-fix `carrier_nco.py`.
+- `test/test_verilog_lowering.py::TestNoNegativeLiteralAnywhere` requires that
+  no unary negative literal (`-N'h…`) appears anywhere in the LiteX output, not
+  only in comparisons. That holds with LiteX at or after `37b75bd4`
+  (2026-07-24, *"emit negative signed constants as $signed(N'h<pattern>)"*),
+  which is why requirements-test.txt now pins that commit: the previous pin,
+  `93c8d230`, is the commit **before** it, and rendered the clamp bound as
+  `-32'h80000000`. This is very probably the whole story of §5.6e as well —
+  the July builds were made against a LiteX that already had the fix, the
+  five-tap builds against a pin one day too old.
+- `scripts/xsim_correlation.py` runs the LiteX-lowered `TrackingChannel` in
+  Vivado's own simulator against a synthetic satellite and compares every dump
+  with the Migen simulation of the same netlist, bit for bit. It is the test
+  §5.6f asked for under hypothesis 3. `test/test_xsim_correlation.py` runs it
+  as part of the suite wherever xvlog/xelab/xsim are on the PATH and skips by
+  name where they are not (CI).
+
+**What the simulator says, before and after.** GPS L1 C/A PRN 1 at 4 MS/s,
++1500 Hz, amplitude 200 on σ = 30 noise, two code periods, one idle clock
+between samples; the satellite sits exactly on the replica, so the aligned
+prompt is `200 × 127 × 4000 ≈ 1.02 × 10⁸`:
+
+| Gateware | `.init` files | xsim `ip` | Migen `ip` | Verdict |
+|---|---|---:|---:|---|
+| main `8795de1` (#42) | as written (`-3`…) | `2147483647`, `dump_saturated` = 1 | 101 597 180 | ROM is `x` from entry 129; **FAIL** |
+| main `8795de1` (#42) | as Vivado reads them (sign dropped) | 17 325 840, then −17 176 541 | 101 597 180 | 6× low and sign-flipping: **no correlation — the board's symptom, reproduced** |
+| this fix | as written | **101 597 180** | 101 597 180 | **PASS**, all six accumulators bit-exact over both dumps |
+
+Galileo E1B, CBOC(6,1,1/11) on five taps at 24.552 MS/s, −2500 Hz, one 4092-chip
+period (98 209 samples): **PASS**, all ten accumulators bit-exact. One thing the
+run showed on the way: at test amplitude 200 the accumulators hit the 32-bit
+rail (`dump_saturated` = 1 in both simulators, still bit-exact) — a CBOC
+replica peaks at 25, and `25 × 127 × 200 × 98 209` is 6 × 10¹⁰. A live E1
+satellite is a few LSB per sample and stays two orders of magnitude below the
+rail; the suite's E1 case uses amplitude 20.
+
+**The fix** (`carrier_nco.py`): the tables are stored as their two's-complement
+bit patterns (`rom_words`), which is what an 8-bit signed ROM holds anyway and
+what every `$readmemh` reader can parse. Nothing about the NCO's behaviour
+changes in the Migen simulator — `test_carrier_nco.py` passes unchanged —
+because the read port is signed and reinterprets the pattern.
+
+What the July builds did with the same files is not known: no `.init` or
+Vivado log from them survives, only the `.bin`. They demonstrably wiped the
+carrier off (satellites at −1.6 to −6.8 kHz Doppler tracked for minutes), so
+whatever toolchain produced them did not read `-3` as `03`. The fix is right
+for every reader, so the question is recorded rather than pursued.
+
+**Status of this fix on hardware:** see §5.9.
 
 ### 5.7 What is on the board, and rolling back
 

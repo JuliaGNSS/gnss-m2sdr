@@ -55,6 +55,17 @@ def main():
                         "default effort, and that path is 52% routing, which is "
                         "what the stronger directives are for. See "
                         "docs/gateware_builds.md.")
+    p.add_argument("--directive", action="append", default=[], metavar="STAGE=DIRECTIVE",
+                   help="Override one Vivado directive on top of --timing-effort, e.g. "
+                        "place=ExtraPostPlacementOpt, route=AggressiveExplore, "
+                        "post_place_phys_opt=AggressiveExplore, "
+                        "post_route_phys_opt=AggressiveExplore, synth=PerformanceOptimized. "
+                        "Repeatable. Vivado is deterministic for a netlist and a directive "
+                        "set, so a build that misses by picoseconds is re-run with a "
+                        "different set, not the same one (docs/gateware_builds.md 5.9).")
+    p.add_argument("--build-name-suffix", default="",
+                   help="Appended to the build name, so directive variants of one "
+                        "configuration can live side by side under --output-dir.")
     args = p.parse_args()
 
     soc = GNSSSoC(
@@ -70,7 +81,7 @@ def main():
     build_name = (f"gnss_m2sdr_{args.variant}_x{args.pcie_lanes}"
                   f"_ch{args.channels}_ant{args.num_ants}"
                   f"_code{args.max_code_length}"
-                  f"_tap{args.taps}_sub{args.max_subchips}")
+                  f"_tap{args.taps}_sub{args.max_subchips}{args.build_name_suffix}")
     builder = Builder(soc, output_dir=os.path.join(args.output_dir, build_name),
                       csr_csv=os.path.join(args.output_dir, build_name, "csr.csv"))
     # Vivado is deterministic for a given netlist and directive set, so a build
@@ -93,6 +104,11 @@ def main():
             vivado_route_directive               = "AggressiveExplore",
             vivado_post_route_phys_opt_directive = "AggressiveExplore",
         )
+    for item in args.directive:
+        stage, _, directive = item.partition("=")
+        if not directive:
+            p.error(f"--directive expects STAGE=DIRECTIVE, got {item!r}")
+        effort[f"vivado_{stage}_directive"] = directive
     builder.build(build_name=build_name, run=args.build, **effort)
 
 

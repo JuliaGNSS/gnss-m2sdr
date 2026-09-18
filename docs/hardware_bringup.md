@@ -30,20 +30,26 @@ mkdir -p ~/gnss-m2sdr/rollback/headers_before
 cp kernel/{csr,soc,mem}.h user/csr.h ~/gnss-m2sdr/rollback/headers_before/
 
 B=~/gnss-m2sdr/build/gnss_m2sdr_m2_x1_ch4_ant1_code1023
-cp $B/software/include/generated/{soc,mem}.h kernel/
-# csr.h needs adapting -- see below
-python3 ~/gnss-m2sdr/scripts/driver_headers.py $B/software/include/generated/csr.h kernel/csr.h
+# All three headers need adapting -- see below
+for h in csr soc mem; do
+  python3 ~/gnss-m2sdr/scripts/driver_headers.py -o kernel/$h.h $B/software/include/generated/$h.h
+done
 cp kernel/csr.h user/csr.h
 cd kernel && make clean all && sudo make install && sudo ./init.sh
 cd ../user  && make clean all                         # rebuild m2sdr_util, m2sdr_rf, ...
 ```
 
-LiteX's generated `csr.h` cannot be copied in as-is: it `#include`s
+LiteX's generated headers cannot be copied in as-is: `csr.h` `#include`s
 `generated/soc.h`, `system.h` and `hw/common.h`, none of which exist in the
-M2SDR software tree, and the build fails on the first file that pulls it in.
-`scripts/driver_headers.py` strips those three includes and substitutes the
-handful of accessors the tree expects. Restore
-`~/gnss-m2sdr/rollback/headers_before/` and rebuild if anything goes wrong.
+M2SDR software tree, and since mid-2026 `csr.h` and `soc.h` also open with
+`#include <stdint.h>` (which a kernel module has no access to) and `csr.h`
+carries one `static inline` accessor per register calling `csr_read_simple`
+from the stripped `hw/common.h` (an implicit declaration the kernel build
+rejects). `scripts/driver_headers.py` strips the firmware-only includes, turns
+`<stdint.h>` into `<linux/types.h>` under `__KERNEL__`, and drops the accessor
+functions; the `CSR_*` address macros the driver actually uses are untouched.
+Restore `~/gnss-m2sdr/rollback/headers_before/` and rebuild if anything goes
+wrong.
 
 ## 2. Flash the gateware (multiboot operational slot) and reload
 
@@ -92,7 +98,11 @@ is one you read back off the flash yourself, **before** you overwrite it:
 ```bash
 cd ~/litex_m2sdr/litex_m2sdr/software/user
 mkdir -p ~/gnss-m2sdr/rollback
-./m2sdr_util flash_read -c 0 ~/gnss-m2sdr/rollback/op_slot_backup.bin 0x00800000 0x700000
+# flash_read FILE SIZE [OFFSET] -- size first, then the slot offset. The other
+# way round reads 8 MiB from 0x700000, i.e. the tail of the golden image
+# followed by the operational one (measured 2026-09-18: the sync word then
+# sits at 0x100030 instead of 0x30).
+./m2sdr_util flash_read -c 0 ~/gnss-m2sdr/rollback/op_slot_backup.bin 0x700000 0x00800000
 md5sum ~/gnss-m2sdr/rollback/op_slot_backup.bin
 # 8f04c9ecf12711efb76bf2a7dd700219  = what was on the board on 2026-09-17
 ```
