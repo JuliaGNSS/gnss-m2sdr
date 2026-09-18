@@ -24,7 +24,8 @@ was built against).
 | `…_code4092_tap5_sub12` with the carrier-ROM fix, `max` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.069 ns — *not met* (14 AD9361 BFP endpoints) | no |
 | same, `max` + `--directive place=ExtraPostPlacementOpt` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.115 ns — *not met* | no |
 | same, `max` + `--directive synth=PerformanceOptimized` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.000 ns** — met | no |
-| `…_code4092_tap5_sub12_placeSpread`: `max` + `--directive place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.003 ns** — met | **flashed 2026-09-18** (§5.9) |
+| `…_code4092_tap5_sub12_placeSpread`: `max` + `--directive place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.003 ns** — met | flashed 2026-09-18 10:00, verified on sky (§5.9) |
+| `…_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`: 6 channels, `max` + `synth=PerformanceOptimized` + `place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.007 ns** — met | **flashed 2026-09-18 13:05, on the board now** (§5.9b) |
 
 The v1 reference closed with **5 ps** of margin over 73 880 endpoints. That is
 the context for everything below: this design was already at the edge of the
@@ -1138,10 +1139,30 @@ there; its field record has every counter):
 **Six channels** close timing too, with `--directive synth=PerformanceOptimized
 --directive place=AltSpreadLogic_high` on top of `max`: **WNS +0.007 ns**,
 0 failing of 141 430 endpoints (`…_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`,
-5 374 172 bytes). Its `pcie_dma1`/`pcie_endpoint` bases are the same as the
-four-channel build's, so the driver on orin2 already fits it; it is staged
-under `~/gnss-m2sdr/build/` and not flashed. Eight channels miss by 0.173 ns on
+5 374 172 bytes, md5 `2ebd04238d9b6fa24dafbbcb270651ea`). Its
+`pcie_dma1`/`pcie_endpoint` bases are the same as the four-channel build's, so
+the driver on orin2 already fitted it. **Flashed 13:05 UTC**, power-cycled, up
+as *built on 2026-09-18 11:01:05*; `hw_accept_v3.py` passed all five checks
+(`n_channels` 6, 4 004 341 samples/s, three- and five-tap records on the
+wire). §5.9b has its sky runs. Eight channels miss by 0.173 ns on
 52 endpoints (the CSR readback mux, as §5.6 predicted).
+
+### 5.9b Six channels on sky
+
+Through GNSSReceiver with GNSSM2SDR's queued NCO words, 4 MS/s, same RF
+settings: **six GPS L1 C/A satellites in lock at once** (PRN 18, 24, 20, 22, 5
+and 23 at 30–45 dBHz), and over a 600 s run four to six satellites at
+35–45 dBHz for three minutes with **0 lost-record gaps, 0 device drops,
+1 074 708 NCO commits landing 0.04 ms late on average**. The gateware side of
+six channels is done.
+
+No GPS fix came out of it, and the reason is on the host: every GPS satellite
+becomes ranging-ready within seconds but in 240 s only one of five reached a
+decoded ephemeris, at 39–44 dBHz, while satellites at 41–46 dBHz stayed
+undecoded — and Galileo E1B decoded four ephemerides in 40 s through the same
+link the same day. GNSSReceiver's field record
+(`examples/analysis/hardware_live_m2sdr.md`) has the runs; the GPS LNAV path of
+the hardware link is where to look next, not the correlator.
 
 ### 5.8 Three things that cost hours on the hardware side
 
