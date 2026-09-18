@@ -1156,13 +1156,18 @@ and 23 at 30–45 dBHz), and over a 600 s run four to six satellites at
 1 074 708 NCO commits landing 0.04 ms late on average**. The gateware side of
 six channels is done.
 
-No GPS fix came out of it, and the reason is on the host: every GPS satellite
-becomes ranging-ready within seconds but in 240 s only one of five reached a
-decoded ephemeris, at 39–44 dBHz, while satellites at 41–46 dBHz stayed
-undecoded — and Galileo E1B decoded four ephemerides in 40 s through the same
-link the same day. GNSSReceiver's field record
-(`examples/analysis/hardware_live_m2sdr.md`) has the runs; the GPS LNAV path of
-the hardware link is where to look next, not the correlator.
+The GPS fix did not come at first, and the reason was on the host: every GPS
+satellite became ranging-ready within seconds but almost none reached a decoded
+ephemeris, while Galileo E1B decoded four in 40 s through the same link. The
+carrier phase was locked (17° standard deviation on a 41 dBHz satellite after
+removing the bit sign); the link was handing `Tracking` an occasional record
+that crossed the 20-block navigation-bit boundary, after which `Tracking`'s bit
+buffer — which looks for the boundary with `==` — never emitted another bit.
+With the two record-sizing fixes in GNSSReceiver (its field record
+`examples/analysis/hardware_live_m2sdr.md` has the trace), the same board gave
+**a GPS L1 C/A position fix after 205 s, 1095 solutions in the following 100 s**,
+at the site the Galileo-only fix had placed the antenna. Nothing in this
+repository changed for it: the correlator had been right since §5.9.
 
 ### 5.8 Three things that cost hours on the hardware side
 
