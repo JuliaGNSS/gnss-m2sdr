@@ -33,6 +33,21 @@ def _sincos_tables(addr_bits, amp_bits):
     return sin_t, cos_t
 
 
+def rom_words(values, width):
+    """Signed table values as the unsigned `width`-bit words a ROM init holds.
+
+    Every Verilog backend writes `Memory.init` entries as plain hex, so a
+    negative Python int has no representation there at all. Masking is the
+    two's-complement pattern the signed read port reinterprets back to the
+    original value.
+    """
+    mask = (1 << width) - 1
+    for v in values:
+        if not -(1 << (width - 1)) <= v < (1 << (width - 1)):
+            raise ValueError(f"ROM value {v} does not fit {width} signed bits")
+    return [v & mask for v in values]
+
+
 class CarrierNCO(LiteXModule):
     """Carrier NCO / replica generator.
 
@@ -63,10 +78,16 @@ class CarrierNCO(LiteXModule):
         # # #
 
         sin_t, cos_t = _sincos_tables(lut_addr_bits, amp_bits)
-        # Add memories via `specials +=` (not as named attributes) so AutoCSR
-        # does not map them onto the CSR bus (keeps them as plain ROMs).
-        sin_mem = Memory(amp_bits, 1 << lut_addr_bits, init=sin_t)
-        cos_mem = Memory(amp_bits, 1 << lut_addr_bits, init=cos_t)
+        # The ROM contents go to Vivado through a `$readmemh` file, and a
+        # `Memory.init` entry is written into that file as a bare hex number.
+        # A negative entry therefore comes out as `-3`, which is not a hex
+        # digit: xsim stops reading the file there, and Vivado's synthesis
+        # silently drops the sign -- the flashed table was |sin| and |cos|, a
+        # rectified carrier with no fundamental, and the correlators saw no
+        # satellite (docs/gateware_builds.md 5.6g). Store the two's-complement
+        # bit pattern, which is what an `amp_bits`-wide signed ROM holds anyway.
+        sin_mem = Memory(amp_bits, 1 << lut_addr_bits, init=rom_words(sin_t, amp_bits))
+        cos_mem = Memory(amp_bits, 1 << lut_addr_bits, init=rom_words(cos_t, amp_bits))
         sin_rd = sin_mem.get_port(async_read=True)
         cos_rd = cos_mem.get_port(async_read=True)
         self.specials += sin_mem, cos_mem, sin_rd, cos_rd

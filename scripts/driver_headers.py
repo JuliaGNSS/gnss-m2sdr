@@ -33,24 +33,56 @@ import sys
 # Includes that only exist inside a LiteX bare-metal firmware build.
 FIRMWARE_ONLY = ("generated/soc.h", "system.h", "hw/common.h")
 
+# LiteX (since mid-2026) also opens csr.h with `#include <stdint.h>` for the
+# typed accessor functions. The kernel module has no <stdint.h>: it gets the
+# uintN_t typedefs from <linux/types.h>. The user tools have both.
+STDINT_REPLACEMENT = (
+    "#ifdef __KERNEL__\n"
+    "#include <linux/types.h>   /* stdint.h, see scripts/driver_headers.py */\n"
+    "#else\n"
+    "#include <stdint.h>\n"
+    "#endif\n"
+)
+
 
 def strip_firmware_includes(text):
-    """Comment out the firmware-only #includes; leave the rest untouched."""
+    """Comment out the firmware-only #includes and drop the accessor functions.
+
+    LiteX (since mid-2026) also writes one `static inline` read/write accessor
+    per register into csr.h, calling `csr_read_simple` / `csr_write_simple`
+    from the stripped hw/common.h. The driver never uses them and the kernel
+    build rejects the implicit declarations, so every `static inline ... {`
+    block is dropped up to its closing `}`. The `CSR_*` macros are untouched.
+    """
     out, removed = [], []
+    in_accessor, n_accessors = False, 0
     for line in text.splitlines(keepends=True):
+        if in_accessor:
+            if line.strip() == "}":
+                in_accessor = False
+            continue
+        if line.startswith("static inline "):
+            in_accessor = not line.rstrip().endswith("}")
+            n_accessors += 1
+            continue
         m = re.match(r'\s*#\s*include\s*[<"]([^>"]+)[>"]', line)
         if m and m.group(1) in FIRMWARE_ONLY:
             removed.append(m.group(1))
             out.append("/* %s */ /* stripped: firmware-only, see "
                        "scripts/driver_headers.py */\n" % line.rstrip("\n"))
+        elif m and m.group(1) == "stdint.h":
+            removed.append("stdint.h (kernel: linux/types.h)")
+            out.append(STDINT_REPLACEMENT)
         else:
             out.append(line)
+    if n_accessors:
+        removed.append(f"{n_accessors} accessor functions")
     return "".join(out), removed
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("csr_h", help="generated csr.h from a build")
+    ap.add_argument("csr_h", help="generated csr.h (or soc.h / mem.h) from a build")
     ap.add_argument("-o", "--output", help="where to write it (default: stdout)")
     args = ap.parse_args()
 
@@ -61,9 +93,6 @@ def main():
     else:
         sys.stdout.write(text)
     print("stripped: " + (", ".join(removed) or "nothing"), file=sys.stderr)
-    # `#include <stdint.h>` must survive -- the CSR macros are typed.
-    if "#include <stdint.h>" not in text:
-        print("warning: no <stdint.h> in the header", file=sys.stderr)
 
 
 if __name__ == "__main__":

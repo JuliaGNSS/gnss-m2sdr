@@ -15,7 +15,7 @@ ssh "$HOST" 'mkdir -p ~/gnss-m2sdr/build/'"$BUILD"'/gateware ~/gnss-m2sdr/build/
 
 # Host software + repo (Python only; no build needed on orin2).
 rsync -az --exclude build --exclude .git --exclude '__pycache__' \
-    "$REPO/gnss_m2sdr" "$REPO/software" "$REPO/docs" "$HOST:~/gnss-m2sdr/"
+    "$REPO/gnss_m2sdr" "$REPO/software" "$REPO/docs" "$REPO/scripts" "$HOST:~/gnss-m2sdr/"
 
 # Gateware image + CSR map.
 scp "$GW"  "$HOST:~/gnss-m2sdr/build/$BUILD/gateware/"
