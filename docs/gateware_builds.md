@@ -1056,6 +1056,93 @@ the peak further. An earlier revision of this page reported "GPS L1 C/A acquires
 on ten of ten PRNs tried" from exactly this sweep. Ten of ten should have been
 the tell — a real sky does not hand over every PRN you ask for.
 
+### 5.9 The carrier-ROM fix, built and flashed (2026-09-18)
+
+Same RTL as §5.6f plus the `carrier_nco.py` fix of §5.6g, LiteX `37b75bd4`,
+`litex_m2sdr` `b10dc4d`, Vivado 2024.1, all at `--channels 4 --num-ants 1
+--max-code-length 4092 --taps 5 --max-subchips 12 --timing-effort max`:
+
+| Directives on top of `max` | WNS | Failing | Where |
+|---|---:|---:|---|
+| none | −0.069 ns | 14 | all in litex_m2sdr's AD9361 `bfp8_max_abs` path (a CSR storage bit → 15 logic levels → the comparator's CE) |
+| `place=ExtraPostPlacementOpt` | −0.115 ns | 87 | same, worse |
+| `synth=PerformanceOptimized` | **+0.000 ns** | 0 | — |
+| `place=AltSpreadLogic_high` | **+0.003 ns** | 0 | — |
+
+The one that is *not* about the tracking bank at all — the block-floating-point
+comparator is litex_m2sdr's own, on a sample format (`bfp8`) this receiver does
+not use — is the one that decides whether a build is flashable, because
+this design leaves it with tens of picoseconds either way. `build.py` grew
+`--directive STAGE=DIRECTIVE` so that a miss can be answered with a different
+directive set instead of a shrug: Vivado is deterministic for a given netlist
+and directive set, so the same command line produces the same miss.
+
+Utilisation is unchanged from §5.6 (25 269 LUTs, 20 935 registers, 5 818
+LUT-as-memory, 48 BRAM tiles, 56 DSP48E1). Each build takes ~35 minutes on a
+24-core host; four ran in parallel.
+
+Six and eight channels, same directives: **−0.022 ns** (15 endpoints: 8 on the
+same `bfp8_max_abs` path, 2 on LiteX's CSR readback mux) and **−0.173 ns** (52).
+Six is within a directive set of closing; eight is the CSR readback mux
+§5.6 already flagged as the next RTL change.
+
+**Flashed:** `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread`
+(md5 `107f9ab635d4bd7210a7dc43b42c6c85`, 4 396 000 bytes) to the operational
+slot at 10:00 UTC, after reading the slot back and confirming it was byte for
+byte the 2026-07-29 image `op_slot_backup.bin` (md5 `8f04c9ec…`), and after
+rebuilding the kernel module and tools against the new headers (the only base
+peripherals that move are `pcie_dma1`/`pcie_endpoint`, 0x1f000/0x1f800 →
+0x15000/0x15800; `flash`/`icap` do not, so the old tools can flash the new
+image). `flash_write` → `flash_reload` → `shutdown -r`.
+
+**The reboot needed a power cycle.** After `flash_reload` + `shutdown -r` the
+host answered TCP on port 22 for 100 minutes without sshd ever sending a
+banner — the kernel was up, userspace was not — until the board was power
+cycled by hand. The 2026-09-17 sessions saw "~5 min, once ~40": count on a
+power cycle after every flash, and do not poll the host every few seconds
+while it is down. Up again, `m2sdr_util info` read *built on 2026-09-18
+09:34:40*, the rebuilt module probed both DMA devices, and
+`scripts/hw_accept_v3.py` passed all five checks: CSR layout 3 / record 2,
+capabilities decoding to exactly this build, 4 002 507 samples/s on the
+counter, GPS L1 C/A acquired on the FPGA sweep, and 512 DMA1 records framed
+with a three-tap and a five-tap channel side by side on the wire.
+
+**On sky, through GNSSReceiver** (`examples/analysis/hardware_live_m2sdr.jl`
+there; its field record has every counter):
+
+- *GPS L1 C/A, 300 s.* PRN 14 at 47–52 dBHz for the whole run, PRN 21 and 20
+  at 34–45 dBHz; 359 439 NCO commits landing 0.04 ms late on average, 3
+  lost-record gaps (one 71 ms event at the first acquisition merge), 0 device
+  drops. **The correlator correlates.** No fix: four channels are one satellite
+  short once the acquisition's false alarms have had their turn.
+- *Galileo E1, five taps, BOC(1,1) replica on the 4092-chip code, 4 MS/s.* The
+  hardware side was right from the first run — E1C PRN 16 at 48.7 dBHz — and
+  the host side was not: every lock decayed within ten seconds because
+  GNSSM2SDR held one pending NCO word per channel and let the next word
+  supersede one not yet due, which starves any signal whose folds (4 ms) come
+  faster than its words fall due (8 ms). GPS never noticed (2 ms and 2 ms).
+  With the words queued per channel (GNSSM2SDR `fix/nco-queue`), an E1B-only
+  run held four Galileo satellites at 36–47 dBHz, decoded their I/NAV pages
+  and produced a **Galileo-only position fix after 39.8 s** (68 338 commits,
+  0.01 ms late on average). **The first non-GPS signal through this
+  correlator on sky.**
+- *GPS L1 C/A next to Galileo E1B in one bank, 200 s*, the GPS search limited
+  to two PRNs so the bank had channels for both: GPS PRN 14 on three taps at
+  42–46 dBHz next to E1B PRN 34, 16 and 15 on five taps at 26–45 dBHz for the
+  last 110 s, no tap-layout mismatch, C/N₀s agreeing with the
+  single-constellation runs — the step-5 "mixed operation" criterion, on sky.
+- Not run: CBOC (`GalileoE1B`) — the software acquisition's replica needs
+  12.276 MS/s and this board's raw stream was left at 4 MS/s; the pilot's
+  secondary-code synchronisation on hardware; any position accuracy statement.
+
+**Six channels** close timing too, with `--directive synth=PerformanceOptimized
+--directive place=AltSpreadLogic_high` on top of `max`: **WNS +0.007 ns**,
+0 failing of 141 430 endpoints (`…_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`,
+5 374 172 bytes). Its `pcie_dma1`/`pcie_endpoint` bases are the same as the
+four-channel build's, so the driver on orin2 already fits it; it is staged
+under `~/gnss-m2sdr/build/` and not flashed. Eight channels miss by 0.173 ns on
+52 endpoints (the CSR readback mux, as §5.6 predicted).
+
 ### 5.8 Three things that cost hours on the hardware side
 
 *`flash_reload` is required, and it wedges PCIe on this host.* Both halves
