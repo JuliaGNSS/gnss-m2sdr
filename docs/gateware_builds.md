@@ -20,12 +20,20 @@ was built against).
 | `gnss_m2sdr_m2_x1_ch4_ant2_code1023_tap5_sub12` (isolation, §2b) | 5 | 12 | 1023 | 2 | **WNS −1.288 ns** — *not met* | **no** |
 | same, after the pipeline fixes of §5 | 5 | 12 | 10230 | 2 | **WNS −0.788 ns** — *not met* | no |
 | `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12` (§5.6) | 5 | 12 | 4092 | 1 | **WNS +0.015 ns** — met | **flashed, then rolled back** (§5.6b) |
+| same RTL + #42 clamp fix, `--timing-effort max` (§5.6f) | 5 | 12 | 4092 | 1 | **WNS +0.012 ns** — met | flashed, did not correlate, rolled back (§5.6f) |
+| `…_code4092_tap5_sub12` with the carrier-ROM fix, `max` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.069 ns — *not met* (14 AD9361 BFP endpoints) | no |
+| same, `max` + `--directive place=ExtraPostPlacementOpt` (§5.9) | 5 | 12 | 4092 | 1 | WNS −0.115 ns — *not met* | no |
+| same, `max` + `--directive synth=PerformanceOptimized` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.000 ns** — met | no |
+| `…_code4092_tap5_sub12_placeSpread`: `max` + `--directive place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.003 ns** — met | flashed 2026-09-18 10:00, verified on sky (§5.9) |
+| `…_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`: 6 channels, `max` + `synth=PerformanceOptimized` + `place=AltSpreadLogic_high` (§5.9) | 5 | 12 | 4092 | 1 | **WNS +0.007 ns** — met | **flashed 2026-09-18 13:05, on the board now** (§5.9b) |
 
 The v1 reference closed with **5 ps** of margin over 73 880 endpoints. That is
 the context for everything below: this design was already at the edge of the
 part before steps 3–5 added to it.
 
-**What is on the board today is none of these.** It is a **20-channel** build
+**What is on the board today** is the last row: the carrier-ROM fix at
+`--directive place=AltSpreadLogic_high`, flashed 2026-09-18 10:00 UTC; §5.9
+has what it does on sky. Before that it was a **20-channel** build
 (`gnss_m2sdr_m2_x1_ch20_ant1`, SoC identifier *built on 2026-07-29 23:42:50*),
 which is itself **WNS −0.181 ns** over 507 endpoints. §5.7 has the evidence and
 the rollback command. The timing-clean v3 build *was* flashed on 2026-09-17; it
@@ -768,6 +776,112 @@ sub-100 ps setup miss: post-place phys_opt and routing both go to
 `AggressiveExplore`. On this design `high` gave −0.070 ns and `max` gave
 +0.012 ns, on the same RTL.
 
+### 5.6g The second fault: the carrier ROM was written as `-3`
+
+§5.6f left one bounded question: with the clamp fixed, why does the channel
+still not correlate? Hypothesis 2 there — *the carrier wipe-off* — is the
+answer, and like the clamp it is a property of the Verilog the build writes,
+not of the design.
+
+**What the build writes.** The carrier NCO's sin/cos tables are `Memory`
+specials with signed `init` values (`_sincos_tables` returns −127…127). LiteX
+emits every memory's contents into a `$readmemh` file, formatting each entry
+with `"{:02x}".format(d)`. For a negative `d` that is not hex at all:
+
+```
+$ sed -n 127,134p gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_sin_mem.init
+06
+03
+00
+-3
+-6
+-9
+-c
+-10
+```
+
+Generated from `build.py --channels 4 --num-ants 1 --max-code-length 4092
+--taps 5 --max-subchips 12` on 2026-09-18 with the toolchain of
+requirements-test.txt: **eight `.init` files (sin and cos, four channels), 127
+of 256 entries negative in each.** Every bitstream this repository has ever
+built shipped those files.
+
+**What the two readers make of them — measured, not inferred.**
+
+| Reader | `00 03 06 -3 -6 7f 81 00` becomes | Effect on the ROM |
+|---|---|---|
+| xsim `$readmemh` | `00 03 06` then *"Illegal hex digit '-'"* and it stops | entries 3… keep their previous value (`x`) |
+| Vivado 2024.1 `synth_design` | `00 03 06 03 06 7f 81 00` — no warning, no error | **the sign is dropped** |
+
+The synthesis row is the one that reached the board: a tiny ROM with exactly
+that file, synthesised out of context and its netlist simulated with the
+unisim library, reads back `03`/`06` where `-3`/`-6` were written. So the
+flashed gateware held **|sin θ| and |cos θ|**. A rectified carrier has no
+component at the carrier frequency — only DC and even harmonics — so the
+wipe-off product `I·|cos| + Q·|sin|` averages to zero over any integration in
+which the NCO phase turns, i.e. for every Doppler but zero. That is exactly the
+§5.6f picture: code NCO right, chip index right, integration window right,
+accumulators noise-like at ±10⁵–10⁶ (the noise floor a 127-amplitude
+"carrier" produces), and no peak anywhere in a code-phase sweep of a 53.5 dBHz
+satellite.
+
+**Why the board-free suite was blind, again.** The Migen simulator holds
+`Memory.init` as Python integers; it never writes or reads a file. The gap is
+the same one §5.6e named — the suite and the bitstream are produced by
+different tools — and it is now closed from both sides:
+
+- `test/test_verilog_lowering.py::TestTheMemoryInitFilesAreReadable` lowers the
+  bank with LiteX's converter and requires every `.init` entry to be unsigned
+  hex within the memory's width. It fails on the pre-fix `carrier_nco.py`.
+- `test/test_verilog_lowering.py::TestNoNegativeLiteralAnywhere` requires that
+  no unary negative literal (`-N'h…`) appears anywhere in the LiteX output, not
+  only in comparisons. That holds with LiteX at or after `37b75bd4`
+  (2026-07-24, *"emit negative signed constants as $signed(N'h<pattern>)"*),
+  which is why requirements-test.txt now pins that commit: the previous pin,
+  `93c8d230`, is the commit **before** it, and rendered the clamp bound as
+  `-32'h80000000`. This is very probably the whole story of §5.6e as well —
+  the July builds were made against a LiteX that already had the fix, the
+  five-tap builds against a pin one day too old.
+- `scripts/xsim_correlation.py` runs the LiteX-lowered `TrackingChannel` in
+  Vivado's own simulator against a synthetic satellite and compares every dump
+  with the Migen simulation of the same netlist, bit for bit. It is the test
+  §5.6f asked for under hypothesis 3. `test/test_xsim_correlation.py` runs it
+  as part of the suite wherever xvlog/xelab/xsim are on the PATH and skips by
+  name where they are not (CI).
+
+**What the simulator says, before and after.** GPS L1 C/A PRN 1 at 4 MS/s,
++1500 Hz, amplitude 200 on σ = 30 noise, two code periods, one idle clock
+between samples; the satellite sits exactly on the replica, so the aligned
+prompt is `200 × 127 × 4000 ≈ 1.02 × 10⁸`:
+
+| Gateware | `.init` files | xsim `ip` | Migen `ip` | Verdict |
+|---|---|---:|---:|---|
+| main `8795de1` (#42) | as written (`-3`…) | `2147483647`, `dump_saturated` = 1 | 101 597 180 | ROM is `x` from entry 129; **FAIL** |
+| main `8795de1` (#42) | as Vivado reads them (sign dropped) | 17 325 840, then −17 176 541 | 101 597 180 | 6× low and sign-flipping: **no correlation — the board's symptom, reproduced** |
+| this fix | as written | **101 597 180** | 101 597 180 | **PASS**, all six accumulators bit-exact over both dumps |
+
+Galileo E1B, CBOC(6,1,1/11) on five taps at 24.552 MS/s, −2500 Hz, one 4092-chip
+period (98 209 samples): **PASS**, all ten accumulators bit-exact. One thing the
+run showed on the way: at test amplitude 200 the accumulators hit the 32-bit
+rail (`dump_saturated` = 1 in both simulators, still bit-exact) — a CBOC
+replica peaks at 25, and `25 × 127 × 200 × 98 209` is 6 × 10¹⁰. A live E1
+satellite is a few LSB per sample and stays two orders of magnitude below the
+rail; the suite's E1 case uses amplitude 20.
+
+**The fix** (`carrier_nco.py`): the tables are stored as their two's-complement
+bit patterns (`rom_words`), which is what an 8-bit signed ROM holds anyway and
+what every `$readmemh` reader can parse. Nothing about the NCO's behaviour
+changes in the Migen simulator — `test_carrier_nco.py` passes unchanged —
+because the read port is signed and reinterprets the pattern.
+
+What the July builds did with the same files is not known: no `.init` or
+Vivado log from them survives, only the `.bin`. They demonstrably wiped the
+carrier off (satellites at −1.6 to −6.8 kHz Doppler tracked for minutes), so
+whatever toolchain produced them did not read `-3` as `03`. The fix is right
+for every reader, so the question is recorded rather than pursued.
+
+**Status of this fix on hardware:** see §5.9.
+
 ### 5.7 What is on the board, and rolling back
 
 The identification in the first version of this page was wrong and it matters
@@ -942,6 +1056,118 @@ baseline of the same order as a real 1 ms peak, and the sliding scheme smears
 the peak further. An earlier revision of this page reported "GPS L1 C/A acquires
 on ten of ten PRNs tried" from exactly this sweep. Ten of ten should have been
 the tell — a real sky does not hand over every PRN you ask for.
+
+### 5.9 The carrier-ROM fix, built and flashed (2026-09-18)
+
+Same RTL as §5.6f plus the `carrier_nco.py` fix of §5.6g, LiteX `37b75bd4`,
+`litex_m2sdr` `b10dc4d`, Vivado 2024.1, all at `--channels 4 --num-ants 1
+--max-code-length 4092 --taps 5 --max-subchips 12 --timing-effort max`:
+
+| Directives on top of `max` | WNS | Failing | Where |
+|---|---:|---:|---|
+| none | −0.069 ns | 14 | all in litex_m2sdr's AD9361 `bfp8_max_abs` path (a CSR storage bit → 15 logic levels → the comparator's CE) |
+| `place=ExtraPostPlacementOpt` | −0.115 ns | 87 | same, worse |
+| `synth=PerformanceOptimized` | **+0.000 ns** | 0 | — |
+| `place=AltSpreadLogic_high` | **+0.003 ns** | 0 | — |
+
+The one that is *not* about the tracking bank at all — the block-floating-point
+comparator is litex_m2sdr's own, on a sample format (`bfp8`) this receiver does
+not use — is the one that decides whether a build is flashable, because
+this design leaves it with tens of picoseconds either way. `build.py` grew
+`--directive STAGE=DIRECTIVE` so that a miss can be answered with a different
+directive set instead of a shrug: Vivado is deterministic for a given netlist
+and directive set, so the same command line produces the same miss.
+
+Utilisation is unchanged from §5.6 (25 269 LUTs, 20 935 registers, 5 818
+LUT-as-memory, 48 BRAM tiles, 56 DSP48E1). Each build takes ~35 minutes on a
+24-core host; four ran in parallel.
+
+Six and eight channels, same directives: **−0.022 ns** (15 endpoints: 8 on the
+same `bfp8_max_abs` path, 2 on LiteX's CSR readback mux) and **−0.173 ns** (52).
+Six is within a directive set of closing; eight is the CSR readback mux
+§5.6 already flagged as the next RTL change.
+
+**Flashed:** `gnss_m2sdr_m2_x1_ch4_ant1_code4092_tap5_sub12_placeSpread`
+(md5 `107f9ab635d4bd7210a7dc43b42c6c85`, 4 396 000 bytes) to the operational
+slot at 10:00 UTC, after reading the slot back and confirming it was byte for
+byte the 2026-07-29 image `op_slot_backup.bin` (md5 `8f04c9ec…`), and after
+rebuilding the kernel module and tools against the new headers (the only base
+peripherals that move are `pcie_dma1`/`pcie_endpoint`, 0x1f000/0x1f800 →
+0x15000/0x15800; `flash`/`icap` do not, so the old tools can flash the new
+image). `flash_write` → `flash_reload` → `shutdown -r`.
+
+**The reboot needed a power cycle.** After `flash_reload` + `shutdown -r` the
+host answered TCP on port 22 for 100 minutes without sshd ever sending a
+banner — the kernel was up, userspace was not — until the board was power
+cycled by hand. The 2026-09-17 sessions saw "~5 min, once ~40": count on a
+power cycle after every flash, and do not poll the host every few seconds
+while it is down. Up again, `m2sdr_util info` read *built on 2026-09-18
+09:34:40*, the rebuilt module probed both DMA devices, and
+`scripts/hw_accept_v3.py` passed all five checks: CSR layout 3 / record 2,
+capabilities decoding to exactly this build, 4 002 507 samples/s on the
+counter, GPS L1 C/A acquired on the FPGA sweep, and 512 DMA1 records framed
+with a three-tap and a five-tap channel side by side on the wire.
+
+**On sky, through GNSSReceiver** (`examples/analysis/hardware_live_m2sdr.jl`
+there; its field record has every counter):
+
+- *GPS L1 C/A, 300 s.* PRN 14 at 47–52 dBHz for the whole run, PRN 21 and 20
+  at 34–45 dBHz; 359 439 NCO commits landing 0.04 ms late on average, 3
+  lost-record gaps (one 71 ms event at the first acquisition merge), 0 device
+  drops. **The correlator correlates.** No fix: four channels are one satellite
+  short once the acquisition's false alarms have had their turn.
+- *Galileo E1, five taps, BOC(1,1) replica on the 4092-chip code, 4 MS/s.* The
+  hardware side was right from the first run — E1C PRN 16 at 48.7 dBHz — and
+  the host side was not: every lock decayed within ten seconds because
+  GNSSM2SDR held one pending NCO word per channel and let the next word
+  supersede one not yet due, which starves any signal whose folds (4 ms) come
+  faster than its words fall due (8 ms). GPS never noticed (2 ms and 2 ms).
+  With the words queued per channel (GNSSM2SDR `fix/nco-queue`), an E1B-only
+  run held four Galileo satellites at 36–47 dBHz, decoded their I/NAV pages
+  and produced a **Galileo-only position fix after 39.8 s** (68 338 commits,
+  0.01 ms late on average). **The first non-GPS signal through this
+  correlator on sky.**
+- *GPS L1 C/A next to Galileo E1B in one bank, 200 s*, the GPS search limited
+  to two PRNs so the bank had channels for both: GPS PRN 14 on three taps at
+  42–46 dBHz next to E1B PRN 34, 16 and 15 on five taps at 26–45 dBHz for the
+  last 110 s, no tap-layout mismatch, C/N₀s agreeing with the
+  single-constellation runs — the step-5 "mixed operation" criterion, on sky.
+- Not run: CBOC (`GalileoE1B`) — the software acquisition's replica needs
+  12.276 MS/s and this board's raw stream was left at 4 MS/s; the pilot's
+  secondary-code synchronisation on hardware; any position accuracy statement.
+
+**Six channels** close timing too, with `--directive synth=PerformanceOptimized
+--directive place=AltSpreadLogic_high` on top of `max`: **WNS +0.007 ns**,
+0 failing of 141 430 endpoints (`…_ch6_ant1_code4092_tap5_sub12_synthPerfSpread`,
+5 374 172 bytes, md5 `2ebd04238d9b6fa24dafbbcb270651ea`). Its
+`pcie_dma1`/`pcie_endpoint` bases are the same as the four-channel build's, so
+the driver on orin2 already fitted it. **Flashed 13:05 UTC**, power-cycled, up
+as *built on 2026-09-18 11:01:05*; `hw_accept_v3.py` passed all five checks
+(`n_channels` 6, 4 004 341 samples/s, three- and five-tap records on the
+wire). §5.9b has its sky runs. Eight channels miss by 0.173 ns on
+52 endpoints (the CSR readback mux, as §5.6 predicted).
+
+### 5.9b Six channels on sky
+
+Through GNSSReceiver with GNSSM2SDR's queued NCO words, 4 MS/s, same RF
+settings: **six GPS L1 C/A satellites in lock at once** (PRN 18, 24, 20, 22, 5
+and 23 at 30–45 dBHz), and over a 600 s run four to six satellites at
+35–45 dBHz for three minutes with **0 lost-record gaps, 0 device drops,
+1 074 708 NCO commits landing 0.04 ms late on average**. The gateware side of
+six channels is done.
+
+The GPS fix did not come at first, and the reason was on the host: every GPS
+satellite became ranging-ready within seconds but almost none reached a decoded
+ephemeris, while Galileo E1B decoded four in 40 s through the same link. The
+carrier phase was locked (17° standard deviation on a 41 dBHz satellite after
+removing the bit sign); the link was handing `Tracking` an occasional record
+that crossed the 20-block navigation-bit boundary, after which `Tracking`'s bit
+buffer — which looks for the boundary with `==` — never emitted another bit.
+With the two record-sizing fixes in GNSSReceiver (its field record
+`examples/analysis/hardware_live_m2sdr.md` has the trace), the same board gave
+**a GPS L1 C/A position fix after 205 s, 1095 solutions in the following 100 s**,
+at the site the Galileo-only fix had placed the antenna. Nothing in this
+repository changed for it: the correlator had been right since §5.9.
 
 ### 5.8 Three things that cost hours on the hardware side
 
