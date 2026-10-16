@@ -49,11 +49,16 @@ def _record_layout():
 
 
 class _Fields:
-    """A flat Signal split into named fields (record payloads, memory words)."""
+    """A flat Signal split into named fields (record payloads, memory words).
+
+    Reset-less: the pipeline registers built from these carry data that is only
+    looked at under a valid bit, and leaving them out of the reset tree keeps
+    the reset's fanout off the datapath's timing (it was the engine's worst
+    path, at 0 logic levels)."""
     def __init__(self, layout, name):
         self.layout = layout
         self.width = sum(w for _, w in layout)
-        self.raw = Signal(self.width, name=name)
+        self.raw = Signal(self.width, name=name, reset_less=True)
         offset = 0
         for fname, w in layout:
             setattr(self, fname, self.raw[offset:offset + w])
@@ -369,7 +374,7 @@ class TDMEngine(LiteXModule):
                 acc = getattr(s6_state, f"acc{k}_{part}")
                 acc_s = Signal((P.ACC_BITS, True), name=f"s6_acc{k}_{part}")
                 self.comb += acc_s.eq(acc)
-                total = Signal((sum_w, True), name=f"s7_sum{k}_{part}")
+                total = Signal((sum_w, True), name=f"s7_sum{k}_{part}", reset_less=True)
                 use = Signal(name=f"s6_use{k}_{part}")
                 self.comb += use.eq(~warming & (s6_static.num_taps > k))
                 acc_stmts.append(
@@ -742,40 +747,64 @@ class TDMCorrelator(LiteXModule):
 
 
 class RXTap(LiteXModule):
-    """Counts the RX words on their way to the host and, when ``tag_enable`` is
-    set, writes the low 16 bits of each word's index into the four sign nibbles.
+    """Counts every RX word the RFIC delivers, hands each to the correlator, and
+    forwards it, tagged with its sample index if ``tag_enable`` is set, to the
+    host path.
 
-    The AD9361's samples are 12-bit, sign-extended into 16-bit slots, so bits
-    [15:12] of every slot carry nothing. Tagged, every host sample says which
-    device sample it is (``index & 0xFFFF`` = q1 nibble . i1 . q0 . i0, most
-    significant first): the host's raw stream and the correlator count the same
-    samples, and a lost DMA buffer is seen, not guessed. ``valid`` / ``data`` /
-    ``index`` present each accepted word, untagged, to the correlator.
+    The tap never stalls the RFIC: the AD9361 PHY free-runs and drops words
+    under backpressure, so a stalling host path (no reader on DMA0, a slow
+    one) must not reach it, or the correlator would lose samples and its sample
+    index would stop following time. Instead the host's copy goes through a
+    FIFO, and a word the host path cannot take is dropped from the host's copy
+    only (``host_drops``) — the host sees the hole in the tags.
+
+    Tags: the AD9361's samples are 12-bit, sign-extended into 16-bit slots, so
+    bits [15:12] of every slot carry nothing. Tagged, the i0, q0 and i1 nibbles
+    hold the index's low 12 bits, and the q1 nibble holds nibble ``m`` of
+    ``index >> 12``, where ``m = index[8:12]``: within every aligned block of
+    4096 samples (over which ``index >> 12`` is constant) all sixteen nibbles of
+    ``index >> 12`` pass by, so any 8192 consecutive host samples name their
+    device indices exactly.
     """
-    def __init__(self):
+    def __init__(self, host_fifo_depth=1024):
         self.sink   = stream.Endpoint([("data", 64)])
         self.source = stream.Endpoint([("data", 64)])
         self.tag_enable = Signal()
         self.valid = Signal()
         self.data  = Signal(64)
         self.index = Signal(P.SAMPLE_INDEX_BITS)
+        self._host_drops = CSRStatus(32, description="RX words the host path could not take (dropped from DMA0 only).")
 
         # # #
 
-        count = Signal(P.SAMPLE_INDEX_BITS)
+        self.count = count = Signal(P.SAMPLE_INDEX_BITS)
+        high = Signal(64)
+        high_nibble = Signal(4)
         tagged = Signal(64)
         d = self.sink.data
-        self.comb += tagged.eq(Cat(
-            d[0:12],  count[0:4],
-            d[16:28], count[4:8],
-            d[32:44], count[8:12],
-            d[48:60], count[12:16],
-        ))
         self.comb += [
-            self.sink.connect(self.source, omit={"data"}),
-            If(self.tag_enable, self.source.data.eq(tagged)).Else(self.source.data.eq(d)),
-            self.valid.eq(self.sink.valid & self.source.ready),
+            high.eq(count[12:]),
+            high_nibble.eq(Array(high[4 * k:4 * (k + 1)] for k in range(16))[count[8:12]]),
+            tagged.eq(Cat(
+                d[0:12],  count[0:4],
+                d[16:28], count[4:8],
+                d[32:44], count[8:12],
+                d[48:60], high_nibble,
+            )),
+        ]
+        self.host_fifo = fifo = stream.SyncFIFO([("data", 64)], host_fifo_depth, buffered=True)
+        drops = Signal(32)
+        self.comb += [
+            self.sink.ready.eq(1),
+            fifo.sink.valid.eq(self.sink.valid),
+            If(self.tag_enable, fifo.sink.data.eq(tagged)).Else(fifo.sink.data.eq(d)),
+            fifo.source.connect(self.source),
+            self.valid.eq(self.sink.valid),
             self.data.eq(d),
             self.index.eq(count),
+            self._host_drops.status.eq(drops),
         ]
-        self.sync += If(self.valid, count.eq(count + 1))
+        self.sync += [
+            If(self.valid, count.eq(count + 1)),
+            If(self.sink.valid & ~fifo.sink.ready, drops.eq(drops + 1)),
+        ]
