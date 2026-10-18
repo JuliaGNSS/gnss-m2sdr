@@ -5,7 +5,8 @@
 
 """Build the TDM-correlator gateware for the LiteX-M2SDR (m2 variant, PCIe x1).
 
-    LITEX_M2SDR_DIR=../litex_m2sdr python build_tdm.py --build
+    git submodule update --init      # litex_m2sdr, pinned
+    python build_tdm.py --build
 
 Writes the bitstream, csr.csv and the kernel/user headers
 (build/<name>/software/kernel/{csr,soc,mem}.h) the host tools must be rebuilt

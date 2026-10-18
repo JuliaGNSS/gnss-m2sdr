@@ -38,29 +38,35 @@ checkout as a dependency:
   correlator on its RFIC datapath hook, `add_rfic_datapath()`
   (enjoy-digital/litex_m2sdr#185), with a second PCIe DMA channel
   (`pcie_dmas=2`) for the records.
-- `BaseSoC` lives in litex_m2sdr's top-level `litex_m2sdr.py` script, so it is
-  loaded by file path. Point `LITEX_M2SDR_DIR` at the checkout; without it,
-  `~/litex_m2sdr` and a checkout next to this repo are tried. A checkout
-  without the hook is refused.
+- It is pinned as a git submodule at `third_party/litex_m2sdr`, currently
+  `main` at [`973669b`](https://github.com/enjoy-digital/litex_m2sdr/commit/973669b)
+  (2026-10-15). The same checkout provides the gateware's `BaseSoC` and the
+  kernel module and user tools the host rebuilds, so both match.
+- `BaseSoC` lives in litex_m2sdr's top-level `litex_m2sdr.py` script, which
+  its `setup.py` does not install, so it is loaded by file path. Set
+  `LITEX_M2SDR_DIR` to build against another checkout, such as an upstream
+  branch; a checkout without the hook is refused.
 - The host needs litex_m2sdr's kernel module with per-DMA-channel ring
   geometry (#187), so DMA1 can run small buffers with an interrupt per buffer.
 
-Tested with litex_m2sdr `main` at
-[`973669b`](https://github.com/enjoy-digital/litex_m2sdr/commit/973669b)
-(2026-10-15). The bitstream above was built with Vivado 2024.1 and the LiteX
-ecosystem as of 2026-10-15 (litex `faff1b21e`, litepcie `586d7a4`, litei2c
-`73ac32e`, migen `4c2ae8d`).
+The bitstream above was built with Vivado 2024.1 and the LiteX ecosystem as of
+2026-10-15 (litex `faff1b21e`, litepcie `586d7a4`, litei2c `73ac32e`, migen
+`4c2ae8d`). To move the pin, check out the new commit in the submodule, rebuild,
+and commit the submodule.
 
 ## Building and bring-up
 
 ```sh
-LITEX_M2SDR_DIR=../litex_m2sdr python build_tdm.py --build   # --channels, --code-words
+git clone --recurse-submodules https://github.com/JuliaGNSS/gnss-m2sdr
+# or, in an existing clone: git submodule update --init
+python build_tdm.py --build      # --channels, --code-words
 ```
 
 This writes the bitstream, `csr.csv` and the kernel and user headers to
 `build/gnss_tdm_m2_x1_ch24_code4096/`. Then:
 
-1. Rebuild litex_m2sdr's kernel module and user tools with
+1. Rebuild the kernel module and user tools in
+   `third_party/litex_m2sdr/litex_m2sdr/software/` with
    `build/<name>/software/kernel/{csr,soc,mem}.h`. The headers shipped in
    litex_m2sdr describe upstream's own gateware, and tools built with them
    hang on this one.
@@ -80,6 +86,7 @@ gnss_m2sdr/tdm/   the gateware: params.py (formats, record layout), model.py
                   (bit-exact Python model), engine.py (engine, CSRs, record
                   serialiser, RX tap), soc.py (the SoC on litex_m2sdr)
 build_tdm.py      the build
+third_party/      litex_m2sdr (submodule)
 test/             Migen and xsim tests against the model
 docs/             the design
 ```
@@ -99,6 +106,7 @@ PYTHONPATH=. python -m unittest test.test_tdm_engine -v
   reached silicon before. It finds xsim on `PATH`, in `$XILINX_VIVADO/bin` or
   through `$XILINX_ENV` (a wrapper that sets up Vivado's environment), and
   skips without it, as in CI.
+- The tests do not use litex_m2sdr, so CI does not fetch the submodule.
 - `requirements-test.txt` pins migen `e19524c` and LiteX `37b75bd4`; it says
   why. migen's simulator cannot lower the write-only `Memory` port that
   `stream.SyncFIFO` creates, and `test/migen_compat.py` patches that for

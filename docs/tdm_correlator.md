@@ -146,9 +146,9 @@ engine scenario on it in xsim against the model.
 
 ## Bring-up on a board
 
-1. `LITEX_M2SDR_DIR=../litex_m2sdr python build_tdm.py --build` (see the
-   README for the litex_m2sdr version).
-2. Rebuild litex_m2sdr's kernel module and user tools with the build's
+1. `git submodule update --init`, then `python build_tdm.py --build`
+   (litex_m2sdr is pinned at `third_party/litex_m2sdr`; see the README).
+2. Rebuild that checkout's kernel module and user tools with the build's
    `software/kernel/{csr,soc,mem}.h`; load the module with
    `dma_buffer_size=8192,512 dma_buffer_per_irq=8,1`.
 3. Write `*_operational.bin` to the operational slot (0x800000), ICAP-reload,

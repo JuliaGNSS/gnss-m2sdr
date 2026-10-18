@@ -22,18 +22,18 @@ from migen import *
 from litex.soc.interconnect import stream
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SUBMODULE = os.path.join(_REPO_ROOT, "third_party", "litex_m2sdr")
 
 
 def find_litex_m2sdr_dir(env=None):
-    """$LITEX_M2SDR_DIR, else ~/litex_m2sdr, else a checkout next to this repo."""
+    """$LITEX_M2SDR_DIR, else the pinned submodule (third_party/litex_m2sdr)."""
     env = os.environ if env is None else env
-    explicit = env.get("LITEX_M2SDR_DIR")
-    tried = [explicit] if explicit else [os.path.expanduser("~/litex_m2sdr"),
-                                         os.path.join(os.path.dirname(_REPO_ROOT), "litex_m2sdr")]
-    for directory in tried:
-        if os.path.exists(os.path.join(directory, "litex_m2sdr.py")):
-            return directory
-    raise FileNotFoundError("litex_m2sdr.py not found; set LITEX_M2SDR_DIR. Tried: " + ", ".join(tried))
+    directory = env.get("LITEX_M2SDR_DIR") or _SUBMODULE
+    if not os.path.exists(os.path.join(directory, "litex_m2sdr.py")):
+        hint = ("check LITEX_M2SDR_DIR" if env.get("LITEX_M2SDR_DIR")
+                else "run `git submodule update --init` or set LITEX_M2SDR_DIR")
+        raise FileNotFoundError(f"litex_m2sdr.py not found in {directory}; {hint}")
+    return directory
 
 
 def _load_base_module():
