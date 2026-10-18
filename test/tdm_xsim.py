@@ -7,8 +7,8 @@ converter writes -- the artefact the bitstream is built from -- and return the
 64-bit words it streamed.
 
 The Migen simulator never sees that Verilog, and two faults have reached
-silicon through exactly that gap (docs/gateware_builds.md 5.6e, 5.6g), so the
-TDM suite runs every scenario through both.
+silicon through exactly that gap (docs/tdm_correlator.md, "Two lowering
+faults"), so the TDM suite runs every scenario through both.
 
 xvlog/xelab/xsim are taken from PATH, from ``$XILINX_VIVADO/bin``, or run
 through ``$XILINX_ENV`` (a wrapper that sets up Vivado's environment and execs

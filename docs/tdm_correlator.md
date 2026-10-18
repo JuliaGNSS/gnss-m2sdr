@@ -1,19 +1,19 @@
 # The TDM correlator
 
-`gnss_m2sdr/tdm/` is a second gateware design for the LiteX-M2SDR: one
-pipelined correlator datapath, time-multiplexed over every channel, instead of
-one correlator instance per channel. It is what the hardware-correlator
+`gnss_m2sdr/tdm/` is the gateware for the LiteX-M2SDR: one pipelined
+correlator datapath, time-multiplexed over every channel. It replaced an
+earlier design with one correlator instance per channel ([the per-channel
+bank](#the-per-channel-bank-retired)). It is what the hardware-correlator
 receiver (GNSSReceiver.jl `receive(::HardwareLoop, …)`, GNSSM2SDR.jl's
 `M2SDRLoop`) drives.
 
 ## Why time-multiplexed
 
 At 4 MS/s and a 125 MHz system clock there are 31 clock cycles per input
-sample. The per-channel bank (`gnss_m2sdr/gateware/bank.py`) used one of them
-per channel and spent the rest idle, with a complete datapath — carrier NCO and
-table, code RAMs, five correlators, DSP cascades — per channel. Six channels
-closed timing only at `--timing-effort max` with directive tuning, 56 DSP48E1
-for four channels ([gateware builds](gateware_builds.md)).
+sample. The per-channel bank used one of them per channel and spent the rest
+idle, with a complete datapath — carrier NCO and table, code RAMs, five
+correlators, DSP cascades — per channel. Six channels closed timing only at
+`--timing-effort max` with directive tuning, 56 DSP48E1 for four channels.
 
 The TDM engine runs the datapath once per channel per sample: a round of
 `max(n_channels + 1, 11)` cycles per sample, one slot per channel plus one for
@@ -110,8 +110,8 @@ DMA buffer as a hole in the tags.
 - `test/test_tdm_xsim.py`: the same scenario on the Verilog **LiteX's
   converter writes** (the artefact the bitstream is built from), in Vivado's
   xsim, plus checks that no negative literal and no signed `.init` entry is in
-  it — the two lowering faults that reached silicon with the per-channel bank
-  ([gateware builds](gateware_builds.md) §5.6e, §5.6g).
+  it — the [two lowering faults](#two-lowering-faults) that reached silicon
+  with the per-channel bank.
 - `test/test_tdm_rxtap.py`: the tap under a stalling host — the correlator
   sees every sample on consecutive indices, the host's tags name its own
   samples, the drop count is exact.
@@ -122,9 +122,32 @@ DMA buffer as a hole in the tags.
   41–45 dB-Hz with bit sync, 0 bytes allocated and records at most 0.6 ms old
   at the fold.
 
+### Two lowering faults
+
+The Migen simulator runs the design, the bitstream is built from the Verilog
+LiteX writes, and twice the per-channel bank's hardware differed from its
+simulation because of that Verilog:
+
+- **A negative constant written unsigned.** LiteX before `37b75bd4`
+  (2026-07-24) rendered a negative constant as `-32'h80000000`, an unsigned
+  literal. Verilog compares unsigned when either operand is, so the saturating
+  accumulator's lower-bound test was true for every positive sum and clamped it
+  to −2³¹. `requirements-test.txt` pins LiteX at that commit, and the TDM
+  engine saturates on the sum's top bits instead of comparing against a
+  constant at all.
+- **A signed memory initialiser.** LiteX writes a `Memory`'s contents to a
+  `$readmemh` file with `"{:02x}".format(d)`, which for a negative `d` is
+  `-3`, not hex. The carrier sine table came out unreadable and the channel
+  never correlated. The TDM carrier table is a case statement on unsigned
+  8-bit patterns, and none of its memories has a signed initialiser.
+
+`test/test_tdm_xsim.py` checks both on the lowered Verilog, and runs the
+engine scenario on it in xsim against the model.
+
 ## Bring-up on a board
 
-1. `LITEX_M2SDR_DIR=../litex_m2sdr python build_tdm.py --build`.
+1. `LITEX_M2SDR_DIR=../litex_m2sdr python build_tdm.py --build` (see the
+   README for the litex_m2sdr version).
 2. Rebuild litex_m2sdr's kernel module and user tools with the build's
    `software/kernel/{csr,soc,mem}.h`; load the module with
    `dma_buffer_size=8192,512 dma_buffer_per_irq=8,1`.
@@ -142,3 +165,15 @@ DMA buffer as a hole in the tags.
   table.
 - More than one antenna per channel and more than one band.
 - 1R1T mode (the tap assumes one 2R2T word per sample instant).
+
+## The per-channel bank (retired)
+
+The first gateware (`gnss_m2sdr/gateware/`, `build.py`) instantiated a
+complete tracking channel per satellite and supported features the TDM engine
+does not have yet: sub-chip modulations (BOC(1,1), Galileo E1 CBOC, GPS L1C
+TMBOC, checked against GNSSSignals.jl) and two antennas per channel. It was
+built on the `add_rx_datapath_processing()` hook of litex_m2sdr#152, which
+upstream did not merge (it took the RFIC datapath hook, #185, instead), so it
+no longer builds against upstream litex_m2sdr. It was removed together with its
+host software, scripts and design notes; its last version, including the
+build log and bring-up notes, is at [`c5c6085`](https://github.com/JuliaGNSS/gnss-m2sdr/tree/c5c60855666580e0dd8d934fa3a46970aa88c62e).

@@ -16,7 +16,8 @@ oldest record has waited ``flush_cycles``.
 
 Arithmetic note. Every constant below is written as an unsigned bit pattern
 and every signed operand is a signed ``Signal``: LiteX's Verilog backend has
-emitted negative literals as unsigned before (docs/gateware_builds.md 5.6e),
+emitted negative literals as unsigned before (docs/tdm_correlator.md,
+"Two lowering faults"),
 so nothing here depends on how a negative constant is rendered.
 """
 

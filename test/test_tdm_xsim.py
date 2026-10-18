@@ -34,7 +34,7 @@ class TestTDMVerilogInXsim(unittest.TestCase):
 
     def test_no_negative_literal(self):
         # A unary-minus literal is how a signed constant reached silicon as an
-        # unsigned one before (docs/gateware_builds.md 5.6e).
+        # unsigned one before (docs/tdm_correlator.md, "Two lowering faults").
         self.assertIsNone(re.search(r"(?:^|[(=,?:&|~!<>]\s*)-\s*\d+'", self.verilog, re.M))
 
     def test_memory_init_files_are_unsigned_hex(self):
