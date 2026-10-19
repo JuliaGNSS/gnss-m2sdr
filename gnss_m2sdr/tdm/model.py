@@ -64,6 +64,7 @@ class ChannelState:
     integ: int = 0
     warm: int = 0
     sat: bool = False
+    lost: bool = False
     acc: list = field(default_factory=lambda: [[0, 0] for _ in range(P.MAX_TAPS)])
 
 
@@ -135,8 +136,8 @@ class Engine:
         self.enabled = [False] * n_channels
         self.pend = [False] * n_channels
         self.missed = [False] * n_channels
-        self.strobe_period = strobe_period
-        self.strobe_count = 0
+        self.last_n = None                 # the previous sample processed
+        self.set_strobe_period(strobe_period)
         self.cos_t, self.sin_t = P.carrier_table()
 
     # Host commands ---------------------------------------------------------------------------
@@ -160,25 +161,42 @@ class Engine:
         self.enabled[ch] = False
         self.pend[ch] = False
 
+    def set_strobe_period(self, period):
+        """A write of the strobe period (and the state after a reset): the
+        strobes re-find the period's phase from the next sample."""
+        self.strobe_period = period & M32
+        self.strobe_sync = True
+        self.strobe_hold = 0
+        self.strobe_next = 0
+
     # One sample ------------------------------------------------------------------------------
 
     def step(self, n, samples):
         """Process sample ``n``; ``samples`` is ((I0, Q0), (I1, Q1)) for the two
         antennas. Returns the records it produced, in emission order."""
         out = []
+        gap = self.last_n is not None and n != self.last_n + 1
+        self.last_n = n
         for ch in range(self.n):
-            rec = self._channel(ch, n, samples)
+            rec = self._channel(ch, n, samples, gap)
             if rec is not None:
                 out.append(rec)
-        if self.strobe_period:
-            if self.strobe_count == self.strobe_period - 1:
+        period = self.strobe_period
+        if period:
+            if self.strobe_sync:
+                self.strobe_next = P.strobe_next(n + 1 + P.STROBE_SYNC_SAMPLES, period)
+                self.strobe_hold = P.STROBE_SYNC_SAMPLES - 1
+                self.strobe_sync = False
+            elif self.strobe_hold:
+                self.strobe_hold -= 1
+            elif n + 1 >= self.strobe_next:
                 out.append(Record(kind=P.KIND_STROBE, sample_index=n + 1))
-                self.strobe_count = 0
-            else:
-                self.strobe_count += 1
+                self.strobe_next += period
+                if self.strobe_next <= n + 1:
+                    self.strobe_sync = True
         return out
 
-    def _channel(self, ch, n, samples):
+    def _channel(self, ch, n, samples, gap):
         cfg, st = self.cfg[ch], self.state[ch]
         if self.pend[ch]:
             p = self.pending[ch]
@@ -190,7 +208,9 @@ class Engine:
                 st.integ = 0
                 st.warm = cfg.warmup
                 st.sat = False
+                st.lost = False
                 st.acc = [[0, 0] for _ in range(P.MAX_TAPS)]
+                gap = False                # samples lost before the start do not matter
                 self.enabled[ch] = True
                 self.pend[ch] = False
             elif n > p.start:
@@ -198,6 +218,7 @@ class Engine:
                 self.pend[ch] = False
         if not self.enabled[ch]:
             return None
+        st.lost |= gap
 
         # Carrier wipe-off: sample x exp(-j phase).
         k = st.carrier_phase >> (P.PHASE_BITS - P.CARRIER_LUT_BITS)
@@ -236,7 +257,7 @@ class Engine:
             channel=ch,
             num_taps=cfg.num_taps,
             antenna=cfg.antenna,
-            flags=P.FLAG_SATURATED if st.sat else 0,
+            flags=(P.FLAG_SATURATED if st.sat else 0) | (P.FLAG_SAMPLE_OVERFLOW if st.lost else 0),
             assign_id=cfg.assign_id,
             sample_index=n + 1,
             integrated=st.integ,
@@ -247,6 +268,7 @@ class Engine:
         st.acc = [[0, 0] for _ in range(P.MAX_TAPS)]
         st.integ = 0
         st.sat = False
+        st.lost = False
         return rec
 
 

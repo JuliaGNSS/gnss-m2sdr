@@ -158,6 +158,10 @@ class Scenario:
         self.write("cmd", P.CMD_RELEASE | ch << P.CMD_CHANNEL_SHIFT)
         self.model.release(ch)
 
+    def strobe_period(self, period):
+        self.write("strobe_period", period)
+        self.model.set_strobe_period(period)
+
     def samples(self, block, spacing=None):
         """Feed a list of ((i0, q0), (i1, q1)) samples."""
         spacing = self.spacing if spacing is None else spacing

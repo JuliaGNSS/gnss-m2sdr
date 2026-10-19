@@ -69,13 +69,15 @@ class _Fields:
 class TDMEngine(LiteXModule):
     """Round-robin correlator datapath.
 
-    Inputs: ``issue`` with ``slot``, ``sample_index`` and the four 12-bit samples
-    (I/Q of two antennas), one slot per cycle. Host-side configuration arrives on
+    Inputs: ``issue`` with ``slot``, ``sample_index``, the four 12-bit samples
+    (I/Q of two antennas) and ``sample_gap`` (samples were lost before this
+    one), one slot per cycle. Host-side configuration arrives on
     the memory write ports exposed below (``cfg_*_wr``, ``code_wr``) and on the
     flag requests; records leave on ``rec_valid`` / ``rec``.
     """
     def __init__(self, n_channels, code_words):
         assert 1 <= n_channels <= 32
+        P.check_code_words(code_words)
         self.n_channels = n_channels
         self.n_slots    = P.num_slots(n_channels)
 
@@ -84,6 +86,7 @@ class TDMEngine(LiteXModule):
         self.slot         = Signal(8)
         self.sample_index = Signal(P.SAMPLE_INDEX_BITS)
         self.samples      = [Signal((P.SAMPLE_BITS, True)) for _ in range(4)]   # i0, q0, i1, q1
+        self.sample_gap   = Signal()
         self.strobe_due   = Signal()
 
         # Records out (one cycle pulse, at most one per cycle).
@@ -138,22 +141,29 @@ class TDMEngine(LiteXModule):
                           self.cfg_freq_wr, self.cfg_static_wr, self.cfg_pending_wr, self.code_wr,
                           freq_rd, static_rd, pending_rd, code_rd]
 
-        # Channel state RAM.
+        # Channel state RAMs: the NCOs and histories, read at issue, and the
+        # accumulators, read only in time for S6 so that they do not ride the
+        # pipeline from S1. Both are written back in S7.
         state_layout = [
             ("carrier_phase", P.PHASE_BITS),
             ("code_frac",     P.FRAC_BITS),
             ("code_chip",     P.CHIP_BITS),
             ("hist_rep",      P.HISTORY),
             ("hist_wrap",     P.HISTORY),
-            ("integ",         P.INTEG_BITS),
             ("warm",          P.HISTORY_BITS),
+        ]
+        acc_layout = [
+            ("integ",         P.INTEG_BITS),
             ("sat",           1),
+            ("lost",          1),
         ] + [(f"acc{k}_{part}", P.ACC_BITS) for k in range(P.MAX_TAPS) for part in ("i", "q")]
-        state_w = sum(w for _, w in state_layout)
-        mem_state = Memory(state_w, n_channels, name="tdm_state")
+        mem_state = Memory(sum(w for _, w in state_layout), n_channels, name="tdm_state")
+        mem_acc   = Memory(sum(w for _, w in acc_layout),   n_channels, name="tdm_acc")
         state_rd = mem_state.get_port()                        # synchronous
         state_wr = mem_state.get_port(write_capable=True)
-        self.specials += mem_state, state_rd, state_wr
+        acc_rd   = mem_acc.get_port()                          # synchronous
+        acc_wr   = mem_acc.get_port(write_capable=True)
+        self.specials += mem_state, state_rd, state_wr, mem_acc, acc_rd, acc_wr
 
         # # #
 
@@ -167,7 +177,7 @@ class TDMEngine(LiteXModule):
             static_rd.adr.eq(self.slot),
             pending_rd.adr.eq(self.slot),
         ]
-        s1_valid, s1_slot, s1_n, s1_strobe = Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s1_valid, s1_slot, s1_n, s1_strobe, s1_gap = Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal(), Signal()
         s1_samples = [Signal((P.SAMPLE_BITS, True)) for _ in range(4)]
         s1_freq    = _Fields(freq_layout, "s1_freq")
         s1_static  = _Fields(static_layout, "s1_static")
@@ -180,6 +190,7 @@ class TDMEngine(LiteXModule):
             s1_slot.eq(self.slot),
             s1_n.eq(self.sample_index),
             s1_strobe.eq(self.strobe_due & (self.slot == self.n_slots - 1)),
+            s1_gap.eq(self.sample_gap),
             *[a.eq(b) for a, b in zip(s1_samples, self.samples)],
             s1_freq.raw.eq(freq_rd.dat_r),
             s1_static.raw.eq(static_rd.dat_r),
@@ -192,7 +203,7 @@ class TDMEngine(LiteXModule):
         self.comb += s1_state.raw.eq(state_rd.dat_r)
 
         # S1: start-sample comparison, antenna selection. -----------------------------------------
-        s2_valid, s2_slot, s2_n, s2_strobe = Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s2_valid, s2_slot, s2_n, s2_strobe, s2_gap = Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal(), Signal()
         s2_freq    = _Fields(freq_layout, "s2_freq")
         s2_static  = _Fields(static_layout, "s2_static")
         s2_pending = _Fields(pending_layout, "s2_pending")
@@ -204,6 +215,7 @@ class TDMEngine(LiteXModule):
         self.comb += diff.eq(Cat(s1_n, C(0, 1)) - Cat(s1_pending.start, C(0, 1)))
         self.sync += [
             s2_valid.eq(s1_valid), s2_slot.eq(s1_slot), s2_n.eq(s1_n), s2_strobe.eq(s1_strobe & s1_valid),
+            s2_gap.eq(s1_gap),
             s2_freq.raw.eq(s1_freq.raw), s2_static.raw.eq(s1_static.raw),
             s2_pending.raw.eq(s1_pending.raw), s2_state.raw.eq(s1_state.raw),
             s2_en.eq(s1_en), s2_pend.eq(s1_pend), s2_gen.eq(s1_gen),
@@ -232,7 +244,7 @@ class TDMEngine(LiteXModule):
         e = _Fields(state_layout, "s2_eff")
         self.comb += [
             e.raw.eq(s2_state.raw),
-            If(start,
+            If(start,                                  # the accumulators are cleared in S5
                 e.raw.eq(0),
                 e.carrier_phase.eq(s2_pending.carrier_phase),
                 e.code_chip.eq(s2_pending.code_chip),
@@ -244,6 +256,7 @@ class TDMEngine(LiteXModule):
         self.comb += active.eq(s2_valid & (s2_en | start))
 
         s3_valid, s3_active, s3_slot, s3_n, s3_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s3_gap, s3_start = Signal(), Signal()
         s3_static = _Fields(static_layout, "s3_static")
         s3_state  = _Fields(state_layout, "s3_state")     # effective state, NCOs not yet advanced
         s3_lut    = Signal(P.CARRIER_LUT_BITS)
@@ -256,6 +269,9 @@ class TDMEngine(LiteXModule):
         self.comb += frac_sum.eq(e.code_frac + s2_freq.code_freq)
         self.sync += [
             s3_valid.eq(s2_valid), s3_active.eq(active), s3_slot.eq(s2_slot), s3_n.eq(s2_n), s3_strobe.eq(s2_strobe),
+            # Samples lost before a channel's start sample do not concern it.
+            s3_gap.eq(s2_gap & ~start),
+            s3_start.eq(start),
             s3_static.raw.eq(s2_static.raw),
             s3_state.raw.eq(e.raw),
             s3_lut.eq(e.carrier_phase[P.PHASE_BITS - P.CARRIER_LUT_BITS:]),
@@ -277,6 +293,7 @@ class TDMEngine(LiteXModule):
         chip_inc = Signal(P.CHIP_BITS + 1)
         self.comb += chip_inc.eq(s3_state.code_chip + s3_carry)
         s4_valid, s4_active, s4_slot, s4_n, s4_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s4_gap, s4_start = Signal(), Signal()
         s4_static = _Fields(static_layout, "s4_static")
         s4_state  = _Fields(state_layout, "s4_state")
         s4_cos, s4_sin = Signal((8, True)), Signal((8, True))
@@ -288,6 +305,7 @@ class TDMEngine(LiteXModule):
         self.comb += wrap.eq(chip_inc == s3_static.code_length)
         self.sync += [
             s4_valid.eq(s3_valid), s4_active.eq(s3_active), s4_slot.eq(s3_slot), s4_n.eq(s3_n), s4_strobe.eq(s3_strobe),
+            s4_gap.eq(s3_gap), s4_start.eq(s3_start),
             s4_static.raw.eq(s3_static.raw), s4_state.raw.eq(s3_state.raw),
             s4_cos.eq(lut_cos), s4_sin.eq(lut_sin),
             s4_i.eq(s3_i), s4_q.eq(s3_q),
@@ -297,7 +315,8 @@ class TDMEngine(LiteXModule):
             s4_bitsel.eq(s3_state.code_chip[:5]),
         ]
 
-        # S4: code bit select, wipe-off products. -------------------------------------------------
+        # S4: code bit select, wipe-off products, accumulator read. --------------------------------
+        self.comb += acc_rd.adr.eq(s4_slot)
         code_shifted = Signal(P.CODE_WORD_BITS)
         code_bit = Signal()
         self.comb += [
@@ -306,6 +325,7 @@ class TDMEngine(LiteXModule):
         ]
         prod_w = P.SAMPLE_BITS + 8
         s5_valid, s5_active, s5_slot, s5_n, s5_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s5_gap, s5_start = Signal(), Signal()
         s5_static = _Fields(static_layout, "s5_static")
         s5_state  = _Fields(state_layout, "s5_state")
         s5_cp_next, s5_frac_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS)
@@ -313,6 +333,7 @@ class TDMEngine(LiteXModule):
         s5_ic, s5_qs, s5_qc, s5_is = [Signal((prod_w, True)) for _ in range(4)]
         self.sync += [
             s5_valid.eq(s4_valid), s5_active.eq(s4_active), s5_slot.eq(s4_slot), s5_n.eq(s4_n), s5_strobe.eq(s4_strobe),
+            s5_gap.eq(s4_gap), s5_start.eq(s4_start),
             s5_static.raw.eq(s4_static.raw), s5_state.raw.eq(s4_state.raw),
             s5_cp_next.eq(s4_cp_next), s5_frac_next.eq(s4_frac_next),
             s5_chip_next.eq(s4_chip_next), s5_wrap.eq(s4_wrap), s5_bit.eq(code_bit),
@@ -331,8 +352,10 @@ class TDMEngine(LiteXModule):
             hist_wrap_new.eq(Cat(s5_wrap, s5_state.hist_wrap[:P.HISTORY - 1])),
         ]
         s6_valid, s6_active, s6_slot, s6_n, s6_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s6_gap = Signal()
         s6_static = _Fields(static_layout, "s6_static")
         s6_state  = _Fields(state_layout, "s6_state")
+        s6_acc    = _Fields(acc_layout, "s6_acc")      # a channel starting gets cleared ones
         s6_cp_next, s6_frac_next, s6_chip_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS), Signal(P.CHIP_BITS)
         s6_hist_rep, s6_hist_wrap = Signal(P.HISTORY), Signal(P.HISTORY)
         s6_bb_i, s6_bb_q = Signal((bb_w, True)), Signal((bb_w, True))
@@ -347,7 +370,9 @@ class TDMEngine(LiteXModule):
         ]
         self.sync += [
             s6_valid.eq(s5_valid), s6_active.eq(s5_active), s6_slot.eq(s5_slot), s6_n.eq(s5_n), s6_strobe.eq(s5_strobe),
+            s6_gap.eq(s5_gap),
             s6_static.raw.eq(s5_static.raw), s6_state.raw.eq(s5_state.raw),
+            If(s5_start, s6_acc.raw.eq(0)).Else(s6_acc.raw.eq(acc_rd.dat_r)),
             s6_cp_next.eq(s5_cp_next), s6_frac_next.eq(s5_frac_next), s6_chip_next.eq(s5_chip_next),
             s6_hist_rep.eq(hist_rep_new), s6_hist_wrap.eq(hist_wrap_new),
             s6_bb_i.eq(s5_ic + s5_qs),
@@ -361,18 +386,20 @@ class TDMEngine(LiteXModule):
         warming = Signal()
         self.comb += warming.eq(s6_state.warm != 0)
         s7_valid, s7_active, s7_slot, s7_n, s7_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
+        s7_gap = Signal()
         s7_static = _Fields(static_layout, "s7_static")
         s7_cp_next, s7_frac_next, s7_chip_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS), Signal(P.CHIP_BITS)
         s7_hist_rep, s7_hist_wrap = Signal(P.HISTORY), Signal(P.HISTORY)
         s7_integ = Signal(P.INTEG_BITS)
         s7_warm  = Signal(P.HISTORY_BITS)
         s7_sat_in = Signal()
+        s7_lost_in = Signal()
         s7_dump  = Signal()
         s7_sums  = {}
         acc_stmts = []
         for k in range(P.MAX_TAPS):
             for part, bb in (("i", s6_bb_i), ("q", s6_bb_q)):
-                acc = getattr(s6_state, f"acc{k}_{part}")
+                acc = getattr(s6_acc, f"acc{k}_{part}")
                 acc_s = Signal((P.ACC_BITS, True), name=f"s6_acc{k}_{part}")
                 self.comb += acc_s.eq(acc)
                 total = Signal((sum_w, True), name=f"s7_sum{k}_{part}", reset_less=True)
@@ -393,22 +420,27 @@ class TDMEngine(LiteXModule):
         self.sync += acc_stmts
         self.sync += [
             s7_valid.eq(s6_valid), s7_active.eq(s6_active), s7_slot.eq(s6_slot), s7_n.eq(s6_n), s7_strobe.eq(s6_strobe),
+            s7_gap.eq(s6_gap),
             s7_static.raw.eq(s6_static.raw),
             s7_cp_next.eq(s6_cp_next), s7_frac_next.eq(s6_frac_next), s7_chip_next.eq(s6_chip_next),
             s7_hist_rep.eq(s6_hist_rep), s7_hist_wrap.eq(s6_hist_wrap),
-            s7_sat_in.eq(s6_state.sat),
+            s7_sat_in.eq(s6_acc.sat),
+            s7_lost_in.eq(s6_acc.lost),
             If(warming,
                 s7_warm.eq(s6_state.warm - 1),
-                s7_integ.eq(s6_state.integ),
+                s7_integ.eq(s6_acc.integ),
                 s7_dump.eq(0),
             ).Else(
                 s7_warm.eq(0),
-                s7_integ.eq(s6_state.integ + 1),
+                s7_integ.eq(s6_acc.integ + 1),
                 s7_dump.eq(s6_prompt_wrap),
             ),
         ]
 
         # S7: saturate, write back, emit. ---------------------------------------------------------
+        # The write-back below is in stage S7; num_slots() keeps a slot's next
+        # issue from reading the state before it lands.
+        assert P.WRITEBACK_STAGE == 7 and self.n_slots >= P.WRITEBACK_STAGE
         top, sign = P.ACC_BITS, P.ACC_BITS - 1
         max_pos = C((1 << (P.ACC_BITS - 1)) - 1, P.ACC_BITS)
         max_neg = C(1 << (P.ACC_BITS - 1), P.ACC_BITS)
@@ -426,9 +458,14 @@ class TDMEngine(LiteXModule):
             sat_vals[(k, part)] = v
             any_clip += [pos, neg]
         sat_now = Signal()
-        self.comb += sat_now.eq(s7_sat_in | reduce(or_, any_clip))
+        lost_now = Signal()
+        self.comb += [
+            sat_now.eq(s7_sat_in | reduce(or_, any_clip)),
+            lost_now.eq(s7_lost_in | s7_gap),
+        ]
 
         w = _Fields(state_layout, "s7_wb")
+        wa = _Fields(acc_layout, "s7_wb_acc")
         self.comb += [
             w.carrier_phase.eq(s7_cp_next),
             w.code_frac.eq(s7_frac_next),
@@ -437,17 +474,19 @@ class TDMEngine(LiteXModule):
             w.hist_wrap.eq(s7_hist_wrap),
             w.warm.eq(s7_warm),
             If(s7_dump,
-                w.integ.eq(0),
-                w.sat.eq(0),
-                *[getattr(w, f"acc{k}_{part}").eq(0) for (k, part) in sat_vals],
+                wa.raw.eq(0),
             ).Else(
-                w.integ.eq(s7_integ),
-                w.sat.eq(sat_now),
-                *[getattr(w, f"acc{k}_{part}").eq(v) for (k, part), v in sat_vals.items()],
+                wa.integ.eq(s7_integ),
+                wa.sat.eq(sat_now),
+                wa.lost.eq(lost_now),
+                *[getattr(wa, f"acc{k}_{part}").eq(v) for (k, part), v in sat_vals.items()],
             ),
             state_wr.adr.eq(s7_slot),
             state_wr.dat_w.eq(w.raw),
             state_wr.we.eq(s7_valid & s7_active),
+            acc_wr.adr.eq(s7_slot),
+            acc_wr.dat_w.eq(wa.raw),
+            acc_wr.we.eq(s7_valid & s7_active),
         ]
 
         r = self.rec
@@ -460,7 +499,7 @@ class TDMEngine(LiteXModule):
                 r.channel.eq(s7_slot),
                 r.num_taps.eq(s7_static.num_taps),
                 r.antenna.eq(s7_static.antenna),
-                r.flags.eq(Mux(sat_now, P.FLAG_SATURATED, 0)),
+                r.flags.eq(Mux(sat_now, P.FLAG_SATURATED, 0) | Mux(lost_now, P.FLAG_SAMPLE_OVERFLOW, 0)),
                 r.assign_id.eq(s7_static.assign_id),
                 r.sample_index.eq(s7_n + 1),
                 r.integrated.eq(s7_integ),
@@ -496,16 +535,16 @@ class TDMCorrelator(LiteXModule):
                                   description="[7:0] channels, [15:8] slots, [19:16] taps, [25:20] history, [30:26] log2 code words.")
         self._control = CSRStorage(fields=[
             CSRField("enable",        size=1, offset=0, description="Feed RX samples to the engine."),
-            CSRField("record_enable", size=1, offset=1, description="Stream records to the DMA (else drop them)."),
-            CSRField("reset",         size=1, offset=2, description="Hold the channels, FIFOs and counters in reset."),
+            CSRField("record_enable", size=1, offset=1, description="Stream records to the DMA (else drop them). Cleared, the record in flight is finished and its DMA buffer padded out."),
+            CSRField("reset",         size=1, offset=2, description="Hold the channels, FIFOs, serialiser, strobes and counters in reset (not sample_count, which follows the device sample index)."),
             CSRField("tag",           size=1, offset=3, description="Tag each host RX word with its sample index (see RXTap)."),
         ])
-        self._strobe_period = CSRStorage(32, description="Epoch-strobe period in samples (0 = none).")
+        self._strobe_period = CSRStorage(32, description="Epoch strobes on the multiples of this many samples of the sample index (0 = none).")
         self._flush_cycles  = CSRStorage(32, reset=12500, description="Pad a DMA buffer once its first record is this many sys cycles old.")
         self._buffer_words  = CSRStorage(24, reset=64, description="64-bit words per DMA buffer (multiple of 8).")
-        self._sample_count    = CSRStatus(32, description="Samples processed, low 32 bits.")
-        self._sample_count_hi = CSRStatus(16, description="Samples processed, bits [47:32] (not latched).")
-        self._sample_overflows = CSRStatus(32, description="Samples lost to a full sample FIFO.")
+        self._sample_count    = CSRStatus(32, description="Sample index one past the last sample processed, low 32 bits.")
+        self._sample_count_hi = CSRStatus(16, description="Sample index one past the last sample processed, bits [47:32] (not latched).")
+        self._sample_overflows = CSRStatus(32, description="Samples lost to a full sample FIFO (the records over them carry FLAG_SAMPLE_OVERFLOW).")
         self._record_drops     = CSRStatus(32, description="Records lost to a full record FIFO.")
         self._records          = CSRStatus(32, description="Records written to the DMA stream.")
         self._enabled  = CSRStatus(32, description="Bitmap: channel running.")
@@ -551,25 +590,24 @@ class TDMCorrelator(LiteXModule):
         in_round = Signal()
         cur_n    = Signal(P.SAMPLE_INDEX_BITS)
         cur_s    = [Signal((P.SAMPLE_BITS, True)) for _ in range(4)]
-        processed = Signal(P.SAMPLE_INDEX_BITS)
-        strobe_cnt = Signal(32)
+        processed = Signal(P.SAMPLE_INDEX_BITS)    # one past the last sample popped
+        seen     = Signal()                         # a sample was popped since the reset
+        cur_gap  = Signal()                         # samples were lost before cur_n
+        popped   = Signal()                         # the first cycle of a round
         strobe_due = Signal()
-        period = self._strobe_period.storage
         self.comb += fifo.re.eq(~in_round & fifo.readable & ~rst)
         self.sync += [
+            popped.eq(fifo.re),
             If(rst,
-                in_round.eq(0), slot.eq(0), strobe_cnt.eq(0), strobe_due.eq(0),
+                in_round.eq(0), slot.eq(0), seen.eq(0),
             ).Elif(fifo.re,
                 in_round.eq(1),
                 slot.eq(0),
                 cur_n.eq(fifo.dout[:P.SAMPLE_INDEX_BITS]),
                 *[cur_s[k].eq(fifo.dout[P.SAMPLE_INDEX_BITS + 12 * k:P.SAMPLE_INDEX_BITS + 12 * (k + 1)]) for k in range(4)],
                 processed.eq(fifo.dout[:P.SAMPLE_INDEX_BITS] + 1),
-                If((period != 0) & (strobe_cnt == period - 1),
-                    strobe_due.eq(1), strobe_cnt.eq(0),
-                ).Else(
-                    strobe_due.eq(0), strobe_cnt.eq(strobe_cnt + 1),
-                ),
+                seen.eq(1),
+                cur_gap.eq(seen & (fifo.dout[:P.SAMPLE_INDEX_BITS] != processed)),
             ).Elif(in_round,
                 If(slot == n_slots - 1,
                     in_round.eq(0),
@@ -583,9 +621,77 @@ class TDMCorrelator(LiteXModule):
             engine.slot.eq(slot),
             engine.sample_index.eq(cur_n),
             *[engine.samples[k].eq(cur_s[k]) for k in range(4)],
+            engine.sample_gap.eq(cur_gap),
             engine.strobe_due.eq(strobe_due),
             self._sample_count.status.eq(processed[:32]),
             self._sample_count_hi.status.eq(processed[32:48]),
+        ]
+
+        # Epoch strobes (params.py, "Epoch strobes"). ------------------------------------------------
+        # In a round's first cycle ``processed`` is the new sample's index + 1:
+        # it either anchors the period's phase or is compared against
+        # ``strobe_next``; ``strobe_due`` is read in the round's last slot. The
+        # anchor's next multiple of the period comes from a bit-serial
+        # remainder, done before the anchor's STROBE_SYNC_SAMPLES-th successor.
+        W = P.STROBE_SYNC_SAMPLES
+        div_steps = P.SAMPLE_INDEX_BITS + 1
+        assert W * (n_slots + 1) > div_steps + 2, "the strobe anchor's division must end before its first check"
+        period      = self._strobe_period.storage
+        strobe_next = Signal(P.SAMPLE_INDEX_BITS + 1)
+        need_sync   = Signal(reset=1)              # anchor the phase at the next sample
+        synced      = Signal()                     # strobe_next is valid
+        hold        = Signal(max=W)                # samples still to pass before the first check
+        stale_check = Signal()
+        div_busy    = Signal()
+        div_count   = Signal(max=div_steps + 1)
+        div_x       = Signal(P.SAMPLE_INDEX_BITS + 1)   # the anchor's index + 1 + W
+        div_bits    = Signal(P.SAMPLE_INDEX_BITS + 1)   # div_x, shifted out MSB first
+        div_rem     = Signal(33)
+        div_trial   = Signal(33)
+        self.comb += div_trial.eq(Cat(div_bits[-1], div_rem[:32]))
+        self.sync += [
+            If(rst | self._strobe_period.re,
+                need_sync.eq(1), synced.eq(0), hold.eq(0), strobe_due.eq(0), stale_check.eq(0),
+                div_busy.eq(0),
+            ).Else(
+                stale_check.eq(0),
+                If(popped & (period != 0),
+                    strobe_due.eq(0),
+                    If(need_sync,
+                        need_sync.eq(0), synced.eq(0), hold.eq(W - 1),
+                        div_busy.eq(1), div_count.eq(div_steps), div_rem.eq(0),
+                        div_x.eq(processed + W), div_bits.eq(processed + W),
+                    ).Elif(hold != 0,
+                        hold.eq(hold - 1),
+                    ).Elif(synced & (processed >= strobe_next),
+                        strobe_due.eq(1),
+                        strobe_next.eq(strobe_next + period),
+                        stale_check.eq(1),
+                    ),
+                ).Elif(popped,
+                    strobe_due.eq(0),
+                ),
+                # A gap longer than a period: the next multiple is still behind.
+                If(stale_check & (strobe_next <= processed), need_sync.eq(1)),
+                If(div_busy,
+                    If(div_count != 0,
+                        div_count.eq(div_count - 1),
+                        div_bits.eq(div_bits << 1),
+                        If(div_trial >= period,
+                            div_rem.eq(div_trial - period),
+                        ).Else(
+                            div_rem.eq(div_trial),
+                        ),
+                    ).Else(
+                        div_busy.eq(0), synced.eq(1),
+                        If(div_rem == 0,
+                            strobe_next.eq(div_x),
+                        ).Else(
+                            strobe_next.eq(div_x - div_rem + period),
+                        ),
+                    ),
+                ),
+            ),
         ]
 
         # Commands and flags ----------------------------------------------------------------------
@@ -713,19 +819,24 @@ class TDMCorrelator(LiteXModule):
         src = self.source
         self.comb += [
             src.data.eq(Mux(padding, 0, words[word_idx])),
-            src.valid.eq(rec_en & (sending | padding)),
+            src.valid.eq(sending | padding),
             src.first.eq(0),
             src.last.eq(0),
         ]
+        # Clearing record_enable stops at a buffer boundary: the record in
+        # flight is finished and its buffer padded out, so the DMA's buffers
+        # stay whole records; records that come meanwhile are dropped.
+        idle = Signal()
+        self.comb += idle.eq(~sending & ~padding)
         start_record = Signal()
-        self.comb += start_record.eq(rec_en & ~sending & ~padding & rfifo.readable)
+        self.comb += start_record.eq(rec_en & idle & rfifo.readable)
         start_pad    = Signal()
-        self.comb += start_pad.eq(rec_en & ~sending & ~padding & ~rfifo.readable &
-                                  (buf_pos != 0) & (age >= self._flush_cycles.storage))
+        self.comb += start_pad.eq(idle & (buf_pos != 0) &
+                                  (~rec_en | (~rfifo.readable & (age >= self._flush_cycles.storage))))
         self.comb += rfifo.re.eq(start_record | (~rec_en & rfifo.readable))
         self.sync += [
-            If(rst | ~rec_en,
-                sending.eq(0), padding.eq(0), word_idx.eq(0), buf_pos.eq(0), age.eq(0),
+            If(rst,
+                sending.eq(0), padding.eq(0), word_idx.eq(0), buf_pos.eq(0), age.eq(0), records.eq(0),
             ).Else(
                 If(start_record,
                     sending.eq(1), word_idx.eq(0),
@@ -774,7 +885,7 @@ class RXTap(LiteXModule):
         self.valid = Signal()
         self.data  = Signal(64)
         self.index = Signal(P.SAMPLE_INDEX_BITS)
-        self._host_drops = CSRStatus(32, description="RX words the host path could not take (dropped from DMA0 only).")
+        self._host_drops = CSRStatus(32, description="RX words the host path could not take (dropped from DMA0 only). Free-running, like the sample index: the correlator's reset does not touch the tap.")
 
         # # #
 

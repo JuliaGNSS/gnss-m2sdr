@@ -21,9 +21,9 @@ described in [docs/tdm_correlator.md](docs/tdm_correlator.md).
 
 - GPS L1 C/A, 24 channels at 4 MS/s, up to five taps per channel.
 - `gnss_tdm_m2_x1_ch24_code4096` meets timing at upstream's default
-  directives (WNS +0.134 ns at 125 MHz; 4 DSP48E1, 11.3 % of the LUTs).
+  directives (WNS +0.097 ns at 125 MHz; 4 DSP48E1, 11.4 % of the LUTs).
 - On a board with an antenna (2026-10-16), every one of 3 890 hardware records
-  matched the bit-exact model. GNSSReceiver.jl tracked and decoded up to eight
+  matched the bit-exact model; on the current build (2026-10-19), all 4 313. GNSSReceiver.jl tracked and decoded up to eight
   satellites and computed position fixes from them.
 - Not yet: sub-chip modulations (BOC, CBOC, TMBOC, so no Galileo E1 yet),
   codes longer than the code memory, more than one antenna per channel or more
@@ -101,7 +101,7 @@ PYTHONPATH=. python -m unittest test.test_tdm_engine -v
 
 - `test_tdm_engine` runs the engine in the Migen simulator against the model,
   record for record. `test_tdm_rxtap` checks the RX tap under a stalling host.
-- `test_tdm_xsim` runs the same scenario on the Verilog LiteX writes, in
+- `test_tdm_xsim` runs the engine scenarios on the Verilog LiteX writes, in
   Vivado's xsim, and checks that Verilog for two lowering faults that have
   reached silicon before. It finds xsim on `PATH`, in `$XILINX_VIVADO/bin` or
   through `$XILINX_ENV` (a wrapper that sets up Vivado's environment), and

@@ -14,7 +14,7 @@ import unittest
 from gnss_m2sdr.tdm import model as M
 from test import tdm_xsim
 from test.tdm_harness import random_code, parse_stream
-from test.test_tdm_engine import build_scenario, CODE_LEN
+from test.test_tdm_engine import build_scenario, strobe_scenario, CODE_LEN
 
 
 @unittest.skipIf(tdm_xsim.tool_prefix() is None, "Vivado xsim not available")
@@ -42,6 +42,22 @@ class TestTDMVerilogInXsim(unittest.TestCase):
             if fn.endswith(".init"):
                 for line in open(os.path.join(self.dir, fn)).read().split():
                     self.assertRegex(line, r"^[0-9a-fA-F]+$", fn)
+
+
+@unittest.skipIf(tdm_xsim.tool_prefix() is None, "Vivado xsim not available")
+class TestTDMVerilogScenarios(unittest.TestCase):
+    """The other engine scenarios on the lowered Verilog: rounds back to back
+    (the state RAMs' read-after-write margin), and the epoch strobes and the
+    lost-sample flag over gaps and period changes."""
+    def run_scenario(self, sc):
+        words, _ = tdm_xsim.run(sc, tempfile.mkdtemp(prefix="tdm_xsim_"), n_channels=4, code_words=256)
+        self.assertEqual(parse_stream(words), sc.records)
+
+    def test_back_to_back_rounds(self):
+        self.run_scenario(build_scenario(random_code(CODE_LEN, seed=7), spacing=7, drain=600))
+
+    def test_strobes_and_lost_samples(self):
+        self.run_scenario(strobe_scenario(random_code(CODE_LEN, seed=9)))
 
 
 if __name__ == "__main__":

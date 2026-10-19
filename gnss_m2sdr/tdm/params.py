@@ -69,7 +69,9 @@ KIND_DUMP   = 1
 KIND_STROBE = 2
 
 FLAG_SATURATED       = 1 << 0  # an accumulator hit the rail during this record
-FLAG_SAMPLE_OVERFLOW = 1 << 1  # the sample FIFO overflowed since the previous record
+FLAG_SAMPLE_OVERFLOW = 1 << 1  # samples were lost during this record (the sample index jumped:
+                               # a full sample FIFO, or the engine disabled), so the NCOs fell
+                               # behind the index
 
 # Command register --------------------------------------------------------------------------------
 
@@ -83,20 +85,47 @@ CMD_CHANNEL_SHIFT = 8
 
 # Engine pipeline ---------------------------------------------------------------------------------
 
-PIPELINE_DEPTH = 9             # issue -> state write-back, in cycles (see engine.py)
+WRITEBACK_STAGE = 7            # a slot issued in cycle t writes its state back in cycle t + 7 (S7,
+                               # engine.py), and a read issued from cycle t + 8 on sees it
 
 def num_slots(n_channels):
     """Slots per round: one per channel, one for the strobe, and enough idle ones
-    that a channel's write-back lands before its next read."""
-    return max(n_channels + 1, PIPELINE_DEPTH + 2)
+    that a channel's write-back lands before its next read. A round is the slots
+    plus one cycle to load the next sample, so a slot is issued again
+    ``num_slots + 1 >= WRITEBACK_STAGE + 1`` cycles later at the earliest."""
+    return max(n_channels + 1, WRITEBACK_STAGE)
+
+# Epoch strobes -----------------------------------------------------------------------------------
+#
+# A strobe follows sample n (and carries sample index n + 1) when the index passes a multiple of
+# the strobe period: n + 1 >= next, where next is the first multiple of the period not yet
+# strobed. Strobes therefore sit on the multiples of the period, whatever samples were lost, and
+# a gap that spans several multiples gives one strobe. After a reset or a write of the period the
+# engine finds the period's phase from the first sample it processes: that sample and the
+# STROBE_SYNC_SAMPLES - 1 after it give no strobe, and the first multiple strobed is the first at
+# or after that sample's index + 1 + STROBE_SYNC_SAMPLES. A gap so long that ``next`` is still
+# behind after a strobe starts that over at the next sample.
+
+STROBE_SYNC_SAMPLES = 8
+
+def strobe_next(index, period):
+    """The first multiple of ``period`` at or after ``index``."""
+    return -(-index // period) * period
 
 # Capability register ------------------------------------------------------------------------------
 
 GNSS_ID = 0x7D4C0001           # TDM correlator, CSR/record interface revision 1
 
+def check_code_words(code_words):
+    """The code memory is addressed modulo its size, so it must be a power of two
+    (and its address is 16 bits)."""
+    if not (0 < code_words <= 1 << 16 and code_words & (code_words - 1) == 0):
+        raise ValueError(f"code_words must be a power of two up to 65536, not {code_words}")
+
 def capabilities_word(n_channels, code_words):
     """[7:0] channels, [15:8] slots per round, [19:16] max taps, [25:20] history,
     [30:26] log2(code words)."""
+    check_code_words(code_words)
     return ((n_channels & 0xFF)
             | (num_slots(n_channels) & 0xFF) << 8
             | (MAX_TAPS & 0xF) << 16
@@ -120,9 +149,13 @@ def tap_offsets(shifts):
     ``lead`` is the largest shift (the earliest tap, never behind the prompt),
     the offsets are ``lead - s`` per tap, and ``warmup`` the samples the history
     needs before every tap is valid."""
+    if not 1 <= len(shifts) <= MAX_TAPS:
+        raise ValueError(f"{len(shifts)} taps; a channel has 1 to {MAX_TAPS}")
     lead = max(max(shifts), 0)
     offsets = [lead - s for s in shifts]
-    if any(d < 0 or d >= HISTORY for d in offsets):
+    # lead, the offsets and warmup are HISTORY_BITS-wide fields of the arm, and
+    # the prompt reads history entry ``lead``: all must index the history.
+    if lead >= HISTORY or any(d < 0 or d >= HISTORY for d in offsets):
         raise ValueError(f"tap shifts {shifts} do not fit a {HISTORY}-entry history")
     warmup = max(max(offsets), lead)
     return lead, offsets, warmup

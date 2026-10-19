@@ -16,15 +16,16 @@ correlators, DSP cascades — per channel. Six channels closed timing only at
 `--timing-effort max` with directive tuning, 56 DSP48E1 for four channels.
 
 The TDM engine runs the datapath once per channel per sample: a round of
-`max(n_channels + 1, 11)` cycles per sample, one slot per channel plus one for
-the epoch strobe. Each slot reads the channel's state from a RAM, advances it
-through an eight-stage pipeline and writes it back before the channel's next
-slot. Every register of the datapath is a pipeline stage, so the design is
+`max(n_channels + 1, 7)` slots per sample, one per channel plus one for the
+epoch strobe, and one cycle to load the next sample. Each slot reads the
+channel's state from a RAM, advances it through an eight-stage pipeline and
+writes it back (in S7, seven cycles after the read) before the channel's next
+slot; seven slots are the fewest that guarantee that (`params.num_slots`). Every register of the datapath is a pipeline stage, so the design is
 easy on timing, and its size barely depends on the channel count:
 
 | build | channels | LUTs (whole SoC) | DSP48E1 | BRAM tiles | WNS (sys_clk) |
 |---|---:|---:|---:|---:|---:|
-| `gnss_tdm_m2_x1_ch24_code4096` | 24 | 15 178 (11.3 %) | **4** | 72.5 | +0.134 ns (worst path in litex_m2sdr's AD9361 BFP8 block; the engine's own worst path +0.23 ns) |
+| `gnss_tdm_m2_x1_ch24_code4096` | 24 | 15 231 (11.4 %) | **4** | 75 | +0.097 ns |
 
 built with upstream litex_m2sdr at `973669b` and the directives of upstream's
 own build (`build_tdm.py`), in about seven minutes.
@@ -40,10 +41,13 @@ cross-slot dependency, so all three are straightforward.
 Per slot (`engine.py`, stages S0–S7, mirrored operation for operation by
 `model.py`):
 
-1. **S0–S1** read the channel's state (block RAM), its NCO words, its static
-   configuration and its pending arm (distributed RAM), select the antenna.
+1. **S0–S1** read the channel's NCO and history state (block RAM), its NCO
+   words, its static configuration and its pending arm (distributed RAM),
+   select the antenna. The accumulators live in a second state RAM that is
+   read in S4, so they join the pipeline only where S6 needs them.
 2. **S2** decides a pending arm: start at the staged sample, or mark it missed
-   if that sample has passed. Adds the carrier and code NCO increments.
+   if that sample has passed. Adds the carrier and code NCO increments. A
+   starting channel's accumulators are cleared on their way into S6.
 3. **S3–S4** the shared carrier table (64 entries, ±127) and the code memory
    (32-chip words, block RAM, one memory for all channels); the code-chip
    carry and the wrap at the code length.
@@ -56,7 +60,8 @@ Per slot (`engine.py`, stages S0–S7, mirrored operation for operation by
    needs its own code read or multiplier.
 6. **S6** five tap pairs accumulated (33 bits), **S7** saturated to 32 bits,
    written back; at the prompt's period end the record is emitted and the
-   accumulators restart.
+   accumulators restart. A record's flags say whether an accumulator
+   saturated and whether samples were lost while it integrated.
 
 Number formats are in `params.py`: 32-bit carrier phase and signed frequency
 word, a 20-bit chip index with a 32-bit fraction and an unsigned code word
@@ -75,14 +80,33 @@ word, a 20-bit chip index with a 32-bit fraction and an unsigned code word
   an arm at it.
 - **Flags** (`gnss_enabled`, `gnss_pending`, `gnss_missed`): bitmaps the
   driver confirms its arms from.
+- **Lost samples.** Each sample carries its device index into the engine.
+  When the index jumps — the sample FIFO overflowed (`gnss_sample_overflows`)
+  or the engine was disabled — the channels' NCOs have fallen behind the
+  index, and every record integrating across the jump carries
+  `FLAG_SAMPLE_OVERFLOW`.
 - **Records** on DMA1: 64-byte blocks — magic, kind (dump / strobe / pad),
   channel, tap count, assignment id, the sample index one past the last sample
   integrated, the integrated count, the earliest tap's code phase, and five tap
   pairs. The serialiser pads a part-filled DMA buffer once its first record is
   `gnss_flush_cycles` old, so with the kernel module's per-channel geometry
   (`dma_buffer_size=8192,512 dma_buffer_per_irq=8,1`, upstream #187) a record
-  reaches the host within ~0.1 ms of its end. Epoch strobes
-  (`gnss_strobe_period`) keep the loop's epoch clock moving.
+  reaches the host within ~0.1 ms of its end. Clearing
+  `gnss_control.record_enable` finishes the record in flight and pads its
+  buffer out before the stream stops, so the host's buffers always hold whole
+  records.
+- **Epoch strobes** (`gnss_strobe_period`) keep the loop's epoch clock moving.
+  They sit on the multiples of the period in the sample index, not on a count
+  of samples, so lost samples and enable toggles do not move them: a strobe
+  follows the sample whose index + 1 reaches the next multiple (a gap over one
+  or more multiples gives a single strobe, at the first sample after it). After a reset or a write of the period the engine finds the
+  period's phase in the first `STROBE_SYNC_SAMPLES` (8) samples it processes,
+  without a strobe (`params.py`, "Epoch strobes").
+- **Reset** (`gnss_control.reset`) clears the channels, the FIFOs, the
+  serialiser, the strobe phase and the counters (`records`, `record_drops`,
+  `sample_overflows`). `gnss_sample_count` is the sample index one past the
+  last processed sample, not a count, and the RX tap's `host_drops` is the tap's
+  own; neither is cleared.
 
 ## The RX tap
 
@@ -106,10 +130,13 @@ DMA buffer as a hole in the tags.
 
 - `test/test_tdm_engine.py`: the engine in the Migen simulator against the
   bit-exact model, record for record, with arms, missed starts, words,
-  releases and a stalling DMA.
-- `test/test_tdm_xsim.py`: the same scenario on the Verilog **LiteX's
-  converter writes** (the artefact the bitstream is built from), in Vivado's
-  xsim, plus checks that no negative literal and no signed `.init` entry is in
+  releases and a stalling DMA; rounds back to back at the fewest slots; epoch
+  strobes over lost samples and period changes; a real sample-FIFO overflow
+  (the model replayed on the samples the engine took); `record_enable`
+  toggled mid-record; the reset's counters.
+- `test/test_tdm_xsim.py`: the main, back-to-back and strobe scenarios on the
+  Verilog **LiteX's converter writes** (the artefact the bitstream is built
+  from), in Vivado's xsim, plus checks that no negative literal and no signed `.init` entry is in
   it — the [two lowering faults](#two-lowering-faults) that reached silicon
   with the per-channel bank.
 - `test/test_tdm_rxtap.py`: the tap under a stalling host — the correlator
@@ -121,6 +148,12 @@ DMA buffer as a hole in the tags.
   bit; the trimmed `gnss_loop` closed the loops on live satellites at
   41–45 dB-Hz with bit sync, 0 bytes allocated and records at most 0.6 ms old
   at the fold.
+- On the board (orin1, 2026-10-19, the build in the table): 4 313 of 4 313
+  records bit-exact against the emulator again; strobes on the multiples of
+  the period, also across a 5 ms disable of the engine (one strobe at the gap,
+  one `FLAG_SAMPLE_OVERFLOW` dump per channel); no malformed DMA block through
+  670 000 back-to-back `record_enable` toggles (the previous build garbled
+  the stream within them); a position fix with `receiver.jl` on RX2.
 
 ### Two lowering faults
 

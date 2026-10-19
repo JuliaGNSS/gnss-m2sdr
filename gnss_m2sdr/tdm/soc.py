@@ -6,8 +6,11 @@
 datapath hook (``add_rfic_datapath``, enjoy-digital/litex_m2sdr#185).
 
   * RX: RFIC -> RXTap (counts, optionally tags) -> pipeline buffer -> host (DMA0).
-    The correlator sees exactly the words the host path accepts, so the host's
-    raw stream and the correlator's sample index count the same samples.
+    The tap never stalls the RFIC: the correlator gets every word, indexed by
+    the tap's count, while the host's copy goes through a FIFO and loses the
+    words the host path cannot take (``gnss_tap_host_drops``). The host's raw
+    stream therefore can skip samples the correlator saw: align it to the
+    sample index by the tags (``gnss_control.tag``), not by counting words.
   * Records: correlator -> DMA1 (``pcie_dmas = 2``), whose buffer geometry the
     kernel module sets per channel (``dma_buffer_size=8192,512``).
   * TX: unchanged passthrough.
