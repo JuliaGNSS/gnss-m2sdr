@@ -196,6 +196,11 @@ DMA buffer as a hole in the tags.
   one `FLAG_SAMPLE_OVERFLOW` dump per channel); no malformed DMA block through
   670 000 back-to-back `record_enable` toggles (the previous build garbled
   the stream within them); a position fix with `receiver.jl` on RX2.
+- On the board (orin1, 2026-10-19, the sub-chip replica build): with Galileo
+  E1B channels armed as CBOC (±25/±13, 12 sub-chips) and as BOC(1,1) next to
+  GPS L1 C/A ones on the antenna's samples, all 4 198 dump records received
+  were bit-exact against the emulator fed the same capture; GPS L1 C/A
+  tracking and position fixes with `receiver.jl` were unchanged.
 
 ### Two lowering faults
 
