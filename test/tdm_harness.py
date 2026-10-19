@@ -28,7 +28,8 @@ from gnss_m2sdr.tdm.engine import TDMCorrelator
 REGS = [
     "control", "strobe_period", "flush_cycles", "buffer_words",
     "s_carrier_freq", "s_code_freq", "s_carrier_phase", "s_code_frac", "s_code_chip",
-    "s_code_length", "s_code_base", "s_taps", "s_misc", "s_start_lo", "s_start_hi",
+    "s_code_length", "s_code_base", "s_taps", "s_misc", "s_subcarrier", "s_amplitude",
+    "s_start_lo", "s_start_hi",
     "cmd", "code_addr", "code_data",
 ]
 REG = {name: k for k, name in enumerate(REGS)}
@@ -133,7 +134,8 @@ class Scenario:
         self.model.word(ch, carrier_freq, code_freq)
 
     def arm(self, ch, *, carrier_freq, code_freq, carrier_phase, code_chip, code_frac,
-            code_length, code_base, shifts, antenna, start):
+            code_length, code_base, shifts, antenna, start,
+            subcarrier=P.SUBCARRIER_BPSK, amplitude=P.AMPLITUDE_UNIT):
         lead, offsets, warmup = P.tap_offsets(shifts)
         offsets5 = list(offsets) + [0] * (P.MAX_TAPS - len(offsets))
         self.assign = (self.assign + 1) & 0xFFFF
@@ -143,6 +145,7 @@ class Scenario:
                        ("s_carrier_phase", carrier_phase), ("s_code_frac", code_frac),
                        ("s_code_chip", code_chip), ("s_code_length", code_length),
                        ("s_code_base", code_base), ("s_taps", taps), ("s_misc", misc),
+                       ("s_subcarrier", subcarrier), ("s_amplitude", amplitude),
                        ("s_start_lo", start & 0xFFFFFFFF), ("s_start_hi", start >> 32)):
             self.write(reg, v)
         self.write("cmd", P.CMD_ARM | ch << P.CMD_CHANNEL_SHIFT)
@@ -150,7 +153,8 @@ class Scenario:
             M.ChannelConfig(carrier_freq=M._signed(carrier_freq, 32), code_freq=code_freq,
                             code_length=code_length, code_base=code_base, lead=lead,
                             offsets=tuple(offsets5), num_taps=len(shifts), warmup=warmup,
-                            antenna=antenna, assign_id=self.assign),
+                            antenna=antenna, assign_id=self.assign,
+                            subcarrier=subcarrier, amplitude=amplitude),
             M.Pending(start=start, carrier_phase=carrier_phase, code_chip=code_chip, code_frac=code_frac))
         return self.assign
 
@@ -181,14 +185,16 @@ class Scenario:
 # Signals ----------------------------------------------------------------------------------------
 
 def gps_like_signal(n, *, fs, code_chips, code_rate, doppler, code_phase, amplitude, noise, seed=1,
-                    antenna=1, other=None):
+                    antenna=1, other=None, subcarrier=None):
     """Two-antenna samples with a BPSK satellite on ``antenna``: ±1 ``code_chips``
     at ``code_rate`` chips/s from ``code_phase`` (chips), carrier ``doppler`` Hz.
-    ``other`` adds a second satellite (a dict of the same keys) to the same antenna."""
+    ``subcarrier(frac)``, if given, multiplies each chip by the value at the
+    chip fraction ``frac`` (a BOC/CBOC satellite). ``other`` adds a second
+    satellite (a dict of the same keys) to the same antenna."""
     rng = random.Random(seed)
     out = []
     sats = [dict(code_chips=code_chips, code_rate=code_rate, doppler=doppler,
-                 code_phase=code_phase, amplitude=amplitude)]
+                 code_phase=code_phase, amplitude=amplitude, subcarrier=subcarrier)]
     if other:
         sats.append(other)
     L = len(code_chips)
@@ -196,7 +202,10 @@ def gps_like_signal(n, *, fs, code_chips, code_rate, doppler, code_phase, amplit
         t = k / fs
         re, im = 0.0, 0.0
         for s in sats:
-            chip = s["code_chips"][int(math.floor(s["code_phase"] + s["code_rate"] * t)) % len(s["code_chips"])]
+            phase = s["code_phase"] + s["code_rate"] * t
+            chip = s["code_chips"][int(math.floor(phase)) % len(s["code_chips"])]
+            if s.get("subcarrier") is not None:
+                chip *= s["subcarrier"](phase % 1)
             ph = 2 * math.pi * s["doppler"] * t
             re += s["amplitude"] * chip * math.cos(ph)
             im += s["amplitude"] * chip * math.sin(ph)
@@ -206,6 +215,12 @@ def gps_like_signal(n, *, fs, code_chips, code_rate, doppler, code_phase, amplit
         sig = (clip(sig[0]), clip(sig[1]))
         out.append((nse, sig) if antenna == 1 else (sig, nse))
     return out
+
+
+def cboc_subcarrier(m1=1, m2=6, p=10 / 11):
+    """The CBOC(+) subcarrier as transmitted: sqrt(p) BOC(m1,1) + sqrt(1-p) BOC(m2,1)."""
+    boc = lambda m, f: -1.0 if math.floor(f * 2 * m) % 2 else 1.0
+    return lambda f: math.sqrt(p) * boc(m1, f) + math.sqrt(1 - p) * boc(m2, f)
 
 
 def random_code(length, seed):

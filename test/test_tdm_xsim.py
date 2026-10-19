@@ -14,7 +14,7 @@ import unittest
 from gnss_m2sdr.tdm import model as M
 from test import tdm_xsim
 from test.tdm_harness import random_code, parse_stream
-from test.test_tdm_engine import build_scenario, strobe_scenario, CODE_LEN
+from test.test_tdm_engine import build_scenario, strobe_scenario, cboc_scenario, CODE_LEN
 
 
 @unittest.skipIf(tdm_xsim.tool_prefix() is None, "Vivado xsim not available")
@@ -47,8 +47,9 @@ class TestTDMVerilogInXsim(unittest.TestCase):
 @unittest.skipIf(tdm_xsim.tool_prefix() is None, "Vivado xsim not available")
 class TestTDMVerilogScenarios(unittest.TestCase):
     """The other engine scenarios on the lowered Verilog: rounds back to back
-    (the state RAMs' read-after-write margin), and the epoch strobes and the
-    lost-sample flag over gaps and period changes."""
+    (the state RAMs' read-after-write margin), the epoch strobes and the
+    lost-sample flag over gaps and period changes, and the sub-chip replicas
+    (CBOC's signed-by-unsigned amplitude products)."""
     def run_scenario(self, sc):
         words, _ = tdm_xsim.run(sc, tempfile.mkdtemp(prefix="tdm_xsim_"), n_channels=4, code_words=256)
         self.assertEqual(parse_stream(words), sc.records)
@@ -58,6 +59,9 @@ class TestTDMVerilogScenarios(unittest.TestCase):
 
     def test_strobes_and_lost_samples(self):
         self.run_scenario(strobe_scenario(random_code(CODE_LEN, seed=9)))
+
+    def test_subchip_replicas(self):
+        self.run_scenario(cboc_scenario(random_code(CODE_LEN, seed=13)))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,14 @@ class ChannelConfig:
     warmup: int = 0
     antenna: int = 0
     assign_id: int = 0
+    subcarrier: int = P.SUBCARRIER_BPSK    # s_subcarrier: sub-chips, signs, levels
+    amplitude: int = P.AMPLITUDE_UNIT      # s_amplitude: amp_hi, amp_lo
+
+    def subchips(self):
+        return (self.subcarrier >> (2 * P.MAX_SUBCHIPS)) & ((1 << P.SUBCHIP_BITS) - 1)
+
+    def amp(self, level):
+        return (self.amplitude >> (8 if not level else 0)) & ((1 << P.AMP_BITS) - 1)
 
 
 @dataclass
@@ -61,6 +69,7 @@ class ChannelState:
     code_frac: int = 0
     hist_rep: int = 0
     hist_wrap: int = 0
+    hist_lvl: int = 0
     integ: int = 0
     warm: int = 0
     sat: bool = False
@@ -204,7 +213,7 @@ class Engine:
                 st.carrier_phase = p.carrier_phase & M32
                 st.code_chip = p.code_chip
                 st.code_frac = p.code_frac & M32
-                st.hist_rep = st.hist_wrap = 0
+                st.hist_rep = st.hist_wrap = st.hist_lvl = 0
                 st.integ = 0
                 st.warm = cfg.warmup
                 st.sat = False
@@ -228,9 +237,12 @@ class Engine:
         bb_q = q * c - i * s
         st.carrier_phase = (st.carrier_phase + cfg.carrier_freq) & M32
 
-        # Code NCO (earliest tap) and the replica history.
+        # Code NCO (earliest tap) and the replica history: the chip's sign times
+        # the sub-chip's sign, and the sub-chip's level.
         word = self.code[(cfg.code_base + (st.code_chip >> 5)) % len(self.code)]
-        bit = (word >> (st.code_chip & 31)) & 1
+        sub = P.subchip_index(st.code_frac, cfg.subchips())
+        bit = ((word >> (st.code_chip & 31)) ^ (cfg.subcarrier >> sub)) & 1
+        level = (cfg.subcarrier >> (P.MAX_SUBCHIPS + sub)) & 1
         total = st.code_frac + cfg.code_freq
         st.code_frac = total & M32
         chip = st.code_chip + (total >> 32)
@@ -238,6 +250,7 @@ class Engine:
         st.code_chip = 0 if wrap else chip
         st.hist_rep = ((st.hist_rep << 1) | bit) & M32
         st.hist_wrap = ((st.hist_wrap << 1) | int(wrap)) & M32
+        st.hist_lvl = ((st.hist_lvl << 1) | level) & M32
         prompt_wrap = (st.hist_wrap >> cfg.lead) & 1
 
         if st.warm > 0:
@@ -245,8 +258,10 @@ class Engine:
             return None
         for t in range(cfg.num_taps):
             negative = (st.hist_rep >> cfg.offsets[t]) & 1
+            amp = cfg.amp((st.hist_lvl >> cfg.offsets[t]) & 1)
             for part, bb in ((0, bb_i), (1, bb_q)):
-                value, clipped = _saturate(st.acc[t][part] + (-bb if negative else bb), P.ACC_BITS)
+                v = amp * bb
+                value, clipped = _saturate(st.acc[t][part] + (-v if negative else v), P.ACC_BITS)
                 st.acc[t][part] = value
                 st.sat |= clipped
         st.integ += 1

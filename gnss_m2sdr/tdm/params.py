@@ -19,6 +19,25 @@ Number formats
   with amplitude ``CARRIER_AMPLITUDE``.
 - Accumulators: signed ``ACC_BITS``, saturating.
 
+Replica
+-------
+A channel's replica is the code chip times a sub-chip value: the chip's
+fraction is cut into ``subchips`` (P, at most ``MAX_SUBCHIPS``) equal parts,
+and part ``k = floor(frac * P)`` -- the full-precision product, not the top
+bits of the fraction, since 1/12 is not dyadic -- has a sign and one of two
+amplitudes, ``amp_hi`` or ``amp_lo`` (unsigned ``AMP_BITS``). So the replica
+is ``chip * sign[k] * (amp_hi if level[k] else amp_lo)``:
+
+- BPSK (``LOC``): P = 1, amplitudes 1, the replica +/-1 as before.
+- ``BOCsin(m, 1)``: P = 2m, sign[k] = k odd, amplitudes 1.
+- Galileo E1 ``CBOC(BOC(1,1), BOC(6,1), 10/11)``: P = 12 and GNSSSignals'
+  Int8 levels a1 * BOC(1,1) + a2 * BOC(6,1) with (a1, a2) = (19, 6), i.e.
+  +/-25 and +/-13 -- the replica Tracking.jl's integer correlator uses, whose
+  RMS is ``get_code_amplitude(GalileoE1B())``.
+
+The amplitude scales the accumulators: a channel's records carry the replica
+amplitude the host programmed.
+
 Taps
 ----
 The code NCO runs on the *earliest* tap ("lead" samples ahead of the prompt).
@@ -49,6 +68,9 @@ MAX_TAPS          = 5
 ASSIGN_BITS       = 16
 SAMPLE_INDEX_BITS = 48
 CODE_WORD_BITS    = 32          # chips per code-memory word
+MAX_SUBCHIPS      = 12          # sub-chip table entries (Galileo E1 CBOC needs 12)
+SUBCHIP_BITS      = 4
+AMP_BITS          = 7           # replica amplitudes, unsigned (GNSSSignals' Int8 levels fit)
 
 # Record layout (8 x 64-bit little-endian words = 64 bytes) -------------------------------------------
 #
@@ -114,7 +136,8 @@ def strobe_next(index, period):
 
 # Capability register ------------------------------------------------------------------------------
 
-GNSS_ID = 0x7D4C0001           # TDM correlator, CSR/record interface revision 1
+GNSS_ID = 0x7D4C0002           # TDM correlator, CSR/record interface revision 2 (revision 1
+                               # had no sub-chip replica: no s_subcarrier, s_amplitude)
 
 def check_code_words(code_words):
     """The code memory is addressed modulo its size, so it must be a power of two
@@ -142,6 +165,40 @@ def carrier_table():
     return cos_t, sin_t
 
 # Host-side helpers -------------------------------------------------------------------------------
+
+def subcarrier_word(subchips, signs, levels):
+    """``s_subcarrier``: [11:0] sign bits (1 = negative), [23:12] level bits
+    (1 = ``amp_hi``), [27:24] sub-chips, for per-sub-chip ``signs`` and ``levels``."""
+    if not (1 <= subchips <= MAX_SUBCHIPS and len(signs) == len(levels) == subchips):
+        raise ValueError(f"{subchips} sub-chips; a channel has 1 to {MAX_SUBCHIPS}")
+    sign = sum(int(bool(b)) << k for k, b in enumerate(signs))
+    level = sum(int(bool(b)) << k for k, b in enumerate(levels))
+    return sign | level << MAX_SUBCHIPS | subchips << (2 * MAX_SUBCHIPS)
+
+def amplitude_word(amp_hi, amp_lo):
+    """``s_amplitude``: [6:0] the high amplitude, [14:8] the low one."""
+    if not (0 <= amp_hi < 1 << AMP_BITS and 0 <= amp_lo < 1 << AMP_BITS):
+        raise ValueError(f"amplitudes {amp_hi}, {amp_lo} do not fit {AMP_BITS} bits")
+    return amp_hi | amp_lo << 8
+
+SUBCARRIER_BPSK = subcarrier_word(1, [0], [0])   # the reset values: a BPSK replica, amplitude 1
+AMPLITUDE_UNIT  = amplitude_word(1, 1)
+
+def subchip_index(code_frac, subchips):
+    """The sub-chip a code fraction (32-bit) falls in: floor(frac * P)."""
+    return (code_frac * subchips) >> FRAC_BITS
+
+def cboc_table(m1, m2, a1, a2):
+    """(subchips, signs, levels, amp_hi, amp_lo) of a1 * BOCsin(m1, 1) + a2 * BOCsin(m2, 1)
+    (a2 < 0 for CBOC(-)), the per-sub-chip values GNSSSignals' Int8 code table holds."""
+    P = 2 * math.lcm(m1, m2)
+    boc = lambda m, k: -1 if (k * 2 * m // P) % 2 else 1
+    values = [a1 * boc(m1, k) + a2 * boc(m2, k) for k in range(P)]
+    mags = sorted({abs(v) for v in values})
+    if len(mags) > 2 or 0 in mags:
+        raise ValueError(f"CBOC levels {values} are not two non-zero amplitudes")
+    hi, lo = mags[-1], mags[0]
+    return P, [v < 0 for v in values], [abs(v) == hi for v in values], hi, lo
 
 def tap_offsets(shifts):
     """(lead, offsets, warmup) for tap sample shifts given in record order.

@@ -7,7 +7,7 @@ GNSS downconversion and correlation on the FPGA of the
 
 The gateware is a time-multiplexed (TDM) correlator: one pipelined datapath
 steps every channel once per input sample, reading each channel's state from a
-RAM and writing it back. It needs 4 DSPs at any channel count. The host
+RAM and writing it back. It needs 10 DSPs at any channel count. The host
 acquires on the raw samples, arms channels at an exact device sample, reads
 the correlator records off a second DMA channel and writes the NCO words back.
 [GNSSM2SDR.jl](https://github.com/JuliaGNSS/GNSSM2SDR.jl) is that host side,
@@ -19,14 +19,17 @@ described in [docs/tdm_correlator.md](docs/tdm_correlator.md).
 
 ## Status
 
-- GPS L1 C/A, 24 channels at 4 MS/s, up to five taps per channel.
+- GPS L1 C/A and Galileo E1B, 24 channels at 4 MS/s, up to five taps per
+  channel. The replica is the code times a per-channel sub-chip table of up
+  to 12 entries and two amplitudes, so Galileo E1's CBOC is replicated as
+  GNSSSignals' Int8 code table has it (±25/±13), the one Tracking.jl
+  correlates with ([the replica](docs/tdm_correlator.md#the-replica)).
 - `gnss_tdm_m2_x1_ch24_code4096` meets timing at upstream's default
-  directives (WNS +0.097 ns at 125 MHz; 4 DSP48E1, 11.4 % of the LUTs).
+  directives (WNS +0.118 ns at 125 MHz; 10 DSP48E1, 11.7 % of the LUTs).
 - On a board with an antenna (2026-10-16), every one of 3 890 hardware records
   matched the bit-exact model; on the current build (2026-10-19), all 4 313. GNSSReceiver.jl tracked and decoded up to eight
   satellites and computed position fixes from them.
-- Not yet: sub-chip modulations (BOC, CBOC, TMBOC, so no Galileo E1 yet),
-  codes longer than the code memory, more than one antenna per channel or more
+- Not yet: TMBOC (GPS L1C pilot), codes longer than the code memory, more than one antenna per channel or more
   than one band. See [Not yet](docs/tdm_correlator.md#not-yet).
 
 ## litex_m2sdr

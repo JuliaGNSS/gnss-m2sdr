@@ -113,6 +113,11 @@ class TDMEngine(LiteXModule):
             ("warmup",      P.HISTORY_BITS),
             ("antenna",     1),
             ("assign_id",   P.ASSIGN_BITS),
+            ("subchips",    P.SUBCHIP_BITS),
+            ("sc_sign",     P.MAX_SUBCHIPS),
+            ("sc_level",    P.MAX_SUBCHIPS),
+            ("amp_hi",      P.AMP_BITS),
+            ("amp_lo",      P.AMP_BITS),
         ]
         pending_layout = [
             ("start",         P.SAMPLE_INDEX_BITS),
@@ -150,6 +155,7 @@ class TDMEngine(LiteXModule):
             ("code_chip",     P.CHIP_BITS),
             ("hist_rep",      P.HISTORY),
             ("hist_wrap",     P.HISTORY),
+            ("hist_lvl",      P.HISTORY),
             ("warm",          P.HISTORY_BITS),
         ]
         acc_layout = [
@@ -283,20 +289,34 @@ class TDMEngine(LiteXModule):
             s3_i.eq(s2_i), s3_q.eq(s2_q),
         ]
 
-        # S3: code-memory address out, carrier table, chip increment. -----------------------------
+        # S3: code-memory address out, carrier table scaled by the two replica
+        # amplitudes, sub-chip index, chip increment. ----------------------------------------------
         self.comb += code_rd.adr.eq(s3_code_adr)
         lut_cos = Signal(8)
         lut_sin = Signal(8)
         self.comb += Case(s3_lut, {
             k: [lut_cos.eq(cos_t[k] & 0xFF), lut_sin.eq(sin_t[k] & 0xFF)] for k in range(len(cos_t))
         })
+        lut_cos_s, lut_sin_s = Signal((8, True)), Signal((8, True))
+        amp_hi_s, amp_lo_s = Signal((P.AMP_BITS + 1, True)), Signal((P.AMP_BITS + 1, True))
+        self.comb += [
+            lut_cos_s.eq(lut_cos), lut_sin_s.eq(lut_sin),
+            # Zero-extended into signed signals: every product below is signed x signed.
+            amp_hi_s.eq(s3_static.amp_hi), amp_lo_s.eq(s3_static.amp_lo),
+        ]
+        sc_w = 8 + P.AMP_BITS + 1
+        # floor(frac * P): the full product, since a sub-chip edge at k/12 chip is not dyadic.
+        sub_prod = Signal(P.FRAC_BITS + P.SUBCHIP_BITS)
+        self.comb += sub_prod.eq(s3_state.code_frac * s3_static.subchips)
         chip_inc = Signal(P.CHIP_BITS + 1)
         self.comb += chip_inc.eq(s3_state.code_chip + s3_carry)
         s4_valid, s4_active, s4_slot, s4_n, s4_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
         s4_gap, s4_start = Signal(), Signal()
         s4_static = _Fields(static_layout, "s4_static")
         s4_state  = _Fields(state_layout, "s4_state")
-        s4_cos, s4_sin = Signal((8, True)), Signal((8, True))
+        s4_cos_hi, s4_sin_hi = Signal((sc_w, True)), Signal((sc_w, True))
+        s4_cos_lo, s4_sin_lo = Signal((sc_w, True)), Signal((sc_w, True))
+        s4_sub = Signal(P.SUBCHIP_BITS)
         s4_i, s4_q = Signal((P.SAMPLE_BITS, True)), Signal((P.SAMPLE_BITS, True))
         s4_cp_next, s4_frac_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS)
         s4_chip_next, s4_wrap = Signal(P.CHIP_BITS), Signal()
@@ -307,7 +327,9 @@ class TDMEngine(LiteXModule):
             s4_valid.eq(s3_valid), s4_active.eq(s3_active), s4_slot.eq(s3_slot), s4_n.eq(s3_n), s4_strobe.eq(s3_strobe),
             s4_gap.eq(s3_gap), s4_start.eq(s3_start),
             s4_static.raw.eq(s3_static.raw), s4_state.raw.eq(s3_state.raw),
-            s4_cos.eq(lut_cos), s4_sin.eq(lut_sin),
+            s4_cos_hi.eq(lut_cos_s * amp_hi_s), s4_sin_hi.eq(lut_sin_s * amp_hi_s),
+            s4_cos_lo.eq(lut_cos_s * amp_lo_s), s4_sin_lo.eq(lut_sin_s * amp_lo_s),
+            s4_sub.eq(sub_prod[P.FRAC_BITS:]),
             s4_i.eq(s3_i), s4_q.eq(s3_q),
             s4_cp_next.eq(s3_cp_next), s4_frac_next.eq(s3_frac_next),
             s4_wrap.eq(wrap),
@@ -315,41 +337,53 @@ class TDMEngine(LiteXModule):
             s4_bitsel.eq(s3_state.code_chip[:5]),
         ]
 
-        # S4: code bit select, wipe-off products, accumulator read. --------------------------------
+        # S4: code bit and sub-chip select, wipe-off products, accumulator read. -----------------
         self.comb += acc_rd.adr.eq(s4_slot)
         code_shifted = Signal(P.CODE_WORD_BITS)
+        sign_shifted = Signal(P.MAX_SUBCHIPS)
+        level_shifted = Signal(P.MAX_SUBCHIPS)
         code_bit = Signal()
         self.comb += [
             code_shifted.eq(code_rd.dat_r >> s4_bitsel),
-            code_bit.eq(code_shifted[0]),
+            sign_shifted.eq(s4_static.sc_sign >> s4_sub),
+            level_shifted.eq(s4_static.sc_level >> s4_sub),
+            code_bit.eq(code_shifted[0] ^ sign_shifted[0]),
         ]
-        prod_w = P.SAMPLE_BITS + 8
+        prod_w = P.SAMPLE_BITS + sc_w
         s5_valid, s5_active, s5_slot, s5_n, s5_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
         s5_gap, s5_start = Signal(), Signal()
         s5_static = _Fields(static_layout, "s5_static")
         s5_state  = _Fields(state_layout, "s5_state")
         s5_cp_next, s5_frac_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS)
-        s5_chip_next, s5_wrap, s5_bit = Signal(P.CHIP_BITS), Signal(), Signal()
-        s5_ic, s5_qs, s5_qc, s5_is = [Signal((prod_w, True)) for _ in range(4)]
+        s5_chip_next, s5_wrap, s5_bit, s5_lvl = Signal(P.CHIP_BITS), Signal(), Signal(), Signal()
+        s5_ic_hi, s5_qs_hi, s5_qc_hi, s5_is_hi = [Signal((prod_w, True)) for _ in range(4)]
+        s5_ic_lo, s5_qs_lo, s5_qc_lo, s5_is_lo = [Signal((prod_w, True)) for _ in range(4)]
         self.sync += [
             s5_valid.eq(s4_valid), s5_active.eq(s4_active), s5_slot.eq(s4_slot), s5_n.eq(s4_n), s5_strobe.eq(s4_strobe),
             s5_gap.eq(s4_gap), s5_start.eq(s4_start),
             s5_static.raw.eq(s4_static.raw), s5_state.raw.eq(s4_state.raw),
             s5_cp_next.eq(s4_cp_next), s5_frac_next.eq(s4_frac_next),
             s5_chip_next.eq(s4_chip_next), s5_wrap.eq(s4_wrap), s5_bit.eq(code_bit),
-            s5_ic.eq(s4_i * s4_cos),
-            s5_qs.eq(s4_q * s4_sin),
-            s5_qc.eq(s4_q * s4_cos),
-            s5_is.eq(s4_i * s4_sin),
+            s5_lvl.eq(level_shifted[0]),
+            s5_ic_hi.eq(s4_i * s4_cos_hi),
+            s5_qs_hi.eq(s4_q * s4_sin_hi),
+            s5_qc_hi.eq(s4_q * s4_cos_hi),
+            s5_is_hi.eq(s4_i * s4_sin_hi),
+            s5_ic_lo.eq(s4_i * s4_cos_lo),
+            s5_qs_lo.eq(s4_q * s4_sin_lo),
+            s5_qc_lo.eq(s4_q * s4_cos_lo),
+            s5_is_lo.eq(s4_i * s4_sin_lo),
         ]
 
         # S5: baseband sums, history shift, tap selection. ----------------------------------------
         bb_w = prod_w + 1
         hist_rep_new  = Signal(P.HISTORY)
         hist_wrap_new = Signal(P.HISTORY)
+        hist_lvl_new  = Signal(P.HISTORY)
         self.comb += [
             hist_rep_new.eq(Cat(s5_bit, s5_state.hist_rep[:P.HISTORY - 1])),
             hist_wrap_new.eq(Cat(s5_wrap, s5_state.hist_wrap[:P.HISTORY - 1])),
+            hist_lvl_new.eq(Cat(s5_lvl, s5_state.hist_lvl[:P.HISTORY - 1])),
         ]
         s6_valid, s6_active, s6_slot, s6_n, s6_strobe = Signal(), Signal(), Signal(8), Signal(P.SAMPLE_INDEX_BITS), Signal()
         s6_gap = Signal()
@@ -357,15 +391,19 @@ class TDMEngine(LiteXModule):
         s6_state  = _Fields(state_layout, "s6_state")
         s6_acc    = _Fields(acc_layout, "s6_acc")      # a channel starting gets cleared ones
         s6_cp_next, s6_frac_next, s6_chip_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS), Signal(P.CHIP_BITS)
-        s6_hist_rep, s6_hist_wrap = Signal(P.HISTORY), Signal(P.HISTORY)
-        s6_bb_i, s6_bb_q = Signal((bb_w, True)), Signal((bb_w, True))
+        s6_hist_rep, s6_hist_wrap, s6_hist_lvl = Signal(P.HISTORY), Signal(P.HISTORY), Signal(P.HISTORY)
+        s6_bb_hi_i, s6_bb_hi_q = Signal((bb_w, True)), Signal((bb_w, True))
+        s6_bb_lo_i, s6_bb_lo_q = Signal((bb_w, True)), Signal((bb_w, True))
         s6_neg = [Signal(name=f"s6_neg{k}") for k in range(P.MAX_TAPS)]
+        s6_lvl = [Signal(name=f"s6_lvl{k}") for k in range(P.MAX_TAPS)]
         s6_prompt_wrap = Signal()
         d = [getattr(s5_static, f"d{k}") for k in range(P.MAX_TAPS)]
         tap_shifted = [Signal(P.HISTORY, name=f"s5_tap_shifted{k}") for k in range(P.MAX_TAPS)]
+        lvl_shifted = [Signal(P.HISTORY, name=f"s5_lvl_shifted{k}") for k in range(P.MAX_TAPS)]
         wrap_shifted = Signal(P.HISTORY)
         self.comb += [
             *[tap_shifted[k].eq(hist_rep_new >> d[k]) for k in range(P.MAX_TAPS)],
+            *[lvl_shifted[k].eq(hist_lvl_new >> d[k]) for k in range(P.MAX_TAPS)],
             wrap_shifted.eq(hist_wrap_new >> s5_static.lead),
         ]
         self.sync += [
@@ -374,10 +412,13 @@ class TDMEngine(LiteXModule):
             s6_static.raw.eq(s5_static.raw), s6_state.raw.eq(s5_state.raw),
             If(s5_start, s6_acc.raw.eq(0)).Else(s6_acc.raw.eq(acc_rd.dat_r)),
             s6_cp_next.eq(s5_cp_next), s6_frac_next.eq(s5_frac_next), s6_chip_next.eq(s5_chip_next),
-            s6_hist_rep.eq(hist_rep_new), s6_hist_wrap.eq(hist_wrap_new),
-            s6_bb_i.eq(s5_ic + s5_qs),
-            s6_bb_q.eq(s5_qc - s5_is),
+            s6_hist_rep.eq(hist_rep_new), s6_hist_wrap.eq(hist_wrap_new), s6_hist_lvl.eq(hist_lvl_new),
+            s6_bb_hi_i.eq(s5_ic_hi + s5_qs_hi),
+            s6_bb_hi_q.eq(s5_qc_hi - s5_is_hi),
+            s6_bb_lo_i.eq(s5_ic_lo + s5_qs_lo),
+            s6_bb_lo_q.eq(s5_qc_lo - s5_is_lo),
             *[s6_neg[k].eq(tap_shifted[k][0]) for k in range(P.MAX_TAPS)],
+            *[s6_lvl[k].eq(lvl_shifted[k][0]) for k in range(P.MAX_TAPS)],
             s6_prompt_wrap.eq(wrap_shifted[0]),
         ]
 
@@ -389,7 +430,7 @@ class TDMEngine(LiteXModule):
         s7_gap = Signal()
         s7_static = _Fields(static_layout, "s7_static")
         s7_cp_next, s7_frac_next, s7_chip_next = Signal(P.PHASE_BITS), Signal(P.FRAC_BITS), Signal(P.CHIP_BITS)
-        s7_hist_rep, s7_hist_wrap = Signal(P.HISTORY), Signal(P.HISTORY)
+        s7_hist_rep, s7_hist_wrap, s7_hist_lvl = Signal(P.HISTORY), Signal(P.HISTORY), Signal(P.HISTORY)
         s7_integ = Signal(P.INTEG_BITS)
         s7_warm  = Signal(P.HISTORY_BITS)
         s7_sat_in = Signal()
@@ -398,7 +439,10 @@ class TDMEngine(LiteXModule):
         s7_sums  = {}
         acc_stmts = []
         for k in range(P.MAX_TAPS):
-            for part, bb in (("i", s6_bb_i), ("q", s6_bb_q)):
+            for part, bb_hi, bb_lo in (("i", s6_bb_hi_i, s6_bb_lo_i), ("q", s6_bb_hi_q, s6_bb_lo_q)):
+                # The tap's replica amplitude: the level its history entry carries.
+                bb = Signal((bb_w, True), name=f"s6_bb{k}_{part}")
+                self.comb += If(s6_lvl[k], bb.eq(bb_hi)).Else(bb.eq(bb_lo))
                 acc = getattr(s6_acc, f"acc{k}_{part}")
                 acc_s = Signal((P.ACC_BITS, True), name=f"s6_acc{k}_{part}")
                 self.comb += acc_s.eq(acc)
@@ -423,7 +467,7 @@ class TDMEngine(LiteXModule):
             s7_gap.eq(s6_gap),
             s7_static.raw.eq(s6_static.raw),
             s7_cp_next.eq(s6_cp_next), s7_frac_next.eq(s6_frac_next), s7_chip_next.eq(s6_chip_next),
-            s7_hist_rep.eq(s6_hist_rep), s7_hist_wrap.eq(s6_hist_wrap),
+            s7_hist_rep.eq(s6_hist_rep), s7_hist_wrap.eq(s6_hist_wrap), s7_hist_lvl.eq(s6_hist_lvl),
             s7_sat_in.eq(s6_acc.sat),
             s7_lost_in.eq(s6_acc.lost),
             If(warming,
@@ -472,6 +516,7 @@ class TDMEngine(LiteXModule):
             w.code_chip.eq(s7_chip_next),
             w.hist_rep.eq(s7_hist_rep),
             w.hist_wrap.eq(s7_hist_wrap),
+            w.hist_lvl.eq(s7_hist_lvl),
             w.warm.eq(s7_warm),
             If(s7_dump,
                 wa.raw.eq(0),
@@ -560,6 +605,10 @@ class TDMCorrelator(LiteXModule):
         self._s_code_base     = CSRStorage(16)
         self._s_taps          = CSRStorage(32, description="[24:0] five 5-bit history offsets, [27:25] num_taps.")
         self._s_misc          = CSRStorage(32, description="[4:0] lead, [9:5] warmup, [10] antenna, [31:16] assignment id.")
+        self._s_subcarrier    = CSRStorage(32, reset=P.SUBCARRIER_BPSK,
+                                           description="Replica sub-chips: [11:0] sign (1 = negative), [23:12] level (1 = amp_hi), [27:24] sub-chips per chip.")
+        self._s_amplitude     = CSRStorage(16, reset=P.AMPLITUDE_UNIT,
+                                           description="Replica amplitudes: [6:0] amp_hi, [14:8] amp_lo.")
         self._s_start_lo      = CSRStorage(32)
         self._s_start_hi      = CSRStorage(16)
         self._cmd       = CSRStorage(32, description="Write [1:0] op (1 word, 2 arm, 3 release), [15:8] channel.")
@@ -717,6 +766,11 @@ class TDMCorrelator(LiteXModule):
             "warmup":      misc[5:10],
             "antenna":     misc[10],
             "assign_id":   misc[16:32],
+            "subchips":    self._s_subcarrier.storage[2 * P.MAX_SUBCHIPS:2 * P.MAX_SUBCHIPS + P.SUBCHIP_BITS],
+            "sc_sign":     self._s_subcarrier.storage[0:P.MAX_SUBCHIPS],
+            "sc_level":    self._s_subcarrier.storage[P.MAX_SUBCHIPS:2 * P.MAX_SUBCHIPS],
+            "amp_hi":      self._s_amplitude.storage[0:P.AMP_BITS],
+            "amp_lo":      self._s_amplitude.storage[8:8 + P.AMP_BITS],
         }
         pending_fields = {
             "start":         Cat(self._s_start_lo.storage, self._s_start_hi.storage),
