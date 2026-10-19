@@ -1,11 +1,13 @@
 # Toolchain the Migen simulation suite (test/run_all.py) is known green on.
 #
 # Pinned to exact commits on purpose: migen and LiteX are moving targets, and the
-# Memory / get_port API the recorder's FIFO leans on lives on the seam between
+# Memory / get_port API the engine's FIFOs lean on lives on the seam between
 # them (see test/migen_compat.py for the write-only-port hole in migen's
-# simulator that every CorrelatorRecorder simulation hits).
+# simulator that every simulation with a stream.SyncFIFO hits).
 #
-# Nothing here needs a board, Vivado or numpy; the suite is pure simulation.
+# Nothing here needs a board or numpy; the suite is pure simulation. Vivado is
+# optional: test/test_tdm_xsim.py runs on xsim where it finds it and skips
+# otherwise (CI).
 #
 #   pip install -r requirements-test.txt
 #   PYTHONPATH=. python test/run_all.py
@@ -15,7 +17,6 @@ git+https://github.com/m-labs/migen.git@e19524c963a8342952840983047557707fbe0b6a
 # litex 2026.4, at the commit that emits a negative signed constant as
 # $signed(N'h<pattern>) (37b75bd4, 2026-07-24). The commit before it -- the
 # previous pin -- writes `-32'h80000000`, an unsigned literal, which is how the
-# saturating clamp reached silicon inverted (docs/gateware_builds.md 5.6e).
+# saturating clamp reached silicon inverted (docs/tdm_correlator.md, "Two
+# lowering faults").
 git+https://github.com/enjoy-digital/litex.git@37b75bd4
-# litepcie 2026.4 (dma_layout, used by the record stream)
-git+https://github.com/enjoy-digital/litepcie.git@e84e0b9eea85cc0704775b71a922e2baeead4353

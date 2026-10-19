@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # migen / LiteX / LitePCIe at the exact commits the suite is green on --
+      # migen / LiteX at the exact commits the suite is green on --
       # see requirements-test.txt for why these are pinned. No board, no Vivado
       # and no numpy: the whole suite is pure simulation.
       - name: Install the gateware toolchain
@@ -28,7 +28,7 @@ jobs:
           pip install -r requirements-test.txt
 
       - name: Report toolchain versions
-        run: pip list | grep -Ei 'migen|litex|litepcie'
+        run: pip list | grep -Ei 'migen|litex'
 
       - name: Run the test suite
         run: PYTHONPATH=. python test/run_all.py

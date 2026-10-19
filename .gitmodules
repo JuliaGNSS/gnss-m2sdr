@@ -1,0 +1,3 @@
+[submodule "third_party/litex_m2sdr"]
+	path = third_party/litex_m2sdr
+	url = https://github.com/enjoy-digital/litex_m2sdr.git

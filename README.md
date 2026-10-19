@@ -2,164 +2,124 @@
 
 [![tests](https://github.com/JuliaGNSS/gnss-m2sdr/actions/workflows/tests.yml/badge.svg)](https://github.com/JuliaGNSS/gnss-m2sdr/actions/workflows/tests.yml)
 
-On-FPGA GNSS downconversion + correlation for the [LiteX-M2SDR](https://github.com/enjoy-digital/litex_m2sdr)
-board. Companion to [GNSSReceiver.jl#107](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/107).
+GNSS downconversion and correlation on the FPGA of the
+[LiteX-M2SDR](https://github.com/enjoy-digital/litex_m2sdr).
 
-## Concept
+The gateware is a time-multiplexed (TDM) correlator: one pipelined datapath
+steps every channel once per input sample, reading each channel's state from a
+RAM and writing it back. It needs 4 DSPs at any channel count. The host
+acquires on the raw samples, arms channels at an exact device sample, reads
+the correlator records off a second DMA channel and writes the NCO words back.
+[GNSSM2SDR.jl](https://github.com/JuliaGNSS/GNSSM2SDR.jl) is that host side,
+and [GNSSReceiver.jl](https://github.com/JuliaGNSS/GNSSReceiver.jl)'s
+`receive(::HardwareLoop, …)` is the receiver on top of it.
 
-Acquisition stays on the CPU; **signal tracking runs on the FPGA**:
-
-1. Every ~10 s the SDR streams ~10 ms of raw IQ to the host (existing DMA0 path)
-   for PRN acquisition.
-2. The host feeds back code phase, carrier phase and their Dopplers to the FPGA.
-3. The FPGA runs the code + carrier NCOs and correlates continuously, emitting one
-   correlator dump per code period per channel.
-4. Dumps stream losslessly to the host over a dedicated DMA channel; the host runs
-   the tracking loops (Doppler/NCO-update estimation) and writes NCO updates back.
-
-The dumps map onto `Tracking.jl`'s `CorrelatorOutput(correlator,
-integrated_samples, sample_index)` external-producer contract
-(JuliaGNSS/Tracking.jl #205, #207). The record's `code_phase` is *additional
-device-side metadata that Tracking.jl does not currently consume*: as of
-Tracking.jl v4.1.1 (with #207 merged) the struct has exactly those three fields
-and no `code_phase` keyword constructor exists, despite what #207's description
-advertises. We keep the field because the CPU side needs it for acquisition
-handover and downstream vector tracking.
-
-> **Accumulator order.** `EarlyPromptLateCorrelator.accumulators` is ordered
-> *latest first* — `[late, prompt, early]`, since `get_prompt_index` is 2, late
-> is index 1 and early is index 3. The host glue must therefore build
-> `EarlyPromptLateCorrelator(SVector(late, prompt, early), spacing)`, i.e. the
-> reverse of the record's `prompt, early, late` word order (see
-> `gnss_m2sdr/record_format.py`). Swapping E and L inverts the sign of the DLL
-> discriminator and the loop never converges.
-
-> **Tap offsets.** Tracking.jl quantises its preferred code shifts to whole
-> numbers of input samples (`get_correlator_sample_shifts`) and its
-> discriminators recover the spacing from the correlator they are handed. The
-> host therefore programs each tap as `sample_shift * code_step`, not as the raw
-> preferred chip shift (`GNSSChannel.set_tap_offsets`) — at fs = 4 MHz and 0.5
-> chips the raw value is a ~2.3 % DLL loop-gain error. There is one register per
-> tap and no "spacing": a five-tap layout is not describable by one number, which
-> is why the contract hands over the whole `tap_sample_shifts` array.
-
-> **Antennas.** Beamforming in GNSSReceiver.jl is *post-correlation* on the CPU
-> (`EigenBeamformer`, adapting from the per-antenna prompt covariance), so the
-> device streams **per-antenna** accumulators — one E/P/L block per antenna in
-> every record, `T = SVector{N,Complex}` on the host. The replica generation
-> (carrier NCO, code NCO, three code RAMs) is shared across antennas, since they
-> all track the same signal and only the spatial phase differs; `NCOUpdate` stays
-> one per channel. N ≤ 2 on one board: the AD9361 is 2T2R and its shared LO is
-> what makes the two RX chains phase-coherent. Larger arrays need
-> phase-synchronised multi-board setups and are out of scope.
-
-## Integration with litex_m2sdr (no fork)
-
-The base SoC (PCIe, clocking, SI5351, time) is reused via the upstream
-`add_rx_datapath_processing()` hook + configurable `pcie_dmas`
-(enjoy-digital/litex_m2sdr#152). This repo's SoC subclasses `BaseSoC`, taps the
-RX stream losslessly into the tracking block, and drives `pcie_dma1` with the
-correlator dumps — DMA0's I/Q path is untouched.
-
-`BaseSoC` lives in litex_m2sdr's top-level `litex_m2sdr.py` script, so it is
-loaded by file path rather than imported. Point `LITEX_M2SDR_DIR` at your
-checkout; without it, `~/litex_m2sdr` and a checkout sitting next to this repo
-are tried, and the error lists every path attempted.
-
-```
-export LITEX_M2SDR_DIR=/path/to/litex_m2sdr
-```
+The design, the host interface, the record format and the verification are
+described in [docs/tdm_correlator.md](docs/tdm_correlator.md).
 
 ## Status
 
-- [x] GPS L1 C/A code generator — validated vs IS-GPS-200, autocorrelation/balance,
-      and GNSSSignals.jl `gen_code` (all 32 PRNs, exact).
-- [x] Carrier NCO + sin/cos LUT (SinCosLUT.jl amplitude convention) — matches ideal
-      within quantization; frequency and phase-set verified.
-- [x] Code NCO + multi-tap replica with **independently placed taps** — prompt
-      reproduces the code, epoch period exact, each tap lands exactly on the
-      whole-sample offset it was programmed with.
-- [x] Correlators + integrate-and-dump (`TrackingChannel`), 3 or 5 taps.
-- [x] Full single-channel Migen simulation: locks on a synthetic L1 C/A signal
-      (prompt peaks, E/L balanced, DLL discriminator sign correct, wrong-PRN rejects).
-- [x] Correlator-dump record builder + FIFO + DMA1 (record.py, record_format.py)
-- [x] Multi-channel bank + CSR control (bank.py: carrier/code freq words, per-tap
-      offsets, runtime PRN code load, per-channel dump readback)
-- [x] Deterministic apply point: NCO updates and acquisition handover (carrier
-      freq/phase + code freq/phase) commit atomically on a host-chosen sample
-      index (`apply_at`), giving `NCOUpdate.apply_at_epoch` a hardware meaning
-      and a fixed feedback delay instead of PCIe jitter.
-- [x] SoC integration via litex_m2sdr#152 hook (soc.py, pcie_dmas=2, RX observer)
-- [x] Host software: pure-Python CSR access (ioctl) + sliding-correlator acquisition
-- [x] Periodic **epoch-strobe records** (`gnss_epoch_period` CSR): a timebase marker
-      on the shared sample counter, so the host closes epochs even with no channel
-      locked (GNSSReceiver.jl#107).
-- [x] **Runtime signal configuration** (`docs/signal_configuration.md`): per-channel
-      primary-code length (330 … `--max-code-length`, default 1023) and chipping
-      rate, committed atomically with the code load and the code phase by the
-      arming `restart`; an unrepresentable rate (≥ 1 chip/input sample) is
-      reported (`gnss_rate_error`) and stops that channel's records instead of
-      being truncated into a plausible one. Records carry the **complete** code
-      phase (chip *and* fraction), the code length and the code step, plus a
-      format version and a tap count; `gnss_version` / `gnss_capabilities` /
-      `gnss_signal_caps` let the host discover the build instead of assuming it.
-- [x] **Multi-antenna (N≤2, the AD9361's 2T2R limit)**: `num_ants` per channel —
-      one carrier/code NCO and one replica set shared, `num_ants × 2 × num_taps`
-      accumulators, one block per antenna in the record (`--num-ants 2`).
-- [x] **Sub-chip modulation and five-tap correlation**
-      (`docs/subchip_modulation.md`): per-channel BOC(1,1) (sine and cosine),
-      Galileo E1 CBOC — amplitude-bearing, at GNSSSignals' own (19, 6) integer
-      table, so `replica_code_amplitude` needs no override — and GPS L1C TMBOC,
-      all checked sample for sample against a GNSSSignals.jl golden reference.
-      Very Early / Very Late taps at independent whole-sample offsets, reported
-      in the four record words version 2 reserved, with `num_taps` **per
-      channel** so one bank runs GPS L1 C/A on three taps next to Galileo E1 on
-      five. `GalileoE1B_BOC11` and friends stay separate signals, never a silent
-      substitution for CBOC.
-- [x] **Hardware validation on orin2: on-FPGA correlators acquired a live GPS
-      satellite (PRN 24, peak/median >> 100) from the antenna.**
+- GPS L1 C/A, 24 channels at 4 MS/s, up to five taps per channel.
+- `gnss_tdm_m2_x1_ch24_code4096` meets timing at upstream's default
+  directives (WNS +0.097 ns at 125 MHz; 4 DSP48E1, 11.4 % of the LUTs).
+- On a board with an antenna (2026-10-16), every one of 3 890 hardware records
+  matched the bit-exact model; on the current build (2026-10-19), all 4 313. GNSSReceiver.jl tracked and decoded up to eight
+  satellites and computed position fixes from them.
+- Not yet: sub-chip modulations (BOC, CBOC, TMBOC, so no Galileo E1 yet),
+  codes longer than the code memory, more than one antenna per channel or more
+  than one band. See [Not yet](docs/tdm_correlator.md#not-yet).
 
-### Hardware notes (learned bringing this up on a Jetson Orin)
+## litex_m2sdr
 
-- Requires a litex_m2sdr gateware whose SI5351 uses litei2c **before** commit
-  `ce0bb5d` (the stuck-low bus-error check spuriously fails on this board over
-  PCIe). This repo pins litei2c to `19417d6`. Symptom otherwise: `m2sdr_rf`
-  fails at `SI5351 SYS_INIT ... status 0x00`.
-- The RX observer only sees samples while DMA0 is draining — run a continuous
-  `m2sdr_record /dev/null &` during tracking.
-- On the Orin the PCIe device is `0004:01:00.0`; after `flash_reload`, re-enumerate
-  manually (rescan.py mis-formats the domain): `rmmod m2sdr; echo 1 >
-  /sys/bus/pci/devices/0004:01:00.0/remove; echo 1 > /sys/bus/pci/rescan; modprobe m2sdr`.
+gnss-m2sdr is not a fork of litex_m2sdr. It uses an unmodified upstream
+checkout as a dependency:
+
+- `gnss_m2sdr/tdm/soc.py` subclasses litex_m2sdr's `BaseSoC` and puts the
+  correlator on its RFIC datapath hook, `add_rfic_datapath()`
+  (enjoy-digital/litex_m2sdr#185), with a second PCIe DMA channel
+  (`pcie_dmas=2`) for the records.
+- It is pinned as a git submodule at `third_party/litex_m2sdr`, currently
+  `main` at [`973669b`](https://github.com/enjoy-digital/litex_m2sdr/commit/973669b)
+  (2026-10-15). The same checkout provides the gateware's `BaseSoC` and the
+  kernel module and user tools the host rebuilds, so both match.
+- `BaseSoC` lives in litex_m2sdr's top-level `litex_m2sdr.py` script, which
+  its `setup.py` does not install, so it is loaded by file path. Set
+  `LITEX_M2SDR_DIR` to build against another checkout, such as an upstream
+  branch; a checkout without the hook is refused.
+- The host needs litex_m2sdr's kernel module with per-DMA-channel ring
+  geometry (#187), so DMA1 can run small buffers with an interrupt per buffer.
+
+The bitstream above was built with Vivado 2024.1 and the LiteX ecosystem as of
+2026-10-15 (litex `faff1b21e`, litepcie `586d7a4`, litei2c `73ac32e`, migen
+`4c2ae8d`). To move the pin, check out the new commit in the submodule, rebuild,
+and commit the submodule.
+
+## Building and bring-up
+
+```sh
+git clone --recurse-submodules https://github.com/JuliaGNSS/gnss-m2sdr
+# or, in an existing clone: git submodule update --init
+python build_tdm.py --build      # --channels, --code-words
+```
+
+This writes the bitstream, `csr.csv` and the kernel and user headers to
+`build/gnss_tdm_m2_x1_ch24_code4096/`. Then:
+
+1. Rebuild the kernel module and user tools in
+   `third_party/litex_m2sdr/litex_m2sdr/software/` with
+   `build/<name>/software/kernel/{csr,soc,mem}.h`. The headers shipped in
+   litex_m2sdr describe upstream's own gateware, and tools built with them
+   hang on this one.
+2. Load the module with a small ring for DMA1:
+   `options m2sdr dma_buffer_size=8192,512 dma_buffer_per_irq=8,1`.
+3. Write `*_operational.bin` to the operational flash slot (0x800000), reload
+   the FPGA and reboot the host.
+4. Configure the RF front end:
+   `m2sdr_rf --sample-rate 4e6 --bandwidth 4e6 --rx-freq 1575.42e6 --rx-gain 60 --channel-layout 2t2r`.
+
+GNSSM2SDR.jl's README continues from there: the loop process and the receiver.
 
 ## Layout
 
 ```
-gnss_m2sdr/gateware/   Migen/LiteX gateware (ca_code.py, ...)
-docs/                  record path, hardware bring-up, signal configuration
-test/                  Migen simulations + software-reference tests
-test/data/             committed golden vectors (e.g. GNSSSignals.jl C/A codes)
-julia/                 GNSSSignals.jl project used to regenerate golden vectors
+gnss_m2sdr/tdm/   the gateware: params.py (formats, record layout), model.py
+                  (bit-exact Python model), engine.py (engine, CSRs, record
+                  serialiser, RX tap), soc.py (the SoC on litex_m2sdr)
+build_tdm.py      the build
+third_party/      litex_m2sdr (submodule)
+test/             Migen and xsim tests against the model
+docs/             the design
 ```
 
-## Running tests
+## Tests
 
-Everything is pure simulation — no board, no Vivado, no numpy:
-
-```
-pip install -r requirements-test.txt            # migen + LiteX + LitePCIe, pinned
-PYTHONPATH=. python test/run_all.py             # the whole suite (auto-discovers test/test_*.py)
-PYTHONPATH=. python -m unittest test.test_record -v   # a single module
+```sh
+pip install -r requirements-test.txt     # migen + LiteX, pinned
+PYTHONPATH=. python test/run_all.py      # what CI runs
+PYTHONPATH=. python -m unittest test.test_tdm_engine -v
 ```
 
-`run_all.py` exits non-zero on failure and is what CI runs
-(`.github/workflows/tests.yml`) on every push and pull request.
+- `test_tdm_engine` runs the engine in the Migen simulator against the model,
+  record for record. `test_tdm_rxtap` checks the RX tap under a stalling host.
+- `test_tdm_xsim` runs the engine scenarios on the Verilog LiteX writes, in
+  Vivado's xsim, and checks that Verilog for two lowering faults that have
+  reached silicon before. It finds xsim on `PATH`, in `$XILINX_VIVADO/bin` or
+  through `$XILINX_ENV` (a wrapper that sets up Vivado's environment), and
+  skips without it, as in CI.
+- The tests do not use litex_m2sdr, so CI does not fetch the submodule.
+- `requirements-test.txt` pins migen `e19524c` and LiteX `37b75bd4`; it says
+  why. migen's simulator cannot lower the write-only `Memory` port that
+  `stream.SyncFIFO` creates, and `test/migen_compat.py` patches that for
+  simulation only. Start tests through `test/run_all.py` or
+  `python -m unittest test.<module>`, not as bare scripts, so the patch is
+  installed.
 
-**Toolchain.** `requirements-test.txt` pins the exact commits CI runs: migen
-0.9.2 (`e19524c`), LiteX 2026.4 (`93c8d23`), LitePCIe 2026.4 (`e84e0b9`). One
-upstream quirk is worth knowing about: migen's *simulator* cannot lower the
-write-only `Memory` port that `stream.SyncFIFO` creates, so every simulation
-containing the recorder's FIFO dies with `AttributeError: 'NoneType' object has
-no attribute 'eq'` before its first cycle. `test/migen_compat.py` patches that on
-import — simulation only, gateware generation is untouched — which is why the
-suite must be started through `test/run_all.py` or `python -m unittest
-test.<module>` and not by running a test file as a bare script.
+## History
+
+An earlier design instantiated one complete tracking channel per satellite
+(`gnss_m2sdr/gateware/`, `build.py`). It supported BOC-family modulations and
+two antennas per channel, but needed 56 DSPs for four channels, closed timing
+at six only with directive tuning, and was built on a litex_m2sdr hook that
+upstream did not merge. It was retired. Its last version, with its host
+software and bring-up notes, is at
+[`c5c6085`](https://github.com/JuliaGNSS/gnss-m2sdr/tree/c5c60855666580e0dd8d934fa3a46970aa88c62e).
