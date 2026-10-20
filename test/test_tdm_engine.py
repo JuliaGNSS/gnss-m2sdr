@@ -14,7 +14,8 @@ import test.migen_compat  # noqa: F401  (simulator workaround)
 
 from gnss_m2sdr.tdm import params as P
 from gnss_m2sdr.tdm import model as M
-from test.tdm_harness import TDMHarness, Scenario, REG, gps_like_signal, random_code, parse_stream
+from test.tdm_harness import (TDMHarness, Scenario, REG, gps_like_signal, random_code, parse_stream,
+                              cboc_subcarrier)
 
 
 FS = 4e6
@@ -57,6 +58,66 @@ def build_scenario(code, **kw):
     sc.release(2)
     sc.samples(sig[500:900])
     sc.idle(3000)                          # let the flush timer pad the last buffer out
+    return sc
+
+
+# Galileo E1B's replica as GNSSSignals' Int8 code table holds it (and Tracking.jl
+# correlates with): CBOC(+) with (a1, a2) = (19, 6), levels ±25 and ±13.
+E1B_LEVELS = [25, 13, 25, 13, 25, 13, -13, -25, -13, -25, -13, -25]
+
+
+def cboc_registers(a2=6):
+    subchips, signs, levels, hi, lo = P.cboc_table(1, 6, 19, a2)
+    return P.subcarrier_word(subchips, signs, levels), P.amplitude_word(hi, lo)
+
+
+def cboc_scenario(code, **kw):
+    """A CBOC satellite tracked with the CBOC replica on five taps, a BOC(1,1)
+    and a BPSK replica of the same code on three, and a CBOC channel re-armed
+    as BPSK: every replica shape, and an arm replacing one with another."""
+    sc = Scenario(n_channels=4, code_words=256, strobe_period=0, buffer_words=16, **kw)
+    sc.code(0, M.pack_code(code))
+    doppler = -700.0
+    sig = gps_like_signal(900, fs=FS, code_chips=code, code_rate=CODE_RATE, doppler=doppler,
+                          code_phase=5.0, amplitude=300, noise=60, seed=8, antenna=0,
+                          subcarrier=cboc_subcarrier())
+    code_freq = M.code_word(CODE_RATE, FS)
+    carrier = M.carrier_word(doppler, FS)
+    cboc, amps = cboc_registers()
+    boc11 = P.subcarrier_word(2, [0, 1], [0, 0])
+
+    def arm(ch, shifts, start, **replica):
+        lead = max(shifts)
+        phase = (5.0 + CODE_RATE * start / FS + lead * CODE_RATE / FS) % CODE_LEN
+        sc.arm(ch, carrier_freq=carrier, code_freq=code_freq, carrier_phase=0, code_chip=int(phase),
+               code_frac=int((phase % 1) * 2**32), code_length=CODE_LEN, code_base=0,
+               shifts=shifts, antenna=0, start=start, **replica)
+    arm(0, (-4, -1, 0, 1, 4), 3, subcarrier=cboc, amplitude=amps)
+    arm(1, (-1, 0, 1), 7, subcarrier=boc11)
+    arm(2, (-1, 0, 1), 11)
+    arm(3, (-2, 0, 2), 2, subcarrier=cboc, amplitude=amps)
+    sc.samples(sig[:450])
+    arm(3, (-2, 0, 2), 500)                # back to BPSK, amplitude 1
+    sc.samples(sig[450:900])
+    sc.idle(3000)
+    return sc
+
+
+def wide_subchip_scenario(code):
+    """P = 15 with every sign and level bit set: the sub-chips past the 12-entry
+    tables read as + at amp_lo, in the gateware and the model alike."""
+    sc = Scenario(n_channels=2, code_words=256, strobe_period=0, buffer_words=16)
+    sc.code(0, M.pack_code(code))
+    sig = gps_like_signal(800, fs=FS, code_chips=code, code_rate=CODE_RATE, doppler=0.0,
+                          code_phase=0.0, amplitude=300, noise=60, seed=4, antenna=0)
+    wide = (1 << 2 * P.MAX_SUBCHIPS) - 1 | 15 << 2 * P.MAX_SUBCHIPS
+    for ch in range(2):
+        sc.arm(ch, carrier_freq=0, code_freq=M.code_word(CODE_RATE, FS), carrier_phase=0,
+               code_chip=0, code_frac=0, code_length=CODE_LEN, code_base=0, shifts=(-1, 0, 1),
+               antenna=0, start=2 + ch, subcarrier=wide if ch == 0 else P.SUBCARRIER_BPSK,
+               amplitude=P.amplitude_word(5, 3))
+    sc.samples(sig)
+    sc.idle(2000)
     return sc
 
 
@@ -122,6 +183,29 @@ class TestTDMEngineAgainstModel(unittest.TestCase):
         self.assertEqual(self.status["count"], 900)
         self.assertEqual(self.status["drops"], 0)
         self.assertEqual(self.status["overflows"], 0)
+
+
+class TestSubchipReplica(unittest.TestCase):
+    """CBOC, BOC(1,1) and BPSK replicas in the Migen simulation against the model."""
+    @classmethod
+    def setUpClass(cls):
+        cls.sc = cboc_scenario(random_code(CODE_LEN, seed=13))
+        cls.words, cls.status = run_harness(cls.sc)
+
+    def test_records_match_the_model(self):
+        got = parse_stream(self.words)
+        self.assertGreater(len(self.sc.records), 8)
+        self.assertEqual(got, self.sc.records)
+
+    def test_every_replica_dumped(self):
+        dumps = {(r.channel, r.assign_id) for r in parse_stream(self.words) if r.kind == P.KIND_DUMP}
+        self.assertEqual(len(dumps), 5)
+
+    def test_subchips_past_the_tables(self):
+        sc = wide_subchip_scenario(random_code(CODE_LEN, seed=17))
+        words, _ = run_harness(sc)
+        self.assertGreater(len(sc.records), 2)
+        self.assertEqual(parse_stream(words), sc.records)
 
 
 class TestBackpressure(unittest.TestCase):
@@ -318,6 +402,28 @@ class TestHostHelpers(unittest.TestCase):
             with self.assertRaises(ValueError, msg=shifts):
                 P.tap_offsets(shifts)
 
+    def test_cboc_table_is_gnsssignals_int8_e1b(self):
+        subchips, signs, levels, hi, lo = P.cboc_table(1, 6, 19, 6)
+        self.assertEqual((subchips, hi, lo), (12, 25, 13))
+        self.assertEqual([(-1 if s else 1) * (hi if l else lo) for s, l in zip(signs, levels)], E1B_LEVELS)
+        # CBOC(-) (Galileo E1C) differs in the levels only.
+        _, signs_c, levels_c, _, _ = P.cboc_table(1, 6, 19, -6)
+        self.assertEqual(signs_c, signs)
+        self.assertEqual(levels_c, [not l for l in levels])
+
+    def test_subchip_index_is_the_full_product(self):
+        # 1/12 chip is not dyadic: the top bits of the fraction would misplace edges.
+        for k in range(12):
+            edge = -(-(k << 32) // 12)             # the first fraction in sub-chip k
+            self.assertEqual(P.subchip_index(edge, 12), k)
+            if k:
+                self.assertEqual(P.subchip_index(edge - 1, 12), k - 1)
+        self.assertEqual(P.subchip_index((1 << 32) - 1, 12), 11)
+        with self.assertRaises(ValueError):
+            P.subcarrier_word(13, [0] * 13, [0] * 13)
+        with self.assertRaises(ValueError):
+            P.amplitude_word(128, 1)
+
     def test_code_words_must_be_a_power_of_two(self):
         for n in (3000, 0, 1 << 17):
             with self.assertRaises(ValueError):
@@ -353,6 +459,40 @@ class TestModelCorrelates(unittest.TestCase):
             self.assertLess(abs(early - late) / prompt, 0.25)
             # One code period at 4 MS/s.
             self.assertAlmostEqual(r.integrated, CODE_LEN * FS / CODE_RATE, delta=1)
+
+
+class TestModelCorrelatesCBOC(unittest.TestCase):
+    """On a CBOC satellite the CBOC replica peaks on the prompt, with the
+    accumulators scaled by its amplitude; a BPSK replica of the same code finds
+    almost nothing there (GNSSM2SDR.jl#16)."""
+    def prompts(self, shifts, **replica):
+        code = random_code(CODE_LEN, seed=21)
+        eng = M.Engine(1, 64)
+        eng.write_code(0, M.pack_code(code))
+        sig = gps_like_signal(3000, fs=FS, code_chips=code, code_rate=CODE_RATE, doppler=300.0,
+                              code_phase=0.0, amplitude=200, noise=0, seed=5, antenna=0,
+                              subcarrier=cboc_subcarrier())
+        lead, offsets, warmup = P.tap_offsets(shifts)
+        phase = lead * CODE_RATE / FS
+        eng.arm(0, M.ChannelConfig(carrier_freq=M._signed(M.carrier_word(300.0, FS), 32),
+                                   code_freq=M.code_word(CODE_RATE, FS), code_length=CODE_LEN,
+                                   lead=lead, offsets=tuple(offsets) + (0,) * (5 - len(offsets)),
+                                   num_taps=len(shifts), warmup=warmup, **replica),
+                M.Pending(start=0, code_chip=int(phase), code_frac=int((phase % 1) * 2**32)))
+        recs = [r for n, s in enumerate(sig) for r in eng.step(n, s)][1:]
+        self.assertGreater(len(recs), 5)
+        return [[abs(complex(*t)) / r.integrated for t in r.taps[:len(shifts)]] for r in recs]
+
+    def test_cboc_prompt_peak(self):
+        cboc, amps = cboc_registers()
+        bpsk = self.prompts((-1, 0, 1))
+        for vl, l, p, e, ve in self.prompts((-2, -1, 0, 1, 2), subcarrier=cboc, amplitude=amps):
+            self.assertGreater(p, max(l, e, vl, ve))
+            # Amplitude 200, the carrier table's 127, a replica of RMS ~19.9.
+            self.assertGreater(p, 0.8 * 200 * 127 * 19.9)
+            self.assertLess(abs(e - l) / p, 0.1)
+        for l, p, e in bpsk:
+            self.assertLess(p, 0.1 * 200 * 127)
 
 
 if __name__ == "__main__":

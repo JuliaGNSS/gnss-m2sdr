@@ -14,6 +14,8 @@ sample. The per-channel bank used one of them per channel and spent the rest
 idle, with a complete datapath — carrier NCO and table, code RAMs, five
 correlators, DSP cascades — per channel. Six channels closed timing only at
 `--timing-effort max` with directive tuning, 56 DSP48E1 for four channels.
+(The TDM engine's DSPs are the wipe-off at the replica's two amplitudes and
+the carrier table's scaling by them; without sub-chip replicas it needed 4.)
 
 The TDM engine runs the datapath once per channel per sample: a round of
 `max(n_channels + 1, 7)` slots per sample, one per channel plus one for the
@@ -25,7 +27,7 @@ easy on timing, and its size barely depends on the channel count:
 
 | build | channels | LUTs (whole SoC) | DSP48E1 | BRAM tiles | WNS (sys_clk) |
 |---|---:|---:|---:|---:|---:|
-| `gnss_tdm_m2_x1_ch24_code4096` | 24 | 15 231 (11.4 %) | **4** | 75 | +0.097 ns |
+| `gnss_tdm_m2_x1_ch24_code4096` | 24 | 15 628 (11.7 %) | **10** | 75 | +0.118 ns |
 
 built with upstream litex_m2sdr at `973669b` and the directives of upstream's
 own build (`build_tdm.py`), in about seven minutes.
@@ -48,17 +50,21 @@ Per slot (`engine.py`, stages S0–S7, mirrored operation for operation by
 2. **S2** decides a pending arm: start at the staged sample, or mark it missed
    if that sample has passed. Adds the carrier and code NCO increments. A
    starting channel's accumulators are cleared on their way into S6.
-3. **S3–S4** the shared carrier table (64 entries, ±127) and the code memory
-   (32-chip words, block RAM, one memory for all channels); the code-chip
-   carry and the wrap at the code length.
-4. **S4–S5** the carrier wipe-off: four 12 × 8-bit products — the only four
-   DSPs of the engine.
+3. **S3–S4** the shared carrier table (64 entries, ±127), scaled by the
+   channel's two replica amplitudes ([the replica](#the-replica)), and the code
+   memory (32-chip words, block RAM, one memory for all channels); the
+   sub-chip index `floor(frac · P)`; the code-chip carry and the wrap at the
+   code length.
+4. **S4–S5** the chip's sign times the sub-chip's sign, and the sub-chip's
+   level; the carrier wipe-off: eight 12 × 16-bit products, at each amplitude
+   — the only DSPs of the engine.
 5. **S5** the replica history: the code NCO runs on the *earliest* tap, and
-   each sample pushes that tap's chip, and whether its code period ended, into
-   a 32-entry history. Tap `k` with sample shift `s` reads entry `lead - s`;
-   the prompt's period ends where entry `lead` carries the wrap flag. No tap
-   needs its own code read or multiplier.
-6. **S6** five tap pairs accumulated (33 bits), **S7** saturated to 32 bits,
+   each sample pushes that tap's replica sign and level, and whether its code
+   period ended, into a 32-entry history. Tap `k` with sample shift `s` reads
+   entry `lead - s`; the prompt's period ends where entry `lead` carries the
+   wrap flag. No tap needs its own code read or multiplier.
+6. **S6** five tap pairs accumulated (33 bits), each with the wiped-off sample
+   at the amplitude its history entry names, **S7** saturated to 32 bits,
    written back; at the prompt's period end the record is emitted and the
    accumulators restart. A record's flags say whether an accumulator
    saturated and whether samples were lost while it integrated.
@@ -66,6 +72,49 @@ Per slot (`engine.py`, stages S0–S7, mirrored operation for operation by
 Number formats are in `params.py`: 32-bit carrier phase and signed frequency
 word, a 20-bit chip index with a 32-bit fraction and an unsigned code word
 (chips per sample × 2³²), 12-bit samples, 32-bit accumulators.
+
+## The replica
+
+A channel's replica is the code chip times a sub-chip value: the chip is cut
+into `P ≤ 12` equal sub-chips, and sub-chip `k = floor(frac · P)` — the
+full-precision product of the 32-bit fraction, not its top bits, since a
+sub-chip edge at `k/12` chip is not dyadic — has a sign and one of two
+amplitudes. So the replica is `chip · sign[k] · (level[k] ? amp_hi : amp_lo)`,
+programmed per arm through `s_subcarrier` (signs, levels, `P`) and
+`s_amplitude` (7-bit `amp_hi`, `amp_lo`):
+
+| signal | `P` | sub-chips | amplitudes |
+|---|---:|---|---|
+| GPS L1 C/A (BPSK, the reset values) | 1 | + | 1 |
+| BOC(1,1) | 2 | + − | 1 |
+| Galileo E1B, CBOC(+) | 12 | `25 13 25 13 25 13 −13 −25 −13 −25 −13 −25` | 25, 13 |
+| Galileo E1C, CBOC(−) | 12 | `13 25 13 25 13 25 −25 −13 −25 −13 −25 −13` | 25, 13 |
+
+The CBOC levels are GNSSSignals' Int8 code table, `a1 · BOC(1,1) + a2 ·
+BOC(6,1)` with `(a1, a2) = (19, 6)` — what Tracking.jl's integer correlator
+correlates with — whose RMS, `√397 = 19.92`, is `get_code_amplitude`; the
+receiver declares it as the code amplitude, and the loop core divides it out.
+The host derives both words from that table (GNSSM2SDR.jl's
+`subchip_replica`, `params.cboc_table` here), so the replica cannot drift from
+the software receiver's. A replica correlated with the wrong shape is no small
+loss: a BPSK replica of E1B's code correlates to zero at the prompt
+(GNSSM2SDR.jl#16).
+
+Below `12 × 1.023 MHz = 12.276 MHz` the gateware would alias the BOC(6,1)
+component, but GNSSSignals does not generate the CBOC table there, so no
+software receiver arms it: at 4 MS/s the receiver tracks E1B as BOC(1,1)
+(`GalileoE1B_BOC11`, `P = 2`); CBOC needs a build for 12.5 MS/s, such as the
+7-channel one.
+
+`P` is a 4-bit field, but the sign and level tables hold 12 sub-chips: a `P`
+of 13 to 15, which no host writes, makes the sub-chips past the twelfth
+positive at `amp_lo` (the model does the same).
+
+The amplitude scales the accumulators by up to 25: a full-scale input that
+correlates perfectly reaches the 32-bit rail after about 200 samples, but a
+real integration is noise: at σ = 300 LSB a 4 ms E1B record
+(16 000 samples) sums to about `√16000 · 300 · 127 · 19.9 ≈ 10⁸`, 21 times
+below the rail.
 
 ## The host interface
 
@@ -154,6 +203,11 @@ DMA buffer as a hole in the tags.
   one `FLAG_SAMPLE_OVERFLOW` dump per channel); no malformed DMA block through
   670 000 back-to-back `record_enable` toggles (the previous build garbled
   the stream within them); a position fix with `receiver.jl` on RX2.
+- On the board (orin1, 2026-10-19, the sub-chip replica build): with Galileo
+  E1B channels armed as CBOC (±25/±13, 12 sub-chips) and as BOC(1,1) next to
+  GPS L1 C/A ones on the antenna's samples, all 4 198 dump records received
+  were bit-exact against the emulator fed the same capture; GPS L1 C/A
+  tracking and position fixes with `receiver.jl` were unchanged.
 
 ### Two lowering faults
 
@@ -191,9 +245,9 @@ engine scenario on it in xsim against the model.
 
 ## Not yet
 
-- Sub-chip modulations (BOC, CBOC, TMBOC): the replica history holds one bit
-  per sample; a modulated replica needs a few bits per entry and a small
-  multiply per tap. The tap layout already reaches five taps for them.
+- TMBOC (GPS L1C pilot): its sub-chips change from chip to chip, which the
+  per-channel sub-chip table cannot follow; it needs a pattern bit beside each
+  chip in the code memory.
 - Codes longer than the code memory (GPS L2CL) need a generator instead of a
   table.
 - More than one antenna per channel and more than one band.
