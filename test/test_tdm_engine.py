@@ -103,6 +103,24 @@ def cboc_scenario(code, **kw):
     return sc
 
 
+def wide_subchip_scenario(code):
+    """P = 15 with every sign and level bit set: the sub-chips past the 12-entry
+    tables read as + at amp_lo, in the gateware and the model alike."""
+    sc = Scenario(n_channels=2, code_words=256, strobe_period=0, buffer_words=16)
+    sc.code(0, M.pack_code(code))
+    sig = gps_like_signal(800, fs=FS, code_chips=code, code_rate=CODE_RATE, doppler=0.0,
+                          code_phase=0.0, amplitude=300, noise=60, seed=4, antenna=0)
+    wide = (1 << 2 * P.MAX_SUBCHIPS) - 1 | 15 << 2 * P.MAX_SUBCHIPS
+    for ch in range(2):
+        sc.arm(ch, carrier_freq=0, code_freq=M.code_word(CODE_RATE, FS), carrier_phase=0,
+               code_chip=0, code_frac=0, code_length=CODE_LEN, code_base=0, shifts=(-1, 0, 1),
+               antenna=0, start=2 + ch, subcarrier=wide if ch == 0 else P.SUBCARRIER_BPSK,
+               amplitude=P.amplitude_word(5, 3))
+    sc.samples(sig)
+    sc.idle(2000)
+    return sc
+
+
 def run_harness(sc, ready_pattern=None, probe=None, writer=None):
     """Run ``sc``; return the DMA words and the status registers at the end.
     ``probe(k, dut)``, a generator, is called each cycle after the edge;
@@ -182,6 +200,12 @@ class TestSubchipReplica(unittest.TestCase):
     def test_every_replica_dumped(self):
         dumps = {(r.channel, r.assign_id) for r in parse_stream(self.words) if r.kind == P.KIND_DUMP}
         self.assertEqual(len(dumps), 5)
+
+    def test_subchips_past_the_tables(self):
+        sc = wide_subchip_scenario(random_code(CODE_LEN, seed=17))
+        words, _ = run_harness(sc)
+        self.assertGreater(len(sc.records), 2)
+        self.assertEqual(parse_stream(words), sc.records)
 
 
 class TestBackpressure(unittest.TestCase):

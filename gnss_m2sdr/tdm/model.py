@@ -53,6 +53,12 @@ class ChannelConfig:
     def amp(self, level):
         return (self.amplitude >> (8 if not level else 0)) & ((1 << P.AMP_BITS) - 1)
 
+    def signs(self):
+        return self.subcarrier & ((1 << P.MAX_SUBCHIPS) - 1)
+
+    def levels(self):
+        return (self.subcarrier >> P.MAX_SUBCHIPS) & ((1 << P.MAX_SUBCHIPS) - 1)
+
 
 @dataclass
 class Pending:
@@ -238,11 +244,12 @@ class Engine:
         st.carrier_phase = (st.carrier_phase + cfg.carrier_freq) & M32
 
         # Code NCO (earliest tap) and the replica history: the chip's sign times
-        # the sub-chip's sign, and the sub-chip's level.
+        # the sub-chip's sign, and the sub-chip's level. The sign and level
+        # fields are 12 bits: a sub-chip past them (P > 12) is + at amp_lo.
         word = self.code[(cfg.code_base + (st.code_chip >> 5)) % len(self.code)]
         sub = P.subchip_index(st.code_frac, cfg.subchips())
-        bit = ((word >> (st.code_chip & 31)) ^ (cfg.subcarrier >> sub)) & 1
-        level = (cfg.subcarrier >> (P.MAX_SUBCHIPS + sub)) & 1
+        bit = ((word >> (st.code_chip & 31)) ^ (cfg.signs() >> sub)) & 1
+        level = (cfg.levels() >> sub) & 1
         total = st.code_frac + cfg.code_freq
         st.code_frac = total & M32
         chip = st.code_chip + (total >> 32)
