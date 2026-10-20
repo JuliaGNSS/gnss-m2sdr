@@ -100,8 +100,15 @@ the software receiver's. A replica correlated with the wrong shape is no small
 loss: a BPSK replica of E1B's code correlates to zero at the prompt
 (GNSSM2SDR.jl#16).
 
-At 4 MS/s the BOC(6,1) component is aliased, as it is in the software
-receiver, which samples the same table at the same phases.
+Below `12 × 1.023 MHz = 12.276 MHz` the gateware would alias the BOC(6,1)
+component, but GNSSSignals does not generate the CBOC table there, so no
+software receiver arms it: at 4 MS/s the receiver tracks E1B as BOC(1,1)
+(`GalileoE1B_BOC11`, `P = 2`); CBOC needs a build for 12.5 MS/s, such as the
+7-channel one.
+
+`P` is a 4-bit field, but the sign and level tables hold 12 sub-chips: a `P`
+of 13 to 15, which no host writes, makes the sub-chips past the twelfth
+positive at `amp_lo` (the model does the same).
 
 The amplitude scales the accumulators by up to 25: a full-scale input that
 correlates perfectly reaches the 32-bit rail after about 200 samples, but a
